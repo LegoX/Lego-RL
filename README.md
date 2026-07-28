@@ -247,15 +247,58 @@ Each `agent_loop_config_*.yaml` injects the Harbor adapters via dynamic import �
 
 ## Anti-reward-hacking
 
-Two orthogonal, **per-phase, default-on** defenses run inside the task environment
-(`harbor_patch/environments/kubernetes/kubernetes.py`), so the agent cannot recover the gold fix
-while the verifier still grades correctly. Both are driven through Harbor's `Trial.run()` phases
-(env-setup → agent → verifier), which the RL rollout path goes through, so training gets them too.
+A task's reference fix is sitting right there — on GitHub, and in the repo's own git history. An
+agent that finds it scores 1.0 without solving anything, and the run learns nothing. Two
+**default-on** defenses close those two routes inside the task environment
+(`harbor_patch/environments/kubernetes/kubernetes.py`). Both are keyed to Harbor's `Trial.run()`
+phases, which the RL rollout path goes through, so training gets them for free.
 
-| Vector | Mechanism | agent phase | verifier phase |
-|---|---|---|---|
-| **Network** (fetch the answer from GitHub / raw / PyPI) | iptables egress **sidecar** (`netadmin`, `NET_ADMIN`; the main container has none, so the policy can't be flushed away). CNI is flannel → k8s NetworkPolicy is a no-op, hence iptables. | `allowlist` — private LAN (in-cluster LLM proxy / registry) + DNS reachable, **public dropped** | `public` — relaxed so an online grader can reach PyPI |
-| **Local git history** (`git log -p` / `show <sha>` / `checkout <sha>` / `archive` / `blame` — an open-ended list a command blacklist can't cover) | **single-commit rebuild**: `mv .git .git.orig && git init && git add -A && git commit`. The working tree is untouched (the agent still solves); the fix objects/refs simply no longer exist. Uniform across SWE-bench (fix is an ancestor of HEAD) and OpenSWE (fix on side branches). | history stripped | `.git.orig` restored (`restore_git_history()`, called from harbor `trial.py` before the verifier) so `git checkout <historical_sha> <testfile>` + `git apply <test_patch>` work |
+The trick is that the verifier needs what the agent must not have: PyPI access to install a grader,
+and the original history to check out the reference tests. So neither defense is a global switch —
+each one flips per phase:
+
+```mermaid
+flowchart LR
+    E["<b>env-setup</b><br/>network: public<br/>git: full history"]
+    A["<b>agent</b><br/>network: allowlist<br/>git: single commit"]
+    V["<b>verifier</b><br/>network: public<br/>git: restored"]
+    E --> A --> V
+
+    style A fill:#7f1d1d,stroke:#ef4444,color:#fff
+    style E fill:#1e3a5f,stroke:#3b82f6,color:#fff
+    style V fill:#1e3a5f,stroke:#3b82f6,color:#fff
+```
+
+**Network.** During the agent phase the pod keeps the private LAN and DNS (it still has to reach the
+in-cluster LLM proxy and registry) but public egress is dropped. Flannel is the CNI, so a Kubernetes
+`NetworkPolicy` is a no-op — the rules are iptables instead, applied from a second container in the
+same pod:
+
+```mermaid
+flowchart TB
+    subgraph pod["Sandbox pod — one shared network namespace"]
+        direction LR
+        main["<b>main</b><br/>the agent runs here<br/>no NET_ADMIN"]
+        side["<b>netadmin</b> sidecar<br/>holds NET_ADMIN<br/>writes the iptables rules"]
+    end
+    side -.->|"same netns, so the rules<br/>apply to main too"| main
+
+    style main fill:#7f1d1d,stroke:#ef4444,color:#fff
+    style side fill:#14532d,stroke:#22c55e,color:#fff
+```
+
+The split is the whole point: the sidecar holds `NET_ADMIN`, the agent's container does not, so the
+policy cannot be flushed away by the thing it constrains. The sidecar then sleeps, and the policy is
+re-applied per phase.
+
+**Local git history.** Blocking this by command blacklist is hopeless — `git log -p`, `show <sha>`,
+`checkout <sha>`, `archive`, `blame` and a dozen more all reach the same objects. So the objects go
+away instead: `mv .git .git.orig && git init && git add -A && git commit` rebuilds the repo as a
+single commit. The working tree is untouched, so the task is still solvable; the fix simply no longer
+exists anywhere in the repository. This behaves identically whether the fix is an ancestor of `HEAD`
+(SWE-bench) or on a side branch (OpenSWE). Before the verifier runs, `restore_git_history()` puts
+`.git.orig` back, so `git checkout <historical_sha> <testfile>` and `git apply <test_patch>` work
+normally.
 
 Per-phase network is declarative via each task's `task.toml`
 (`[environment]/[agent]/[verifier] network_mode = public|allowlist|no-network`); adding these keys is
