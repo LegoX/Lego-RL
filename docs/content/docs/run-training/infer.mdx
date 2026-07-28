@@ -1,0 +1,99 @@
+---
+title: Batch Inference
+description: Batch-generate trajectories over a task index — for difficulty filtering and data selection
+---
+
+Batch-generates agent trajectories over a Harbor task index. This is the
+pipeline's **task filter**: each instance is attempted `N_TRIALS` times, and the
+instances in the target difficulty band (e.g. solved 1–3 of 4 — the ones that
+carry the most gradient signal under group-relative advantages) are written to a
+**selected index** for training. Interrupted runs resume automatically —
+completed trials are skipped.
+
+## 1. Config
+
+```bash
+cp scripts/infer/templates/qwen36-27b_1node.env \
+   scripts/infer/configs/my_infer.env
+```
+
+```bash
+# my_infer.env — the CHANGEME lines
+PROJECT_NAME=infer-qwen36-27b
+SCAFFOLD=ohsdk
+BACKEND=k8s
+MODEL_PRESET=qwen36-27b            # or MODEL_PATH=/models/global_step_N_hf
+
+# data / output
+TRAIN_INDEX=/data/base_index.parquet     # base index of all candidate instances
+# INSTANCES_FILE=/data/shard0.txt        # this node's shard (empty = whole index)
+RESULTS_DIR=/data/results/node0
+OUTPUT_INDEX=/data/selected_node0.parquet
+N_TRIALS=4                               # attempts per instance (the k in pass@k)
+N_CONCURRENT=40
+TEMPERATURE=1.0
+
+# vLLM topology (single node, TP8)
+GEN_TP=8
+GEN_DP=1
+VLLM_NNODES=1
+VLLM_MAX_MODEL_LEN=128000
+```
+
+## 2. Validate
+
+```bash
+PREFLIGHT_ONLY=1 bash scripts/infer/infer.sh infer/configs/my_infer.env   # checks only, no launch
+# or:  /rl:check infer/configs/my_infer.env
+```
+
+## 3. Run
+
+```bash
+nohup setsid bash scripts/infer/infer.sh infer/configs/my_infer.env \
+  > logs/infer_$(date +%m%d).out 2>&1 &
+# or:  /rl:run infer/configs/my_infer.env
+```
+
+## 4. Results
+
+```bash
+tail -F logs/<exp>.log
+# === inference done: results=/data/results/node0  selected=/data/selected_node0.parquet ===
+```
+
+Per-trial results land in `RESULTS_DIR`; the filtered task index is
+`OUTPUT_INDEX` — point a training config's `TRAIN_INDEX` at it. The selected
+index carries the same thin pointer rows as any
+[task index](/docs/data-preparation#task-index), so further filtering, unioning
+across nodes, or re-banding is plain dataframe work.
+
+## Multi-node DP
+
+Run the **same** config on every GPU node; the node whose local IP matches
+`VLLM_HEAD_HOST` becomes rank 0 automatically. Give each node its own shard:
+
+```bash
+# in the config (see templates/qwen36-27b_2node_dp.env):
+VLLM_NNODES=2
+VLLM_HEAD_HOST=10.0.0.1
+INSTANCES_FILE=/data/shard0.txt      # shard1.txt on the other node
+RESULTS_DIR=/data/results/node0      # node1 on the other node
+OUTPUT_INDEX=/data/selected_node0.parquet
+
+# then on each node:
+bash scripts/infer/infer.sh infer/configs/my_infer.env
+```
+
+## Knobs
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TRAIN_INDEX` | — | base task index (parquet), required |
+| `INSTANCES_FILE` | all | this node's instance-id list; empty = whole index |
+| `RESULTS_DIR` / `OUTPUT_INDEX` | — | per-trial results / selected index |
+| `N_TRIALS` | `4` | attempts per instance |
+| `N_CONCURRENT` | `40` | concurrent trials |
+| `TEMPERATURE` | `1.0` | sampling temperature |
+| `GEN_TP` / `GEN_DP` / `VLLM_NNODES` | `4` / `1` / `1` | vLLM topology |
+| `VLLM_MAX_MODEL_LEN` | preset window | serving context length |

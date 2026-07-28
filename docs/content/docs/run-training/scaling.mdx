@@ -1,0 +1,119 @@
+---
+title: Scaling Up
+description: When and how to move from the single-node default to a multi-node, fully-async run
+---
+
+The recommended way to run SWE-Lego-RL is the **single-node** path documented
+throughout this section: one 8×GPU host where verl runs the trainer and vLLM
+serves the policy on the *same* GPUs, launched from a `sync_*` template
+(`TRAIN_MODE=sync`). It is the **minimal-cost** way to get a real RL run
+going — one machine, one config, no cross-node plumbing.
+
+This page is the **advanced** path: what changes when one host is no longer
+enough. You almost certainly do **not** need it to start.
+
+<Callout title="This costs more — reach for it only when you must" type="warn">
+The multi-node / fully-async stack needs **multiple machines**, more setup, and
+more operational care (cross-node networking, a separate rollout pool, staleness
+tuning). Stay on the single-node path until you actually hit its ceiling:
+a large **MoE** policy that won't fit one host's training + serving budget, very
+long contexts (≈131k), or rollout throughput that bottlenecks a synchronous loop.
+</Callout>
+
+## Scaling triggers
+
+| Signal on the single-node run | Scaling lever |
+| --- | --- |
+| Policy is a large **MoE** (e.g. 30B-A3B) and trainer + vLLM won't co-fit | **veomni** engine + a dedicated rollout node |
+| Trainer GPUs idle most of the step waiting on rollouts (`idle_ratio` high) | **Fully-async** trainer/rollout decoupling |
+| Context window must reach ≈131k (40k prompt + 91k response) | Multi-node FSDP (more trainer GPUs + CPU offload) |
+| You need a different agent harness than `claude-code` | A different scaffold via `HARBOR_AGENT_IMPORT_PATH` |
+
+## Fully-async, multi-node
+
+The synchronous loop runs generate → execute → reward → update in lockstep on
+shared GPUs. The **fully-async** path instead splits the cluster into a
+**rollout pool** and a **trainer pool** that run concurrently: rollouts (whose
+latency is mostly sandbox/env execution and tool waits rather than GPU compute)
+stream into a queue while the trainer consumes them, so neither side blocks the
+other.
+
+Switching is a template change, not a different tool — copy an `async_*` template
+and set the topology:
+
+```bash
+cp scripts/train/templates/async_k8s_ohsdk_qwen35a3b.env \
+   scripts/train/configs/my_async_run.env
+# then in the config:  NNODES=3  N_NODES_TRAIN=2  N_NODES_ROLLOUT=1
+bash scripts/train/train.sh train/configs/my_async_run.env
+```
+
+`TRAIN_MODE=async` swaps the entrypoint to `fully_async_main` with
+`fully_async_fsdp.yaml`. A 3-node layout means **2 trainer nodes** (16-GPU FSDP,
+`fsdp_size=16`) + **1 rollout node** (8-GPU vLLM), fitting the ≈131k window (40k
+prompt + 91k response) via more trainer GPUs plus CPU optimizer offload; 4-node
+layouts add rollout capacity the same way. Preflight is fatal if `NNODES` doesn't
+equal the sum. A few knobs govern the async behavior:
+
+| Knob | Role |
+| --- | --- |
+| `staleness_threshold` | How many param-versions stale a rollout may be before the trainer waits (0 = strict on-policy; 1 tolerates a throughput dip) |
+| `partial_rollout` | Resume a rollout aborted mid-generation on a weight sync, instead of discarding it (`True` by default) |
+| `train_bsz` × `n_resp_per_prompt` | Effective batch = prompts × rollouts/prompt. Official **64×8**; smoke **8×4** |
+
+<Callout title="sp_size must be 1 for qwen35" type="warn">
+For the Qwen3.5 policy, `sp_size=1` is **fixed** — Ulysses sequence parallel
+corrupts the GatedDeltaNet layers. The ≈131k window is fit with `fsdp_size=16` +
+CPU optimizer offload, not SP.
+</Callout>
+
+<Callout title="Smoke before the official run" type="info">
+Always validate a new scaffold/cluster with the smoke batch
+(`TRAIN_BSZ=8 N_RESP=4`) before the official `64×8`. The small batch is ~8×
+faster per step but gives noisy gradients and degenerate all-same-reward groups —
+it is for *plumbing validation*, not for reading learning quality.
+</Callout>
+
+## VeOmni backend (MoE)
+
+For MoE policies, set `USE_NEW_VERL=1` so `import verl` resolves to the
+`verl-swe_agent_opd_dev` checkout (prepended to `PYTHONPATH`; its location is
+`NEW_VERL_DIR` in `lib/site.env`, and preflight fails if it doesn't exist). Only
+that tree has the VeOmni `engine_workers`
+**router-replay** (R3) wiring (`actor.veomni.router_replay.mode`) and the
+async-rollouter `routed_experts` concat fixes; the old installed verl's VeOmni
+engine is unvalidated for this path. Dense models can stay on FSDP.
+
+It also enables the `trajectory_filter` config (`TRAJ_FILTER_ENABLE=True`,
+`TRAJ_FILTER_DROP_REASONS=timeout,env_setup_failed`), which the old verl lacks.
+
+## OH-SDK scaffold
+
+For the multi-node path the validated scaffold is **OpenHands-SDK**
+(`SCAFFOLD=ohsdk`, the primary choice), which uses an **image-mounted**
+runtime (the SDK pre-baked into the agent image) instead of an in-pod `venv`
+install — the latter fails on no-egress task pods. Selecting it keeps
+`AGENT_NAME` null so harbor loads the mounted-runtime-aware
+`import_path` class rather than the registry default. Preflight fails on a non-null
+`AGENT_NAME` under `ohsdk`/`oh`, because that mistake shows up as an
+`env_setup_failed` avalanche rather than an error.
+
+## Monitoring signals
+
+Beyond the [single-node metrics](/docs/core-concepts#metrics), the async path adds
+a few signals worth a glance each step:
+
+| Metric | Read |
+| --- | --- |
+| `fully_async/trainer/idle_ratio` | Fraction of the step the trainer waits on rollouts — high = rollout-bound (raise concurrency or rollout capacity) |
+| `rollout_corr/kl` | Rollout-vs-training logprob fidelity — should be ≈3e-4; a spike means scaffold/routing corruption |
+| `fully_async/partial/partial_ratio` | Share of partial (staleness-bounded) rollouts |
+| `trajectory_filter/invalid_ratio` | Share of trajectories dropped before the update |
+
+<Callout title="Advanced-path failure modes" type="warn">
+The async/MoE path has its own silent failure modes — a reward drop traced to
+trajectory filtering / sequence-distribution drift, routing-coverage loss under
+multi-turn replay, and importance-sampling **ESS collapse** on very long
+responses (set `rollout_is=null` and use token-level IS, not sequence-level).
+Check the trajectory filter and sequence drift first.
+</Callout>

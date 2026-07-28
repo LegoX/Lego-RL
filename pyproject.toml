@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swe-lego-rl"
+version = "0.1.0"
+description = "Integration patches for agentic RL training with VeRL and Harbor."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "SWE-Lego-RL maintainers" }
+]
+keywords = ["agentic-rl", "verl", "harbor", "ppo", "grpo", "kubernetes"]
+dependencies = [
+  "harbor>=0.3.1",
+  "numpy>=1.26,<3",
+  "omegaconf>=2.3",
+  "pandas>=2.2.2",
+  "pyarrow>=19.0.0",
+]
+
+[project.optional-dependencies]
+train = [
+  "accelerate",
+  "codetiming",
+  "datasets",
+  "dill",
+  "hydra-core",
+  "peft",
+  "pybind11",
+  "pylatexenc",
+  "ray[default]>=2.41.0",
+  "torch==2.10.0",
+  "torchaudio==2.10.0",
+  "torchdata",
+  "torchvision==0.25.0",
+  "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+  "transformers>=4.56,<5",
+  "vllm==0.19.0",
+  "verl",
+  "wandb",
+  "packaging>=20.0",
+  "tensorboard",
+]
+agent = [
+  "openhands-ai",
+  "openhands-sdk",
+  "openhands-tools",
+]
+cuda12x = [
+  "cupy-cuda12x",
+]
+dev = [
+  "pytest>=8.4.2",
+  "pytest-asyncio>=1.2.0",
+  "ruff>=0.15.4",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"verl_patch" = ["config/*.yaml"]
+"harbor_patch" = ["**/*.j2"]

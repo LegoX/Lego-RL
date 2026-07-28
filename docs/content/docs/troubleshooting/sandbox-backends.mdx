@@ -1,0 +1,90 @@
+---
+title: Sandbox Backends
+description: Docker and Kubernetes runtime issues behind the Harbor sandboxes
+---
+
+Issues in the layer that actually runs each trial. See [Backends](/docs/run-training/backends)
+for choosing and configuring a backend; this page is the failure modes.
+
+## Remote Docker: four startup pitfalls
+
+When bringing up the remote-Docker backend, four issues commonly block the first
+run. Work through them in order:
+
+1. **FlashInfer workspace init fails.** A stale ninja cache at
+   `/root/.cache/flashinfer/` references deleted venv paths → empty workspace →
+   an allreduce assertion fails at startup.
+   **Fix:** `rm -rf /root/.cache/flashinfer/`.
+
+2. **`VLLM_ATTENTION_BACKEND` not seen by Ray workers.** A plain shell `export`
+   doesn't propagate — Ray workers inherit nothing.
+   **Fix:** pass it through Ray's runtime env in `sync_1node_cc.sh`:
+   `+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_ATTENTION_BACKEND=FLASH_ATTN`.
+
+3. **Docker SDK shadowed by `verl/docker/`.** A `docker/` directory on
+   `sys.path` masks the real PyPI `docker` module.
+   **Fix:** `uv pip install --python $VENV/bin/python docker` (site-packages wins);
+   verify with `python -c "from docker import DockerClient; print('ok')"`.
+
+4. **Compose V2 plugin missing.** A hand-installed Docker lacks the compose plugin.
+   **Fix:** install it into `/usr/local/lib/docker/cli-plugins/docker-compose`
+   (`curl` the release binary, `chmod +x`).
+
+After these, re-check the docker CLI + compose, remote connectivity, the
+FlashInfer cache, the Docker SDK import, and the venv paths before relaunching.
+
+## Kubernetes health baseline
+
+When the K8s backend misbehaves, check these indicators first — most rollout
+stalls trace to one of them:
+
+| Indicator | Where | Warn / Crit |
+| --- | --- | --- |
+| `num_cgroups` | `awk 'NR==2{print $3}' /proc/cgroups` | >50k / >100k (cgroup leak) |
+| `percpu` memory | `/sys/fs/cgroup/memory.stat` | >20 / >50 GB (memcg leak) |
+| nvme `%util` | `iostat -x` on the etcd disk | >80% sustained (I/O storm) |
+| nvme `r_await` | `iostat -x` | >50 ms (etcd reads slow) |
+| `RunPodSandbox` p50 | kubelet metrics | >30s (sandbox-creation bottleneck) |
+
+Diagnostic flow: **cgroup leak** (reboot if needed) → **I/O** (find the reader) →
+**control plane** (apiserver/etcd CPU) → **containerd**.
+
+## Kyverno reports-controller I/O storm
+
+**Symptom.** nvme at **100% util**, `r_await` ~89 ms, `load` 30+, **despite no
+pods being created**. Scaling the controller to zero drops I/O to nil instantly.
+
+**Root cause.** The `kyverno-reports-controller` lists ~1000+ `EphemeralReports`
+(takes 32–38s), which exceeds the 15s leader-election lease → it loses leadership
+→ crashes → restarts → lists them all again → dead loop, hammering etcd with small
+random reads each cycle.
+
+**Fix.**
+
+```bash
+kubectl scale -n kyverno deployment/kyverno-reports-controller --replicas=0  # reports are optional; admission still works
+kubectl delete ephemeralreports -A --all                                     # clear the backlog
+```
+
+**Prevent:** a cron that prunes EphemeralReports every ~30 min and alerts when the
+count exceeds ~500.
+
+## Pod-startup disk bottleneck (uv cache)
+
+**Symptom.** Pods stick in `ContainerCreating`; with ~100 concurrent pods each
+running `uv` installs, the etcd nvme sees 1.7k–2.3k w/s, `aqu-sz` ~35–37, and
+tasks take ~150s vs a ~30s baseline — a small-file write storm.
+
+**Root cause.** Each pod writes its uv cache (`/root/.cache/uv`) to the overlayfs
+on disk; 100 pods × many small wheel writes overwhelms the nvme with journal
+amplification.
+
+**Fix.** Put the uv cache on tmpfs via a Kyverno mutating policy that injects, on
+each sandbox pod:
+
+- `emptyDir { medium: Memory, sizeLimit: 1Gi }` mounted at `/root/.cache/uv`
+- `UV_LINK_MODE=copy`
+- a pod-level `resources.limits.memory` headroom (e.g. 8Gi)
+
+Result: `aqu-sz` 37 → 6 (~6× drop), w/s roughly halved, nvme `%util` 100% → ~25%,
+and the `ContainerCreating` queue clears.

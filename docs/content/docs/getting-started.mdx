@@ -1,0 +1,201 @@
+---
+title: Getting Started
+description: Set up SWE-Lego-RL and launch your first training run
+---
+
+Every workload — training, evaluation, or batch inference — follows the same five
+steps:
+
+```text
+1. build the venv        bash scripts/setup_env.sh              (once per machine)
+2. describe the cluster  cp lib/site.example.env lib/site.env   (once per cluster)
+3. copy a template       cp train/templates/X.env train/configs/mine.env
+4. validate              PREFLIGHT_ONLY=1  then  DRY_RUN=1   (checks only, nothing launches)
+5. launch                bash scripts/train/train.sh train/configs/mine.env
+```
+
+The same five steps drive all three workloads — replace `train` with `eval`
+(score a checkpoint) or `infer` (batch trajectory generation).
+
+## Launch paths
+
+Steps 1–3 — build the venv, describe the cluster, form a config from a
+template — are yours either way. From there the run itself has two equivalent
+paths: execute the runner **by hand**, or hand the config to the
+**[agent plugin](/docs/agent-plugin)** (`/rl:*` skills for
+[Claude Code](https://claude.com/claude-code)), which validates it, asks for an
+explicit confirmation, and launches the same runner:
+
+| | Manual | Through the agent |
+| --- | --- | --- |
+| Validate | `PREFLIGHT_ONLY=1 bash scripts/train/train.sh <config>` | `/rl:check <config>` |
+| Launch | `bash scripts/train/train.sh <config>` | `/rl:run <config>` |
+| Watch | `tail -F logs/<exp>.log` | `/rl:status` |
+| Serve the dashboard | `bash webui/start_dashboard.sh` | `/rl:dashboard` |
+
+Both paths run the same `scripts/lib/preflight.sh`; the agent adds live-machine
+checks (a run already in flight, foreign GPUs, a taken port) and a structured
+verdict — see [Agent Plugin](/docs/agent-plugin). The manual steps follow below.
+
+## Prerequisites
+
+- **8× GPU** (A100/H100-class) on the training node — on the single-node path vLLM
+  serves the policy and verl runs the trainer on the same host.
+- **A [sandbox backend](/docs/run-training/backends)** — a reachable
+  **Kubernetes** cluster (production) or a **Docker** daemon (local or remote)
+  for Harbor to run each trial in.
+- **[uv](https://docs.astral.sh/uv/)** — used by `scripts/setup_env.sh` to build the
+  training venv.
+- **A policy checkpoint** — e.g. an SFT-trained Qwen3 model on local disk.
+- **Train/val task indexes**: thin parquet
+  [pointer tables](/docs/data-preparation#task-index) the trainer samples from —
+  build one with `utils/create_task_index.py`, or produce a difficulty-filtered
+  one with [batch inference](/docs/run-training/infer).
+- **Task environment images**, prebuilt and pushed to a registry your cluster can
+  reach. See the image-source callout in
+  [Inputs & Configuration](/docs/reference/io#site-variables) — this is the single
+  most common reason a first run produces nothing but `env_setup_failed`.
+
+<Callout title="Where to run" type="info">
+Training is hours-long — launch it inside a `tmux` session (or with `nohup setsid`)
+so it survives shell disconnects.
+</Callout>
+
+## 1. Venv
+
+`scripts/setup_env.sh` builds the venv at `.venv` via `uv`, and clones + editably
+installs `harbor` and `verl` (plus pinned vllm / flash_attn / transformers / cupy).
+It is idempotent:
+
+```bash
+bash scripts/setup_env.sh
+```
+
+Key overrides (env vars): `VENV_PATH`, `HARBOR_DIR` / `VERL_DIR` (clone locations),
+`HARBOR_REF` / `VERL_REF` (branches), `PYTHON_VERSION` (default `3.12.3`), and the
+`SKIP_CLONE` / `SKIP_FLASH_ATTN` / `SKIP_CUPY` flags. Confirm the editable installs
+resolve to the trees you expect:
+
+```bash
+.venv/bin/python -c "import harbor, verl, verl_patch; print(harbor.__file__)"
+```
+
+## 2. Site config
+
+Everything cluster-specific lives in one file, never in a run config:
+
+```bash
+cp scripts/lib/site.example.env scripts/lib/site.env
+$EDITOR scripts/lib/site.env
+```
+
+Fill in at least `MODEL_ROOT` (where your checkpoints live) and `K8S_KUBECONFIG`,
+plus `HARBOR_OPENSWE_IMAGE_REGISTRY` if you have a prebuilt-image registry. Leaving
+a value empty is legal — it falls back to the portable-but-slower path. See
+[Site variables](/docs/reference/io#site-variables) for the full surface.
+
+<Callout title="You only do this once" type="info">
+`site.env` is sourced automatically by every runner. Nothing below this point holds
+a cluster address, so the same config file is portable to a colleague's cluster once
+they write their own `site.env`.
+</Callout>
+
+## 3. Run config
+
+Templates are named by their **axes**: `<mode>_<backend>_<scaffold>_<model>.env`.
+Pick the one matching what you want to run and copy it into `configs/`:
+
+```bash
+ls scripts/train/templates/
+#   async_k8s_ohsdk_qwen35a3b.env    sync_k8s_ohsdk_qwen35a3b.env
+#   async_k8s_cc_qwen3-30b-a3b.env   sync_docker_oh_qwen3-30b-a3b.env   ...
+
+cp scripts/train/templates/sync_k8s_ohsdk_qwen35a3b.env \
+   scripts/train/configs/my_first_run.env
+```
+
+Then edit only the `CHANGEME` lines — experiment name, data indexes, topology:
+
+```bash
+PROJECT_NAME=my-project
+EXP_TAG=first-run
+MODEL_PRESET=qwen35a3b            # fills MODEL_PATH / TOOL_PARSER / ENGINE / SP_SIZE / window
+TRAIN_INDEX=/data/harbor_indexes/train.parquet
+VAL_INDEX=/data/harbor_indexes/val.parquet
+NNODES=1
+```
+
+Everything else has a default. To tune a knob the template doesn't mention, add one
+`KEY=VALUE` line — see [parameter tiers](/docs/reference/io#parameter-tiers).
+
+<Callout title="Smoke first" type="info">
+On a new model, scaffold, or cluster, start from a smoke config (`TRAIN_BSZ=8`
+`N_RESP=4`). It is ~8× faster per step and validates the whole plumbing. Its
+gradients are noisy and its reward groups degenerate, so read it as a *plumbing*
+check, never as a learning-quality signal.
+</Callout>
+
+## 4. Validation
+
+`PREFLIGHT_ONLY=1` and `DRY_RUN=1` are environment-variable switches understood
+by every runner: the same launch command runs its config resolution and checks,
+prints the report, and **exits without starting anything** — no GPU, no
+cluster, no side effects. Use them in this order:
+
+```bash
+# 1. config validation — 9 classes of fatal assertion, no cluster needed
+PREFLIGHT_ONLY=1 bash scripts/train/train.sh train/configs/my_first_run.env
+
+# 2. print the fully expanded launch command without running it
+DRY_RUN=1 bash scripts/train/train.sh train/configs/my_first_run.env
+```
+
+Preflight refuses to continue on any `✗ FATAL`. It catches the mistakes that
+otherwise cost a multi-hour run: a `tool_parser` that doesn't match the
+model × scaffold pair, a topology whose node counts don't add up, an `SP_SIZE` that
+doesn't divide the training world, R3 enabled without the new verl tree, and a
+config with no reachable image source. See [Preflight](/docs/run-training/preflight)
+for the full list and what each failure means.
+
+Through the agent, the equivalent is `/rl:check <config>` — the same assertions,
+plus the live-machine checks. See [Agent Plugin](/docs/agent-plugin).
+
+## 5. Launch
+
+```bash
+bash scripts/train/train.sh train/configs/my_first_run.env
+```
+
+(or `/rl:run train/configs/my_first_run.env` through the agent, which launches
+in the background after an explicit confirmation.)
+
+The runner brings up Ray, boots vLLM, starts the in-process proxy, and drives the
+PPO/GRPO/GSPO loop. vLLM CUDA-graph capture on a 30B MoE (TP=4) takes ~10–20 min
+before the first replica registers — this is expected. If a previous run left Ray or
+vLLM processes behind, reset first with `bash scripts/cleanup_before_run.sh`.
+
+## 6. Monitoring
+
+```bash
+tail -F logs/<exp>.log
+bash webui/start_dashboard.sh            # http://<host>:8090 (+ public tunnel)
+```
+
+Checkpoints land under `checkpoints/<project>/<exp>/global_step_N/`. See
+[Results & Artifacts](/docs/run-training/results-and-artifacts) and
+[Dashboard](/docs/dashboard).
+
+## Other workloads
+
+The same contract covers the other two workloads — copy a template, fill the
+`CHANGEME`s, validate, run (by hand or through the agent):
+
+| Goal | Runner | Guide |
+| --- | --- | --- |
+| Train a policy | `scripts/train/train.sh` | this page |
+| Score a checkpoint on a held-out set | `scripts/eval/eval.sh` | [Evaluation](/docs/run-training/eval) |
+| Batch-generate trajectories over an index | `scripts/infer/infer.sh` | [Batch Inference](/docs/run-training/infer) |
+
+When one host is no longer enough — large MoE policies, ≈131k contexts, or
+rollout-bound throughput — switch to an `async_*` template and add nodes. See
+[Scaling Up](/docs/run-training/scaling).

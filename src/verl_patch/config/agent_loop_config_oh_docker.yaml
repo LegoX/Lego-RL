@@ -1,0 +1,46 @@
+# Docker-backend agent loop. Rebuilt 2026-07-16 on the current BuiltinSWEAgentLoop:
+# the old BuiltinOHAgentLoop class was removed in a refactor, leaving this file stale
+# (targeted a non-existent class + missing agent params). Original saved as .yaml.bak.
+# Agent block mirrors agent_loop_config_oh.yaml; environment is RemoteDocker
+# (import_path/force_build read from env; kwargs keep only the agent_runtime_* fields
+# RemoteDockerEnvironment.__init__ accepts — no kubeconfig/namespace/pod_* like k8s).
+- name: builtin_swe_agent
+  _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
+  harbor_cfg:
+    agent:
+      name: ${oc.decode:${oc.env:HARBOR_AGENT_NAME,null}}
+      model_name: hosted_vllm/vllm_model
+      tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+      import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_openhands_ai.openhands:OpenHands}
+      max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,null}}
+      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
+      kwargs:
+        max_iterations: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
+        version: ${oc.env:HARBOR_AGENT_VERSION,0.50.0}
+        disable_tool_calls: ${oc.decode:${oc.env:HARBOR_AGENT_DISABLE_TOOL_CALLS,False}}
+        parser_name: ${oc.env:HARBOR_AGENT_PARSER_NAME,json}
+        model_info: ${oc.decode:${oc.env:HARBOR_AGENT_MODEL_INFO,null}}
+        interleaved_thinking: ${oc.decode:${oc.env:HARBOR_AGENT_INTERLEAVED_THINKING,False}}
+        enable_summarize: ${oc.decode:${oc.env:HARBOR_AGENT_ENABLE_SUMMARIZE,True}}
+        proactive_summarization_threshold: ${oc.decode:${oc.env:HARBOR_AGENT_PROACTIVE_SUMMARIZATION_THRESHOLD,8000}}
+        record_terminal_session: ${oc.decode:${oc.env:HARBOR_AGENT_RECORD_TERMINAL_SESSION,True}}
+        suppress_max_turns_warning: ${oc.decode:${oc.env:HARBOR_AGENT_SUPPRESS_MAX_TURNS_WARNING,True}}
+    verifier:
+      enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+    environment:
+      type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+      import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.remote_docker:RemoteDockerEnvironment}
+      force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,True}}
+      delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+      override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+      override_memory_mb: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB,8192}}
+      kwargs:
+        agent_runtime_image: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE,yuantao428/harbor-openhands-ai-runtime:0.50.0}
+        agent_runtime_mount_path: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/openhands-ai}
+        agent_runtime_image_subpath: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH,opt/custom-agent-runtime/openhands-ai}
+    environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+    agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+    agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
+    verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
+    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}

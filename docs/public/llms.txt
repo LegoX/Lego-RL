@@ -1,0 +1,51 @@
+# SWE-Lego-RL Documentation
+
+> SWE-Lego-RL trains real coding agents with online reinforcement learning on real repositories: the agent drives the same model it is training, a verifier grades the result, and the trainer updates the weights.
+
+- [Introduction](https://swe-lego-rl.pages.dev/docs): What SWE-Lego-RL is and how the pieces fit together
+
+- [Getting Started](https://swe-lego-rl.pages.dev/docs/getting-started): Set up SWE-Lego-RL and launch your first training run
+
+- [Data Preparation](https://swe-lego-rl.pages.dev/docs/data-preparation): Raw issues → Harbor task instances → sandbox images → a filtered task index
+
+## Example Usages
+
+- [Evaluation](https://swe-lego-rl.pages.dev/docs/run-training/eval): Score a checkpoint on a held-out task set with the eval runner
+- [Batch Inference](https://swe-lego-rl.pages.dev/docs/run-training/infer): Batch-generate trajectories over a task index — for difficulty filtering and data selection
+- [Scaling Up](https://swe-lego-rl.pages.dev/docs/run-training/scaling): When and how to move from the single-node default to a multi-node, fully-async run
+- [Preflight](https://swe-lego-rl.pages.dev/docs/run-training/preflight): The nine assertion classes that run before any launch
+- [Backends](https://swe-lego-rl.pages.dev/docs/run-training/backends): Kubernetes and Docker sandboxes for Harbor trials — config, provisioning, and permissions
+- [Inference Stack](https://swe-lego-rl.pages.dev/docs/run-training/inference-stack): The agent → in-process proxy → vLLM chain and its health checks
+- [Results & Artifacts](https://swe-lego-rl.pages.dev/docs/run-training/results-and-artifacts): Where logs, checkpoints, and trajectories land
+
+- [Core Concepts](https://swe-lego-rl.pages.dev/docs/core-concepts): The terminology and training formulation used across SWE-Lego-RL, with references
+
+## Block Design
+
+- [Environment](https://swe-lego-rl.pages.dev/docs/architecture/environment): Sandboxed execution, the verifier, the scaffolds, and the backends
+- [AgentLoopWorkers](https://swe-lego-rl.pages.dev/docs/architecture/agent-loop-workers): The concurrent workers that run scaffolds and capture rollouts
+- [In-Process Proxy](https://swe-lego-rl.pages.dev/docs/architecture/in-process-proxy): One unified API in front of the policy that captures every trajectory
+- [Global Load Balancer](https://swe-lego-rl.pages.dev/docs/architecture/global-load-balancer): Spreading requests across inference replicas with sticky routing
+- [Session-Level Scheduler](https://swe-lego-rl.pages.dev/docs/architecture/session-scheduler): Admission control that protects the prefix cache when KV pressure is high
+- [Rollouter](https://swe-lego-rl.pages.dev/docs/architecture/rollouter): The vLLM inference-server pool, the rollout data buffer, and weight sync
+- [Trainer](https://swe-lego-rl.pages.dev/docs/architecture/trainer): The verl actor — backends, algorithms, and training modes
+
+- [Agent Plugin](https://swe-lego-rl.pages.dev/docs/agent-plugin): Validate, launch, and diagnose runs through a coding agent — or fall back to the same commands by hand
+
+- [Dashboard](https://swe-lego-rl.pages.dev/docs/dashboard): Watch reward, KL, MFU, and response length live
+
+## Troubleshooting
+
+- [Training Startup](https://swe-lego-rl.pages.dev/docs/troubleshooting/training-startup): Model-format and serving issues that surface the moment a run starts
+- [Rewards & Throughput](https://swe-lego-rl.pages.dev/docs/troubleshooting/rewards-and-throughput): When the reward signal is stuck at zero, or the host degrades over time
+- [Fully-Async val Deadlock](https://swe-lego-rl.pages.dev/docs/troubleshooting/async-val-deadlock): The first validation hangs forever because do_validate blocks the actor's event loop — pinned with py-spy, not guessed
+- [Low Val Scores That Are Not the Model](https://swe-lego-rl.pages.dev/docs/troubleshooting/val-false-zero): Four infrastructure causes of a low or zero val score, how to tell them apart, and how to re-score a finished run without re-running the agent
+- [Offline Eval Garbled Output / All-Zero Reward](https://swe-lego-rl.pages.dev/docs/troubleshooting/offline-eval-garbage): A standalone val_only eval emits garbled output even for a known-good checkpoint — the colocated verl serving path, not the model
+- [Sandbox Backends](https://swe-lego-rl.pages.dev/docs/troubleshooting/sandbox-backends): Docker and Kubernetes runtime issues behind the Harbor sandboxes
+
+## Reference
+
+- [Inputs & Configuration](https://swe-lego-rl.pages.dev/docs/reference/io): The three config layers, the runner contract, and what a run writes out
+- [Status & State](https://swe-lego-rl.pages.dev/docs/reference/status): How to tell what is running and what a run did
+- [Config Variants](https://swe-lego-rl.pages.dev/docs/reference/config-variants): The config lines for the edits you make most often
+- [Contributing to the Docs](https://swe-lego-rl.pages.dev/docs/reference/docs-site): How this documentation site is built, previewed, and deployed

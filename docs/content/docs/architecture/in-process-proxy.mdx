@@ -1,0 +1,83 @@
+---
+title: In-Process Proxy
+description: One unified API in front of the policy that captures every trajectory
+---
+
+The **In-Process Proxy** (`src/verl_patch/agent_loop/vllm_chat_completion_proxy.py`)
+is the single seam between every scaffold and the self-served policy: one
+process, one unified API, exact token-level capture — **no standalone LiteLLM,
+no fixed port**.
+
+## Unified API
+
+The proxy is started by the verl agent loop on the training host, binds an
+ephemeral port, and hands each trial a unique **per-session URL**. Both protocol
+families are served from the same process:
+
+```python
+# vllm_chat_completion_proxy.py — route table
+self._app.router.add_post("/sess/{session_id}/v1/chat/completions", self._handle_chat)      # OpenAI
+self._app.router.add_post("/sess/{session_id}/v1/messages",         self._handle_messages)  # Anthropic
+self._app.router.add_get ("/v1/models",                             self._handle_models)
+```
+
+A scaffold needs zero changes — its base URL is overridden per trial:
+
+```bash
+# Claude Code                          # OpenHands / OpenCode / Terminus
+ANTHROPIC_BASE_URL=http://<host>:<port>/sess/<id>   OPENAI_API_BASE=http://<host>:<port>/sess/<id>/v1
+```
+
+## Trajectory capture
+
+The capture pipeline runs once per model call, in five steps:
+
+1. **Tokenize** the incoming messages through the *same* `apply_chat_template`
+   path as verl — incremental, byte-equivalent to a one-shot render, so proxy
+   tokens and trainer tokens can never disagree.
+2. **Prefix-check** against the session's token accumulator. If the agent
+   rewrote earlier history (compaction, injected reminders), the rebuilt
+   prefix's log-probabilities are **recomputed via vLLM `prompt_logprobs`**
+   instead of being zero-filled
+   (kill-switch: `HARBOR_RECOMPUTE_MISMATCH_LOGPROBS=0`).
+3. **Generate** through `server_manager.generate(...)` — never vLLM directly —
+   so load balancing, admission control, and partial-rollout resume apply
+   transparently.
+4. **Append verbatim** the sampled token ids, response mask, per-token
+   log-probabilities, and (for MoE) expert-routing decisions to the session
+   state:
+
+```python
+# per-session accumulator — the token source of truth
+sess = {
+    "traj_acc_ids":            [],   # prompt + response token ids, turn by turn
+    "traj_response_mask":      [],   # 1 = policy token, 0 = tool/user token
+    "traj_response_logprobs":  [],   # behavior-policy logprobs, as sampled
+    "traj_response_routing":   [],   # MoE expert choices (consumed by R3)
+}
+```
+
+5. **Archive** — at trial end the agent loop builds its training output straight
+   from this accumulator (see
+   [AgentLoopWorkers](/docs/architecture/agent-loop-workers)) and a per-trial
+   `proxy_trajectory.json` is written under `harbor_trials/` for inspection.
+
+There is no transcript re-tokenization anywhere in this path: what vLLM
+sampled is what the trainer scores.
+
+## Admission control
+
+Before a call is forwarded, it passes an optional admission gate — the
+[Session-Level Scheduler](/docs/architecture/session-scheduler). Disabled by
+default; when enabled it holds cold sessions back under high KV pressure so
+resident prefixes are not evicted.
+
+## Partial rollout
+
+Because the proxy forwards to verl's `server_manager` rather than to vLLM
+directly, vLLM aborts/retries — and the fully-async **partial rollout** path
+(resuming a generation interrupted by a weight sync) — are handled transparently
+on the way through.
+
+> Readiness checks and failure symptoms:
+> [Inference Stack](/docs/run-training/inference-stack).

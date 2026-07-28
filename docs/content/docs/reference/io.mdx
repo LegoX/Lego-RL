@@ -1,0 +1,178 @@
+---
+title: Inputs & Configuration
+description: The three config layers, the runner contract, and what a run writes out
+---
+
+SWE-Lego-RL has **no `config.yaml`**. A run is defined by a small `.env` **config file**
+handed to one of three **runners**, which fill in everything else from shared
+libraries:
+
+```bash
+bash scripts/train/train.sh  train/configs/my_run.env
+bash scripts/eval/eval.sh    eval/configs/my_eval.env
+bash scripts/infer/infer.sh  infer/configs/my_infer.env
+```
+
+The runner sources the config, applies the model preset, resolves the scaffold and
+backend, runs [preflight](/docs/run-training/preflight), and finally execs verl
+(`fully_async_main` or `main_ppo`) with the Hydra overrides built from those values.
+Anything the config omits gets a default — so a config file is ~20 lines, not ~100.
+
+## Config layers
+
+Read this table top to bottom — it answers "where does this value belong?".
+
+| Layer | File | Scope | Changes |
+| --- | --- | --- | --- |
+| **Site** | `scripts/lib/site.env` | this *cluster*: registry, nydus mirror, hostPath mounts, kubeconfig, docker daemon, `MODEL_ROOT`, `NEW_VERL_DIR` | once, when you move clusters |
+| **Template** | `scripts/{train,eval,infer}/templates/*.env` | a *structural* combination (mode × backend × scaffold × model) | never — you copy it |
+| **Config** | `scripts/{train,eval,infer}/configs/*.env` | one concrete *experiment*: names, data, topology, cadence | every run |
+
+`lib/common_env.sh` auto-sources `site.env` if present. **Nothing cluster-specific
+is hardcoded in the runners or libs** — with no `site.env` the whole stack falls
+back to a portable vanilla path (in-pod inline build, no mounts, no image rewrite):
+slower, but it runs anywhere.
+
+<Callout title="site.env is personal" type="warn">
+`lib/site.env` holds your cluster's registry addresses, kubeconfig path, and mounts.
+Copy `lib/site.example.env` when onboarding a new cluster, and do **not** hand your
+own `site.env` to someone else.
+</Callout>
+
+## Parameter tiers
+
+Which knobs you are expected to touch, and which are managed for you:
+
+| Tier | Who changes it | Examples | Lives in |
+| --- | --- | --- | --- |
+| **T0 axes** | picked once, by choosing a template | `TRAIN_MODE` `SCAFFOLD` `BACKEND` `MODEL_PRESET` | template filename + first lines |
+| **T1 required** | every run | `PROJECT_NAME` `EXP_TAG` `TRAIN_INDEX`/`VAL_INDEX` topology | the `CHANGEME` lines |
+| **T2 often tuned** | frequently | `SAVE_FREQ` `TOTAL_EPOCHS` `TRAIN_BSZ` `N_RESP` `MAX_RESP` `VAL_BEFORE_TRAIN` `N_CONCURRENT` | config, add a line |
+| **T3 advanced** | rarely, and know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `KL_LOSS_COEF` | config, overrides a default |
+| **T4 site** | once per cluster | registry / nydus / mounts / kubeconfig / `MODEL_ROOT` / `NEW_VERL_DIR` / `DOCKER_HOST` | `lib/site.env` |
+| **T5 hidden** | basically never | ~80 harbor + hyperparameter defaults (loop config, offload, tail-kill, pod timeouts…) | `lib/*` + the runner |
+
+Templates carry T0–T1 plus a few T2 examples. To set a T2/T3 knob, add one
+`KEY=VALUE` line to your config. **Multi-word values must be quoted**
+(`EVAL_VLLM_EXTRA_ARGS="--enforce-eager --dtype bfloat16"`).
+
+## T0 — the axes
+
+Only these require picking a different template; everything else is a parameter.
+
+| Axis | Values | What it switches |
+| --- | --- | --- |
+| `TRAIN_MODE` | `async` \| `sync` | `fully_async_main` + `fully_async_fsdp.yaml` (split train/rollout pools) vs `main_ppo` + `sync.yaml` (one colocated pool) |
+| `ENGINE` | `veomni` \| `fsdp` | `model_engine=veomni` + `veomni.*` (required for hybrid-GDN models) vs `strategy=fsdp2` + `fsdp_config.*`. **Chosen by the model preset — normally leave it alone** |
+| `SCAFFOLD` | `ohsdk` \| `oh` \| `cc` \| `oc` | agent class + runtime image + agent-loop config. `ohsdk` is primary; `cc` = Claude Code; `oc` = OpenCode |
+| `BACKEND` | `k8s` \| `docker` | sandbox backend — see [Backends](/docs/run-training/backends) |
+| `MODEL_PRESET` | see below | fills `MODEL_PATH` `TOOL_PARSER` `ENGINE` `SP_SIZE` + context window |
+
+Node counts (`NNODES`, `N_NODES_TRAIN`, `N_NODES_ROLLOUT`) are plain parameters, not
+axes — the same template scales from one node to four.
+
+### Model presets
+
+A preset fills a whole slot of correlated values, so swapping models is a one-line
+change. It only fills what the config left unset — an explicit `MODEL_PATH` always
+wins.
+
+| Preset | Model | Engine | `SP_SIZE` | Window (prompt + response) | `TOOL_PARSER` |
+| --- | --- | --- | --- | --- | --- |
+| `qwen35a3b` | Qwen3.5-35B-A3B (hybrid-GDN MoE) | veomni | 4 | 40 000 + 91 072 | `qwen3_coder` |
+| `qwen3-30b-a3b` | Qwen3-30B-A3B-Instruct-2507 (MoE) | veomni | 4 | 40 000 + 91 072 | by scaffold † |
+| `qwen36-27b` | Qwen3.6-27B (dense hybrid-mamba) | fsdp | 1 | 167 232 + 32 768 | `qwen3_coder` |
+
+† **`tool_parser` is not a pure function of the model.** Qwen3.5/3.6 chat templates
+emit XML → always `qwen3_coder`. The 30B is `qwen3_coder` under `cc` but `hermes`
+under `ohsdk`/`oh`. The preset resolves this from `SCAFFOLD`, and preflight
+re-checks it — getting it wrong means a 100% tool-parse failure rate on step 0 (see
+[Tool-call parser mismatch](/docs/troubleshooting/training-startup#tool-call-parser-mismatch)).
+
+For a model not in the table, leave `MODEL_PRESET` empty and set `MODEL_PATH`,
+`TOOL_PARSER`, `ENGINE`, `SP_SIZE`, `MAX_PROMPT`, and `MAX_RESP` explicitly.
+
+## T1 — required fields
+
+**train** — `PROJECT_NAME` · `EXP_TAG` · `TRAIN_INDEX` · `VAL_INDEX` · topology:
+
+| Variable | Meaning |
+| --- | --- |
+| `PROJECT_NAME` / `EXP_TAG` | wandb project + experiment name; also the `checkpoints/` and `harbor_trials/` path |
+| `TRAIN_INDEX` / `VAL_INDEX` | [Task indexes](/docs/data-preparation#task-index) — thin parquet rows pointing at Harbor task dirs |
+| `NNODES` / `N_NODES_TRAIN` / `N_NODES_ROLLOUT` | topology. **`NNODES` must equal the sum** — preflight is fatal otherwise, because a mismatched Ray cluster hangs in placement |
+| `POD_NAME_PREFIX` | label prefix for this run's sandbox pods (used by cleanup) |
+
+**eval** replaces the data inputs with `DATASET_PATH` (a directory of harbor task
+dirs) or `DATASET_NAME` + `N_TASKS`, and adds serving knobs: `GEN_TP`,
+`EVAL_TEMPERATURE`, `MAX_INPUT_TOKENS` / `MAX_OUTPUT_TOKENS` / `MAX_MODEL_LEN`,
+`N_CONCURRENT`, and `EVAL_ENABLE_EXPERT_PARALLEL` (dense → `false`, MoE → `true`).
+
+**infer** takes a base `TRAIN_INDEX` plus `RESULTS_DIR` + `OUTPUT_INDEX`, an optional
+per-node `INSTANCES_FILE` shard, `N_TRIALS` / `N_CONCURRENT`, and the vLLM topology
+(`GEN_TP`, `GEN_DP`, `VLLM_NNODES`, `VLLM_HEAD_HOST`). A multi-node DP run uses the
+*same* config on every node; whichever node's IP matches `VLLM_HEAD_HOST` becomes
+rank 0.
+
+## Site variables
+
+The full `lib/site.env` surface. Empty is always legal — it just turns the
+corresponding acceleration off.
+
+| Variable | Purpose | Empty means |
+| --- | --- | --- |
+| `MODEL_ROOT` | where `model_presets` looks up `<model-name>` | presets can't resolve paths — set `MODEL_PATH` yourself |
+| `NEW_VERL_DIR` | the `verl-swe_agent_opd_dev` worktree carrying the veomni / R3 / async fixes | required whenever `USE_NEW_VERL=1` |
+| `K8S_KUBECONFIG` | k8s backend cluster | falls back to `$HOME/.kube/config` |
+| `HARBOR_OPENSWE_IMAGE_REGISTRY` | prebuilt per-instance task images | in-pod inline build (slow, needs egress) |
+| `HARBOR_NYDUS_MIRROR` | rewrites official `docker.io/swebench/...` val images to a local mirror | val images must be pullable from Docker Hub |
+| `HARBOR_HOSTPATH_MOUNTS` | JSON list of `{host_path, mount_path, read_only}` for offline grading assets | `null` — no mounts |
+| `DOCKER_HOST` | remote docker daemon (`BACKEND=docker` only) | local socket |
+
+<Callout title="Image source is the biggest portability gotcha" type="warn">
+On **k8s**, `force_build` is ignored — `KubernetesEnvironment` only *pulls*, never
+builds. Without a prebuilt image in a reachable registry (or a Dockerfile whose
+`FROM` is pullable) every pod ends in `ImagePullBackOff` → `env_setup_failed` →
+reward 0. On **docker** you can `force_build=True` instead, but the daemon's builder
+needs egress. For real training runs (hundreds–thousands of instances) prebuild and
+push; per-rollout dependency installs do not scale. If your registry is plain HTTP,
+**every** consumer must trust it as insecure — containerd `certs.d/hosts.toml` on
+each node, or `insecure-registries` in `/etc/docker/daemon.json`.
+</Callout>
+
+## Hyperparameters
+
+Set these in the config when you want to move off the defaults:
+
+```bash
+adv_estimator=grpo            # ppo | grpo
+policy_loss_mode=gspo         # sequence-level policy loss
+learning_rate=1.0e-06
+LR_SCHEDULER=constant         # keep constant on fully-async (see preflight)
+TRAIN_BSZ=64
+N_RESP=8                      # 64 × 8 = 512 trials/step
+MAX_PROMPT=40000
+MAX_RESP=91072                # window = prompt + response
+SAVE_FREQ=5
+TOTAL_EPOCHS=3
+TEMPERATURE=1.0
+```
+
+## Outputs
+
+A run writes, relative to the repo root:
+
+| Output | Path | Notes |
+| --- | --- | --- |
+| Checkpoints | `checkpoints/<project>/<exp>/global_step_N/` | actor FSDP shards, every `SAVE_FREQ` steps |
+| Training log | `logs/<exp>.log` | carries the `step:N - key:value` metric lines |
+| Throughput log | `logs/<exp>_vllm.log` | throughput only (the dashboard skips it) |
+| Trajectories | `harbor_trials/<project>/<exp>/step_*/<session>/proxy_trajectory.json` | per-trial token ids / masks / logprobs |
+| Curves / val resolve rate | wandb + dashboard | see [Dashboard](/docs/dashboard) |
+
+**infer** additionally writes `RESULTS_DIR` (per-trial results) and `OUTPUT_INDEX`
+(the selected-instances parquet); **eval** writes harbor trial dirs plus the score
+summary in its log.
+
+See [Results & Artifacts](/docs/run-training/results-and-artifacts) for the layout
+and [Config Variants](/docs/reference/config-variants) for the edits you make most.

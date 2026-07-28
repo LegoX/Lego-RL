@@ -1,0 +1,166 @@
+---
+title: Dashboard
+description: Watch reward, KL, MFU, and response length live
+---
+
+SWE-Lego-RL ships a self-contained training dashboard (`webui/`) that reads your run
+logs and renders live metric charts, a run comparison view, an agent-trajectory
+browser, and optional LLM analysis — open it locally or over a public tunnel.
+
+<Callout title="Tunnel URLs are ephemeral" type="info">
+The public URL printed by `start_dashboard.sh` (`TUNNEL=true`) is a Cloudflare
+**quick tunnel**; it changes each time the tunnel restarts, so avoid writing it
+into documents. For a stable public URL, deploy the frontend to a Cloudflare
+Pages project instead.
+</Callout>
+
+## Run discovery
+
+`webui/server.py` discovers `.log`/`.out` files under the log dir (skipping
+`*_vllm.log`) as runs and parses the verl `step:N - key:value - ...` lines,
+cleaning numpy wrappers like `np.float64(...)`. Point it at:
+
+| Source | Path |
+| --- | --- |
+| Training logs | `logs/<exp>.log` |
+| Any extra log dir | via `--extra-log-dir` |
+
+For each run it surfaces the full per-step metric set — reward (`critic/score/mean`),
+`actor/entropy`, `actor/ppo_kl`, `actor/pg_clipfrac`, `perf/mfu/*`,
+`response_length/*`, `rollout_corr/kl`, and `val-*` — plus a trajectory browser
+over the per-trial `harbor_trials/` logs.
+
+## Panels
+
+The sidebar carries fourteen panels, roughly in the order you need them while a
+run is in flight:
+
+| Panel | What it answers |
+| --- | --- |
+| Overview | Is this run alive and how far has it got — plus the resolved config it was launched with |
+| Training Metrics | The per-step curves: reward, entropy, KL, clip fraction, grad norm, MFU |
+| Episode Summary | Per-episode aggregates: turns, lengths, outcomes |
+| Rollout Outcomes | How rollouts ended, and which ones contributed no gradient signal |
+| Token & IS | Token counts and importance-sampling ratios |
+| Task Grid | Per-task solve/fail across steps, one cell per task |
+| Validation | Val score at each `test_freq` step, per-capability breakdown, failure modes, and CoT share |
+| Compare | Two or more runs side by side |
+| AI Analysis | An LLM pass over the run's own metrics and trajectories |
+| Trajectory | The agent transcript for one trial, step by step |
+| Logs | The raw run log |
+| Explorer | Any metric key not covered by a dedicated panel |
+| Import | Load an external run directory as a snapshot |
+| Settings | Log dirs, wandb credentials, language |
+
+<Callout title="Val is scored, not rewarded" type="info">
+The validation panel says **Val Score**, not reward: val is graded pass/fail by
+the verifier, while reward is the training signal. They are different numbers
+produced by different graders, and conflating them is how a grading bug gets
+read as a model regression — see
+[Val scores that are not the model's fault](/docs/troubleshooting/val-false-zero).
+</Callout>
+
+### CoT share
+
+The Validation panel also charts **chain-of-thought as a share of the response**
+per val event, which is often the first place a behavioral shift shows up —
+reasoning can double while the solve rate barely moves.
+
+Two things make the number trustworthy, and both are easy to get wrong:
+
+- **The response includes tool-call arguments.** A coding agent emits its patch
+  in `tool_calls[].function.arguments`, a sibling field of `content`. Scoring CoT
+  against visible text alone roughly doubles the reported share.
+- **Every event is measured over one fixed cohort of tasks.** CoT share varies
+  far more between tasks than between steps, and val dumps drift in composition
+  (stragglers, retries, a node dropping out), so a naive per-event mean tracks
+  which tasks landed in the dump rather than what the model is doing. Points
+  whose coverage of that cohort falls below half are flagged in the chart.
+
+## Guided launch
+
+If you use Claude Code, `/rl:dashboard` brings the board up on whatever machine
+you are on, which is the point: paths, log locations and free ports differ per
+box, and the launcher script hard-codes this repo's.
+
+```
+/rl:dashboard [log-dir]
+```
+
+It probes first (`scripts/lib/dashboard_probe.sh`), decides four things, and
+shows the plan before touching anything:
+
+- **Log dir**: candidates ranked by how many run logs they hold and how recently
+  one was written — not by name.
+- **Port**: lowest free port in 8090–8095; an instance already serving your log
+  dir is reported instead of duplicated.
+- **Rebuild**: `dist/` is rebuilt only when older than `src/` or missing.
+- **Tunnel**: proposed but never silent — a public URL waits for your yes.
+
+```text
+proposed plan
+  log dir   /repo/logs        (600 run logs, newest 0 min ago)
+  port      8092              (free; 8090/8091 taken)
+  frontend  reuse dist/       (fresh)
+  tunnel    yes               (public URL)
+Proceed? [Y]/[N]
+```
+
+After a yes it starts in the background, verifies `/api/runs` actually returns
+runs, and reports the public URL, local address, and PIDs. It also diagnoses the
+two common failures — a tunnel URL that 502s (the tunnel outliving its server)
+and an empty board (the wrong log dir) — and never kills an instance it did not
+start.
+
+<Callout title="The public URL needs no Cloudflare account" type="info">
+`cloudflared tunnel --url http://127.0.0.1:8090` gets a random
+`*.trycloudflare.com` hostname **anonymously** — no login, no token, no domain.
+You never need `cloudflared tunnel login` for this, and logging in does not make
+the URL any more stable.
+
+On a new machine the two things that actually stop you are the `cloudflared`
+binary being absent, and the box having no egress to Cloudflare's edge — common
+on an isolated training node, where the tunnel hangs at startup rather than
+failing loudly. The probe reports both, and the fallback in either case is an SSH
+port-forward: `ssh -L 8090:127.0.0.1:8090 <host>`.
+</Callout>
+
+### Stable public URLs
+
+A quick tunnel mints a new hostname every time it starts, which is why a URL
+written into a doc goes stale. The alternatives are genuinely different things,
+not upgrades:
+
+| Option | Cost | Caveat |
+| --- | --- | --- |
+| Quick tunnel | nothing | New URL on every restart |
+| Named tunnel | A Cloudflare account **and** a domain on it, plus `cloudflared tunnel login` or an API token | Hostname you control; you run the tunnel yourself |
+| Cloudflare Pages (`webui/functions/`) | Account + API token | Fixed `*.pages.dev`, but it reads **wandb**, not your local logs — different data than the local board |
+
+## Manual launch
+
+```bash
+bash webui/start_dashboard.sh
+```
+
+This builds the frontend if `dist/` is missing, starts the API server on
+**`:8090`** (reading `../logs`), and — with `TUNNEL=true` (default) — opens a
+Cloudflare quick tunnel and prints the public URL. Then open `http://<host-ip>:8090`.
+
+Override the server directly:
+
+```bash
+python3 webui/server.py --port 8090 --log-dir logs --static-dir webui/dist \
+  [--extra-log-dir <dir>] [--wandb-entity <e> --wandb-project <p> --wandb-api-key <k>]
+```
+
+`PORT`, `LOG_DIR`, and `TUNNEL` are also honored as env vars by
+`start_dashboard.sh` (see `webui/README.md`).
+
+## Data sources
+
+The local server reads your **log files**; if wandb credentials are supplied it
+can additionally surface runs from the wandb API. A Cloudflare Pages deployment
+(`webui/functions/api/[[path]].ts`) reads runs/metrics straight from wandb and
+does **not** see local log files — so a published board reflects the configured
+wandb project, while the local server reads your launch logs.

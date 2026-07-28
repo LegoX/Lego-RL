@@ -1,0 +1,610 @@
+diff --git a/.gitignore b/.gitignore
+index e6c0f5a0..ad2cd1e2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -129,4 +129,5 @@ ENV/
+ logs
+ log
+ outputs
+-.history
+\ No newline at end of file
++.history
++harbor_trials
+\ No newline at end of file
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 0c8b1318..b51350ba 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -177,7 +177,15 @@ class AsyncLLMServerManager:
+ 
+ 
+ class AgentLoopMetrics(BaseModel):
+-    """Agent loop performance metrics."""
++    """Agent loop performance metrics.
++
++    Standard fields track generic agent loop stages. Subclasses / concrete agent loops
++    may attach arbitrary extra timing fields (e.g. harbor env/agent/verifier phases),
++    which will be preserved by ``model_dump`` and aggregated by
++    :meth:`AgentLoopManager._performance_metrics` as ``agent_loop/{key}/{min,max,mean}``.
++    """
++
++    model_config = ConfigDict(extra="allow")
+ 
+     generate_sequences: float = 0.0
+     tool_calls: float = 0.0
+@@ -594,6 +602,7 @@ class AgentLoopWorker:
+         for i in range(len(batch)):
+             trace_this_sample = i in traced_indices
+             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
++            kwargs["global_steps"] = batch.meta_info.get("global_steps", 0)
+             tasks.append(
+                 asyncio.create_task(
+                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+@@ -1173,13 +1182,28 @@ class AgentLoopManager:
+         Returns:
+             DataProto: Output batch.
+         """
+-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+-        outputs = await asyncio.gather(
+-            *[
+-                worker.generate_sequences.remote(chunk)
+-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+-            ]
+-        )
++        worker_queue = asyncio.Queue()
++        for worker in self.agent_loop_workers:
++            await worker_queue.put(worker)
++        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
++        async def process_task(sample):
++            worker = await worker_queue.get()
++            try:
++                result = await worker.generate_sequences.remote(sample)
++            finally:
++                await worker_queue.put(worker)
++                worker_queue.task_done()
++            return result
++        task = [process_task(sample) for sample in single_samples]
++        outputs = await asyncio.gather(*task)
++
++        # chunkes = prompts.chunk(len(self.agent_loop_workers))
++        # outputs = await asyncio.gather(
++        #     *[
++        #         worker.generate_sequences.remote(chunk)
++        #         for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
++        #     ]
++        # )
+         output = DataProto.concat(outputs)
+ 
+         # calculate performance metrics
+@@ -1221,6 +1245,27 @@ class AgentLoopManager:
+             timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
+             timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+ 
++        # Aggregate any extra timing fields attached by concrete agent loops
++        # (e.g. harbor env/agent/verifier phases). The resulting keys flow into
++        # ``timing_raw`` and surface as ``timing_s/agent_loop/{key}/{min,max,mean}``.
++        standard_keys = {"generate_sequences", "tool_calls", "compute_score", "num_preempted"}
++        extra_keys: set[str] = set()
++        for chunk in metrics:
++            for metric in chunk:
++                extra_keys.update(metric.keys())
++        extra_keys -= standard_keys
++        for key in sorted(extra_keys):
++            values = np.array(
++                [float(metric.get(key) or 0.0) for chunk in metrics for metric in chunk],
++                dtype=np.float64,
++            )
++            if values.size == 0:
++                continue
++            timing[f"agent_loop/{key}/min"] = values.min()
++            timing[f"agent_loop/{key}/max"] = values.max()
++            timing[f"agent_loop/{key}/mean"] = values.mean()
++            timing[f"agent_loop/slowest/{key}"] = values[slowest] if slowest < values.size else values.max()
++
+         return timing
+ 
+     @auto_await
+diff --git a/verl/experimental/fully_async_policy/agent_loop/agent_loop.py b/verl/experimental/fully_async_policy/agent_loop/agent_loop.py
+index 80df41de..7b2c6a75 100644
+--- a/verl/experimental/fully_async_policy/agent_loop/agent_loop.py
++++ b/verl/experimental/fully_async_policy/agent_loop/agent_loop.py
+@@ -39,6 +39,28 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+ 
++def _concat_outputs_same_metrics_layout(outputs: list[DataProto]) -> DataProto:
++    """Merge rollout shards like :meth:`DataProto.concat`, then restore ``meta_info["metrics"]``.
++
++    ``DataProto.concat`` turns per-sample metric dicts into columnar ``dict[str, list]``.
++    A single worker processing a whole batch leaves ``metrics`` as ``list[dict]``.
++    Fully-async splits work across workers and concatenates; without this step,
++    downstream code that assumes ``list[dict]`` (same as one-shot batch rollout)
++    would see a different shape.
++    """
++    merged = DataProto.concat(outputs)
++    m = merged.meta_info.get("metrics")
++    if not isinstance(m, dict) or not m:
++        return merged
++    keys = list(m.keys())
++    lengths = [len(m[k]) for k in keys]
++    if not lengths or min(lengths) != max(lengths):
++        return merged
++    n = lengths[0]
++    merged.meta_info["metrics"] = [{k: m[k][i] for k in keys} for i in range(n)]
++    return merged
++
++
+ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
+     """FullyAsyncLLMServerManager supports resume generation on partial rollout, making rollout interruption
+     invisible to the AgentLoop.
+@@ -167,25 +189,47 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
+         super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
+         if self.distillation_enabled:
+             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
++        # Initialize worker queue for idle worker selection
++        self._worker_queue: Optional[asyncio.Queue] = None
++        self._worker_queue_lock = asyncio.Lock()
++
++    async def _init_worker_queue(self) -> asyncio.Queue:
++        """Initialize worker queue lazily."""
++        async with self._worker_queue_lock:
++            if self._worker_queue is None:
++                self._worker_queue = asyncio.Queue()
++                for worker in self.agent_loop_workers:
++                    await self._worker_queue.put(worker)
++        return self._worker_queue
+ 
+     @auto_await
+     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
+         """Split input batch and dispatch to agent loop workers.
+ 
+         Args:
+-            prompts (DataProto): Input batch. Single sample data
++            prompts (DataProto): Input batch.
+         Returns:
+             DataProto: Output batch.
+         """
+-        worker = self._select_best_worker()
+-        output_future = worker.generate_sequences.remote(prompts)
+-        return await asyncio.wrap_future(output_future.future())
+-
+-    def _select_best_worker(self):
+-        """Select the best worker, simple round-robin load balancing"""
+-        if not hasattr(self, "_worker_index"):
+-            self._worker_index = 0
+-
+-        worker = self.agent_loop_workers[self._worker_index]
+-        self._worker_index = (self._worker_index + 1) % len(self.agent_loop_workers)
+-        return worker
++        # Split to single-sample tasks and dispatch at worker granularity.
++        queue = await self._init_worker_queue()
++        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
++
++        async def process_task(sample: DataProto) -> DataProto:
++            worker = await queue.get()
++            try:
++                output_future = worker.generate_sequences.remote(sample)
++                result = await asyncio.wrap_future(output_future.future())
++                return result
++            finally:
++                # Always return worker to queue after task completes or fails.
++                await queue.put(worker)
++                queue.task_done()
++
++        outputs = await asyncio.gather(*[process_task(sample) for sample in single_samples])
++        return _concat_outputs_same_metrics_layout(outputs)
++
++    async def _select_best_worker(self):
++        """Select an idle worker from queue (deprecated, use queue directly)."""
++        queue = await self._init_worker_queue()
++        return await queue.get()
+diff --git a/verl/experimental/fully_async_policy/detach_utils.py b/verl/experimental/fully_async_policy/detach_utils.py
+index 9796d4cf..3e255656 100644
+--- a/verl/experimental/fully_async_policy/detach_utils.py
++++ b/verl/experimental/fully_async_policy/detach_utils.py
+@@ -72,21 +72,112 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
+         )
+ 
+     # Setting selected agent, that supports partial
+-    if not config.actor_rollout_ref.rollout.multi_turn.enable:
+-        full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
++    if config.actor_rollout_ref.rollout.multi_turn.enable:
++        full_batch.non_tensor_batch["agent_name"] = np.array(["tool_agent"] * len(full_batch), dtype=object)
++    else:
++        # full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
++        pass
+ 
+     # Add global step count to generated data
+     full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
+     return full_batch
+ 
+ 
++# Same semantic keys as ``AgentLoopManager._performance_metrics`` (agent_loop.py).
++_AGENT_LOOP_STANDARD_METRIC_KEYS = frozenset(
++    {"generate_sequences", "tool_calls", "compute_score", "num_preempted"}
++)
++
++
++def _aggregate_agent_loop_timing_meta(final_batch: DataProto) -> dict[str, float]:
++    """Mirror :meth:`AgentLoopManager._performance_metrics` for fully-async assembly.
++
++    Populates ``timing_s/agent_loop/...`` keys so ``FullyAsyncTrainer._collect_metrics_from_samples``
++    forwards them into ``self.metrics`` and loggers (same surface as synchronous rollout).
++    """
++    pt = np.asarray(final_batch.non_tensor_batch["processing_times"], dtype=np.float64)
++    tc = np.asarray(final_batch.non_tensor_batch["tool_calls_times"], dtype=np.float64)
++    n = pt.shape[0]
++    if "compute_score_times" in final_batch.non_tensor_batch:
++        t_cs = np.asarray(final_batch.non_tensor_batch["compute_score_times"], dtype=np.float64)
++    else:
++        t_cs = np.zeros(n, dtype=np.float64)
++    if "num_preempted_vals" in final_batch.non_tensor_batch:
++        npm = np.asarray(final_batch.non_tensor_batch["num_preempted_vals"], dtype=np.float64)
++    else:
++        npm = np.full(n, -1.0, dtype=np.float64)
++
++    slowest = int(np.argmax(pt + tc + t_cs)) if n > 0 else 0
++
++    out: dict[str, float] = {}
++    for name, arr in (
++        ("generate_sequences", pt),
++        ("tool_calls", tc),
++        ("compute_score", t_cs),
++        ("num_preempted", npm),
++    ):
++        if arr.size == 0:
++            continue
++        out[f"timing_s/agent_loop/{name}/min"] = float(arr.min())
++        out[f"timing_s/agent_loop/{name}/max"] = float(arr.max())
++        out[f"timing_s/agent_loop/{name}/mean"] = float(arr.mean())
++        if slowest < arr.size:
++            out[f"timing_s/agent_loop/slowest/{name}"] = float(arr[slowest])
++
++    extra_keys: set[str] = set()
++    for nk in final_batch.non_tensor_batch.keys():
++        if nk.startswith("_al_timing_"):
++            extra_keys.add(nk[len("_al_timing_") :])
++    for key in sorted(extra_keys):
++        vals = np.asarray(final_batch.non_tensor_batch[f"_al_timing_{key}"], dtype=np.float64)
++        if vals.size == 0:
++            continue
++        out[f"timing_s/agent_loop/{key}/min"] = float(vals.min())
++        out[f"timing_s/agent_loop/{key}/max"] = float(vals.max())
++        out[f"timing_s/agent_loop/{key}/mean"] = float(vals.mean())
++        if slowest < vals.size:
++            out[f"timing_s/agent_loop/slowest/{key}"] = float(vals[slowest])
++
++    if (
++        n > 0
++        and "attention_mask" in final_batch.batch
++        and "prompts" in final_batch.batch
++        and slowest < n
++    ):
++        prompt_length = int(final_batch.batch["prompts"].shape[1])
++        attention_mask = final_batch.batch["attention_mask"][slowest]
++        plen = min(prompt_length, int(attention_mask.shape[0]))
++        out["timing_s/agent_loop/slowest/prompt_length"] = float(attention_mask[:plen].sum().item())
++        out["timing_s/agent_loop/slowest/response_length"] = float(attention_mask[plen:].sum().item())
++
++    return out
++
++
+ def addition_process(output: DataProto):
+     """collect metirics"""
+-    metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
+-    processing_times_list = [item["generate_sequences"] for item in metrics]
+-    tool_calls_times_list = [item["tool_calls"] for item in metrics]
+-    output.non_tensor_batch["processing_times"] = processing_times_list
+-    output.non_tensor_batch["tool_calls_times"] = tool_calls_times_list
++    metrics_list = output.meta_info.pop("metrics")  # List[Dict[str, Any]]
++    output.non_tensor_batch["processing_times"] = np.asarray(
++        [item["generate_sequences"] for item in metrics_list], dtype=np.float64
++    )
++    output.non_tensor_batch["tool_calls_times"] = np.asarray(
++        [item["tool_calls"] for item in metrics_list], dtype=np.float64
++    )
++    output.non_tensor_batch["compute_score_times"] = np.asarray(
++        [float(item.get("compute_score") or 0.0) for item in metrics_list], dtype=np.float64
++    )
++    output.non_tensor_batch["num_preempted_vals"] = np.asarray(
++        [float(item.get("num_preempted", -1)) for item in metrics_list], dtype=np.float64
++    )
++
++    extra_keys: set[str] = set()
++    for m in metrics_list:
++        extra_keys.update(m.keys())
++    extra_keys -= _AGENT_LOOP_STANDARD_METRIC_KEYS
++    for key in sorted(extra_keys):
++        output.non_tensor_batch[f"_al_timing_{key}"] = np.asarray(
++            [float(m.get(key) or 0.0) for m in metrics_list], dtype=np.float64
++        )
++
+     return output
+ 
+ 
+@@ -138,7 +229,6 @@ def assemble_batch_from_rollout_samples(
+         final_batch.meta_info["global_token_num"] = torch.sum(final_batch.batch["attention_mask"], dim=-1).tolist()
+ 
+     processing_times = final_batch.non_tensor_batch["processing_times"]
+-    tool_calls = final_batch.non_tensor_batch["tool_calls_times"]
+     # Collect statistics
+     processing_time_stats = {
+         "processing_time/avg": np.mean(processing_times),
+@@ -148,15 +238,16 @@ def assemble_batch_from_rollout_samples(
+         "processing_time/tp99": np.percentile(processing_times, 99),
+         "processing_time/tp95": np.percentile(processing_times, 95),
+     }
+-    tool_calls_stats = {}
+-    if len(tool_calls) > 0:
+-        tool_calls_stats = {
+-            "timing_s/agent_loop/tool_calls/max": np.max(tool_calls),
+-            "timing_s/agent_loop/tool_calls/min": np.min(tool_calls),
+-            "timing_s/agent_loop/tool_calls/mean": np.mean(tool_calls),
+-        }
+     processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
+ 
++    # Align with ``AgentLoopManager._performance_metrics`: Harbor / extra agent-loop timings → log.
++    agent_loop_timing_meta = _aggregate_agent_loop_timing_meta(final_batch)
++    for nk in list(final_batch.non_tensor_batch.keys()):
++        if nk.startswith("_al_timing_"):
++            final_batch.non_tensor_batch.pop(nk, None)
++    for nk in ("compute_score_times", "num_preempted_vals"):
++        final_batch.non_tensor_batch.pop(nk, None)
++
+     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
+     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
+     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
+@@ -176,7 +267,7 @@ def assemble_batch_from_rollout_samples(
+             **processing_time_stats,
+             **rollout_status,
+             **partial_stats,
+-            **tool_calls_stats,
++            **agent_loop_timing_meta,
+         }
+     )
+ 
+diff --git a/verl/experimental/fully_async_policy/fully_async_rollouter.py b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+index 7a401773..9c9bd88b 100644
+--- a/verl/experimental/fully_async_policy/fully_async_rollouter.py
++++ b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+@@ -187,8 +187,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         # where the lock's captured loop (get_running_loop) differs from Condition's default loop check.
+         # Explicitly passing the loop is deprecated/removed in Python 3.10+, so this reverse-initialization
+         # is the most robust workaround.
+-        self.condition = asyncio.Condition()
+-        self.lock = self.condition._lock
++        self.lock = asyncio.Lock()
++        # `_resume_event` signals that the rollouter is currently running (paused == False).
++        self._resume_event = asyncio.Event()
++        self._resume_event.set()
++
+ 
+     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
+         """Set message queue client"""
+@@ -207,7 +210,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
+             )
+ 
+-            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
++            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 32
+             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
+             self.max_queue_size = self.max_required_samples
+ 
+@@ -241,7 +244,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         """
+         async with self.lock:
+             self.paused = False
+-            self.condition.notify_all()
++            self._resume_event.set()
+             # every time param change, reset staleness_samples
+             self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
+             timing_raw = {}
+@@ -427,6 +430,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         for epoch, batch_dict in continuous_iterator:
+             # Similar to _prepare_generate_batch: Separate data
+             full_batch = prepare_single_generation_data(batch_dict, self.config)
++            full_batch.meta_info["global_steps"] = self.global_steps
+ 
+             sample_id = f"sample_{epoch}_{self.global_steps}"
+ 
+@@ -465,20 +469,40 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+                 )
+                 async with self.lock:
+                     self.paused = True
+-                while self.active_tasks:
+-                    async with self.lock:
+-                        # After acquiring the lock, the number of active_tasks may change, need to be verified again
+-                        if self.active_tasks:
+-                            done_tasks, self.active_tasks = await asyncio.wait(
+-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
++                    self._resume_event.clear()
++
++                resume_future = asyncio.ensure_future(self._resume_event.wait())
++                try:
++                    # Drain: wait for either (a) at least one active task to finish, or
++                    # (b) a resume signal (reset_staleness / monitor flipping paused=False) to
++                    # break the drain early so new samples can be submitted to free replicas.
++                    # We do NOT hold the lock during the wait, so publishers can acquire it to
++                    # update paused / staleness_samples concurrently.
++                    while self.active_tasks and not resume_future.done():
++                        wait_set = set(self.active_tasks) | {resume_future}
++                        done, _pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
++                        actual_done = done - {resume_future}
++                        if actual_done:
++                            async with self.lock:
++                                for task in actual_done:
++                                    self.active_tasks.discard(task)
++                                    await task
++                        if resume_future in done:
++                            print(
++                                "[FullyAsyncRollouter][Processor] "
++                                "Drain interrupted by resume signal, resuming generation early "
++                                f"(active tasks remaining: {len(self.active_tasks)})"
+                             )
+-                            for task in done_tasks:
+-                                await task
++                            break
+ 
+-                async with self.lock:
+-                    while self.paused:
++                    # block until resuming
++                    if not resume_future.done():
+                         self.idle_start_time = time.time()
+-                        await self.condition.wait()
++                        await resume_future
++                finally:
++                    if not resume_future.done():
++                        resume_future.cancel()
++                        await asyncio.gather(resume_future, return_exceptions=True)
+                 continue
+             # Get sample from appropriate queue and immediately mark task as done
+             rollout_sample = await self.pending_queue.get()
+@@ -510,11 +534,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+                             await task
+ 
+             # Submit single sample processing
++            if self.paused:
++                await self._resume_event.wait()
+             async with self.lock:
+-                # After the pause is over, the lock is acquired and it is necessary
+-                # to determine whether it is the pause phase, otherwise continue to wait
+-                while self.paused:
+-                    await self.condition.wait()
+                 task = safe_create_task(
+                     self._process_single_sample_streaming(rollout_sample),
+                     name=rollout_sample.sample_id,
+@@ -614,6 +636,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         async with self.lock:
+             self.paused = False
+             self.running = True
++            self._resume_event.set()
+ 
+         # Create the main asynchronous task
+         generation_task = safe_create_task(self._streaming_generation_main(), name="generation_task")
+@@ -662,7 +685,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+                 async with self.lock:
+                     self.paused = False
+                     print("[FullyAsyncRollouter][ShouldPause] notify all wait tasks.")
+-                    self.condition.notify_all()
++                    self._resume_event.set()
+ 
+     async def _should_pause_generation(self) -> bool:
+         """Determine whether the build should be paused"""
+diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
+index 97952b28..3f341f19 100644
+--- a/verl/experimental/separation/engine_workers.py
++++ b/verl/experimental/separation/engine_workers.py
+@@ -68,7 +68,16 @@ class DetachActorWorker(ActorRolloutRefWorker):
+ 
+         strategy = self.config.actor.strategy
+ 
+-        if strategy in ["fsdp", "fsdp2"]:
++        if strategy == "fsdp":
++            # FSDP1 uses FlatParameter (not DTensor)
++            from verl.utils.fsdp_utils import (
++                fsdp1_sharded_load_from_cpu,
++                fsdp1_sharded_save_to_cpu,
++            )
++
++            self._strategy_handlers = (fsdp1_sharded_save_to_cpu, fsdp1_sharded_load_from_cpu)
++        elif strategy == "fsdp2":
++            # FSDP2 uses DTensor
+             from verl.utils.fsdp_utils import (
+                 fsdp2_sharded_load_from_cpu,
+                 fsdp2_sharded_save_to_cpu,
+@@ -111,7 +120,12 @@ class DetachActorWorker(ActorRolloutRefWorker):
+         if n in self.cpu_saved_models:
+             strategy = self.config.actor.strategy
+ 
+-            if strategy in ["fsdp", "fsdp2"]:
++            if strategy == "fsdp":
++                # FSDP1: saved state is a dict[str, torch.Tensor]
++                cpu_sharded_state = self.cpu_saved_models[n]
++                self.restore_handler(self.actor.engine.module, cpu_sharded_state)
++            elif strategy == "fsdp2":
++                # FSDP2: saved state is a tuple (dict[str, tuple[Tensor, DTensorSpec]], DTensorSpec)
+                 cpu_sharded_state, global_spec = self.cpu_saved_models[n]
+                 self.restore_handler(self.actor.engine.module, cpu_sharded_state, global_spec)
+             else:
+diff --git a/verl/utils/fsdp_utils.py b/verl/utils/fsdp_utils.py
+index 24093781..a7da3173 100644
+--- a/verl/utils/fsdp_utils.py
++++ b/verl/utils/fsdp_utils.py
+@@ -1016,6 +1016,65 @@ def merged_lora_context(actor, backup_adapters=False):
+             fsdp_merge_unmerge(actor, do_merge=False)
+ 
+ 
++def fsdp1_sharded_save_to_cpu(
++    model: torch.nn.Module,
++) -> dict[str, torch.Tensor]:
++    """
++    Sharded Save for FSDP1: Each process saves its local FlatParameter shards to CPU memory.
++
++    Args:
++        model: FSDP1-wrapped model (using FlatParameter).
++
++    Returns:
++        cpu_sharded_state: Dictionary of CPU shards for the current process.
++                          Key = parameter name, Value = CPU tensor
++    """
++    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
++
++    assert isinstance(model, FSDP), "Model must be wrapped with FSDP1 (FullyShardedDataParallel)"
++
++    # Initialize FSDP if not already done
++    _lazy_init(model, model)
++
++    cpu_sharded_state = {}
++
++    # Save full state dict (sharded) to CPU
++    # FSDP1 uses FlatParameter, so we use state_dict() which returns sharded state by default
++    state_dict = model.state_dict()
++
++    for param_name, param_tensor in state_dict.items():
++        # Move to CPU and detach
++        cpu_tensor = param_tensor.detach().cpu()
++        cpu_sharded_state[param_name] = cpu_tensor
++
++    return cpu_sharded_state
++
++
++def fsdp1_sharded_load_from_cpu(
++    model: torch.nn.Module,
++    cpu_sharded_state: dict[str, torch.Tensor],
++) -> None:
++    """
++    Sharded Load for FSDP1: Each process loads its CPU shard back to GPU.
++
++    Args:
++        model: FSDP1 model to be restored.
++        cpu_sharded_state: Shard data read from CPU memory by the current process.
++    """
++    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
++
++    assert isinstance(model, FSDP), "Model must be wrapped with FSDP1 (FullyShardedDataParallel)"
++
++    # Initialize FSDP if not already done
++    _lazy_init(model, model)
++
++    # Load the sharded state dict
++    model.load_state_dict(cpu_sharded_state)
++
++    # Process synchronization
++    dist.barrier()
++
++
+ def fsdp2_sharded_save_to_cpu(
+     model: torch.nn.Module,
+ ) -> tuple[dict[str, tuple[torch.Tensor, DTensorSpec]], DTensorSpec]:
+diff --git a/verl/workers/config/critic.py b/verl/workers/config/critic.py
+index 3531ed63..3b272015 100644
+--- a/verl/workers/config/critic.py
++++ b/verl/workers/config/critic.py
+@@ -211,6 +211,7 @@ class FSDPCriticConfig(CriticConfig):
+ 
+         if self.strategy in {"fsdp", "fsdp2"}:
+             if self.ulysses_sequence_parallel_size > 1:
++                self.fsdp.ulysses_sequence_parallel_size = self.ulysses_sequence_parallel_size
+                 if not self.model.get("use_remove_padding", False):
+                     raise ValueError(
+                         "When using sequence parallelism for critic, you must enable `use_remove_padding`."

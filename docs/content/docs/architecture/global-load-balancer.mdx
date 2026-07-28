@@ -1,0 +1,42 @@
+---
+title: Global Load Balancer
+description: Spreading requests across inference replicas with sticky routing
+---
+
+The **Global Load Balancer** sits between the [In-Process Proxy](/docs/architecture/in-process-proxy)
+and the [Rollouter](/docs/architecture/rollouter)'s pool of inference servers. Its
+job is to keep every replica evenly fed while keeping each conversation pinned to
+one replica.
+
+## Load balancing
+
+A run serves the policy as several vLLM replicas (each `gen_tp`-way
+tensor-parallel; total replicas = rollout GPUs ÷ `gen_tp`). Replicas register as
+Ray named actors (`vllm_server_*`), and verl's server manager distributes
+incoming requests across them so no replica is idle while another queues. With
+many [AgentLoopWorkers](/docs/architecture/agent-loop-workers) issuing calls
+concurrently, balanced distribution is what turns added rollout GPUs into added
+throughput.
+
+## Sticky routing
+
+Routing is **sticky per session**: all calls from one trial go to the *same*
+replica for the life of the conversation. This matters because a coding-agent
+rollout is long and highly repetitive — each turn re-sends the growing history.
+Pinning the session lets the replica reuse its **prefix cache** across turns
+instead of re-prefilling the whole context every call, which is a large
+throughput win on multi-turn agent rollouts.
+
+<Callout title="Why both at once" type="info">
+Load balancing optimizes *across* sessions (fill every replica); sticky routing
+optimizes *within* a session (reuse the prefix cache). Together they keep the
+rollout GPUs busy without throwing away cached context.
+</Callout>
+
+## KV-cache saturation
+
+Sticky routing pins a session to a replica, but it cannot stop that replica from
+**evicting** the session's blocks once KV pressure is high — and a re-prefill of a
+40k-token agent prompt is expensive. Deciding *how many* sessions may be in flight at
+that point is a separate concern, handled by the opt-in
+[Session-Level Scheduler](/docs/architecture/session-scheduler).

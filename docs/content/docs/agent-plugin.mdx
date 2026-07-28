@@ -1,0 +1,165 @@
+---
+title: Agent Plugin
+description: Validate, launch, and diagnose runs through a coding agent — or fall back to the same commands by hand
+---
+
+SWE-Lego-RL's operator-facing surface is an **agent plugin**: a set of control
+skills for [Claude Code](https://claude.com/claude-code), shipped in this repo
+at `.claude/plugins/rl-plugin/` and exposed as `/rl:*` slash commands. The
+technical report describes this layer as the *operations* pillar — an RL run is
+treated as a composition of reusable blocks, and the plugin drives the
+validate → launch → diagnose cycle over them.
+
+## Launch model
+
+Every workload follows the same two-phase model, whichever path you take:
+
+1. **Form a config.** Copy a template (from `scripts/train/templates/`,
+   `scripts/eval/templates/`, or `scripts/infer/templates/`) into the matching
+   `configs/` directory and fill in the `CHANGEME` lines. The config is the
+   single source of truth for the run.
+2. **Run it** — either **through the agent** (`/rl:run <config>`), which
+   validates first and asks for explicit confirmation, or **by hand**
+   (`bash scripts/train/train.sh <config>`, same for `eval`/`infer`), which
+   runs the same validation inline.
+
+```bash
+# once: form the config
+cp scripts/train/templates/sync_k8s_ohsdk_qwen35a3b.env \
+   scripts/train/configs/my_run.env
+$EDITOR scripts/train/configs/my_run.env        # fill the CHANGEME lines
+```
+
+```text
+# then, in Claude Code opened from the repo root:
+/rl:check train/configs/my_run.env      # safe to launch right now?
+/rl:run   train/configs/my_run.env      # validate → confirm → background launch
+/rl:status                              # is the live run healthy?
+/rl:dashboard                           # serve the training board
+```
+
+The skills are not a second implementation: they shell out to the *same*
+runners and the *same* `scripts/lib/preflight.sh` a manual launch uses, adding
+the judgement a config-only script cannot provide — a run already in flight,
+foreign GPUs, a taken port — and one structured report instead of scrollback.
+
+| | Manual | Through the agent |
+| --- | --- | --- |
+| Validate | `PREFLIGHT_ONLY=1 bash scripts/train/train.sh <config>` | `/rl:check <config>` |
+| Launch | `bash scripts/train/train.sh <config>` | `/rl:run <config>` |
+| Watch | `tail -F logs/<exp>.log` | `/rl:status` |
+| Serve the dashboard | `bash webui/start_dashboard.sh` | `/rl:dashboard` |
+
+## Run validation
+
+The report names this stage **run validation** and divides it into four blocks
+under a strict division of labor — deterministic checks belong to scripts,
+judgement belongs to an operator (human or agent):
+
+| Block | What it does | Implemented by |
+| --- | --- | --- |
+| **Configuration** | The resolved configuration is stated in full before anything starts — model, scaffold, parallelism, context budgets, sandbox and data settings — so what will be launched is stated rather than re-guessed | the runner's config summary |
+| **Constraint checking** | Cross-parameter rules distilled from real incidents fail fast on confirmed misconfiguration and warn on suspicious settings | `scripts/lib/preflight.sh` — see [Preflight](/docs/run-training/preflight) |
+| **Resource inspection** | A read-only report of live facts about the machine: colliding runs, GPU and port occupancy, disk and shared-memory headroom | `scripts/lib/live_probe.sh` |
+| **Confirmation** | These facts become a launch or a refusal | you — or `/rl:run`'s explicit yes/no gate |
+
+## Skills
+
+### `/rl:check`
+
+Answers "is it safe to launch right now?" — read-only, two layers, one verdict:
+
+```text
+SAFE TO RUN: ✅ YES — 0 blockers · 2 warnings
+
+| Layer | Check     | Status | Detail                               |
+|-------|-----------|:------:|--------------------------------------|
+| det   | preflight |   ✓    | ok=23  warn=2  fatal=0               |
+| live  | job       |   ✓    | job:none                             |
+| live  | gpu       |   ✓    | gpu:idle — 8× free                   |
+| live  | port      |   ✓    | 6379 / 8265 free                     |
+| live  | imports   |   ✓    | verl / veomni import OK              |
+```
+
+1. **Deterministic** — `PREFLIGHT_ONLY=1` through the runner itself, so every
+   assertion is the same one a manual launch would hit: `tool_parser` × model ×
+   scaffold, topology, device mesh, VRAM, veomni constraints, R3 × engine × verl,
+   image source, `lr_scheduler`, path existence.
+2. **Live** — `scripts/lib/live_probe.sh` prints local facts and the skill judges
+   ownership: is a trainer already running, is that 130 GB of GPU memory yours or
+   a foreign vLLM, is the port this run needs taken, do `veomni` / `verl` import.
+
+You get a `SAFE TO RUN: ✅ YES / ❌ NO` line, a status table, the resolved run
+parameters verbatim, and numbered next steps. Exactly five things block a launch —
+a `✗ FATAL`, a run already in flight, foreign GPUs, a port conflict, a missing
+import. Warnings never flip the verdict.
+
+<Callout title="A shared machine is the normal case" type="info">
+On a machine several people use, the common blocker is not a bad config — it is
+someone else's vLLM holding all 8 GPUs. `/rl:check` walks the process parent chain
+to decide whether those processes belong to your run tree, and reports the PID and
+memory so you can confirm with the owner rather than guess.
+</Callout>
+
+### `/rl:run`
+
+Runs `/rl:check` first and **refuses on any blocking failure**; there is no force
+flag. On a pass it shows the run configuration block, draws attention to the few
+fields that decide whether the hours are worth spending (data indexes, scale,
+resume behavior, naming), and asks for a yes before touching anything.
+
+Launching defaults to the background (`nohup setsid`), since these runs last
+hours and a foreground launch would tie your session to them. Afterwards it
+reports the **real** `exp_name` — the runner derives it at launch time, so it is
+not the name preflight printed — plus the PIDs, the log paths, and the first-step
+gates worth checking (pearson ≈ 0.999, `lr` non-zero, reward and `num_turns`
+non-zero).
+
+For a multi-node train or infer run it prints the exact per-node command for you
+to run on each node. It never SSHes anywhere.
+
+### `/rl:status`
+
+Read-only diagnosis of a run in flight: which run is alive, how far it has got,
+and whether its numbers are sound. It reads the process table, the step lines in
+the run log and the trials directory, then matches the metrics against the
+failure signatures this stack keeps producing:
+
+| Signature | Evidence it looks for |
+| --- | --- |
+| R3 misalignment | `rollout_actor_probs_pearson_corr` below 0.99 |
+| Frozen model | `actor/lr` is 0 |
+| Gradient starvation | `actor/grad_norm` an order below this run's own earlier steps |
+| Env avalanche | `trajectory_filter/reason/env_setup_failed` climbing across steps |
+| Val fake-zero | val metrics all 0 while train reward is healthy |
+| No-tool-call collapse | `num_turns/mean` falling toward 1 as reward falls |
+| Deadlock | process alive, log mtime old, no new step line |
+
+It only claims a signature when that specific evidence is present — otherwise it
+says so, rather than forcing a match and sending you after the wrong layer.
+
+### `/rl:dashboard`
+
+Brings up `webui/` here, adapting to this machine rather than assuming the paths
+in this repo: it ranks candidate log directories by how many runs they actually
+hold, picks a free port, rebuilds `dist/` only when it is stale, and leaves any
+instance it did not start alone. A public tunnel is opt-in. See
+[Dashboard](/docs/dashboard).
+
+<Callout title="The skills never mutate a run" type="info">
+`/rl:check` and `/rl:status` change nothing at all, and `/rl:run` only ever
+launches — after you say yes. None of them kill a process, edit a config, clear
+`/dev/shm`, delete a log, or touch the cluster. When something needs stopping they
+give you the PID and let you decide.
+</Callout>
+
+## Other workloads
+
+The same contract covers all three workload kinds — the plugin validates and
+launches eval and infer configs exactly as it does training:
+
+| Goal | Runner | Guide |
+| --- | --- | --- |
+| Train a policy | `scripts/train/train.sh` | [Getting Started](/docs/getting-started) |
+| Score a checkpoint on a held-out set | `scripts/eval/eval.sh` | [Evaluation](/docs/run-training/eval) |
+| Batch-generate trajectories over an index | `scripts/infer/infer.sh` | [Batch Inference](/docs/run-training/infer) |

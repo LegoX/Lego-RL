@@ -1,0 +1,67 @@
+---
+title: Training Startup
+description: Model-format and serving issues that surface the moment a run starts
+---
+
+These issues all bite right at launch — a crash on step 0, or every launch paying
+a slow-import tax.
+
+## Tool-call parser mismatch
+
+**Symptom.** Training crashes on the very first step with:
+
+```text
+response_mask must contain at least one valid token (1)
+```
+
+vLLM is healthy and the model clearly generates text, but the *entire* batch has
+zero tool calls (e.g. 0/1024 trials) and the trajectories are single-turn.
+
+**Root cause.** The vLLM rollout is configured with the wrong **tool-call
+parser** for the model's output format. A Qwen3-Coder model emits XML tool calls:
+
+```text
+<function=EnterWorktree>...</function>
+```
+
+but the rollout config sets `tool-call-parser: hermes`, which expects JSON. vLLM's
+hermes parser runs `json.loads()` on the XML, throws `JSONDecodeError` on every
+turn, recognizes **zero** tool calls, so the agent never takes an action — no
+assistant tokens are produced and `response_mask` is all zeros.
+
+**Fix.** Match the parser to the model. The runtime exposes one knob,
+`HARBOR_TOOL_PARSER` (default `qwen3_coder`), which drives every config point
+(`swe_lego_rl_*.yaml` → `tool-call-parser`, `agent_loop_config_cc.yaml` →
+`tool_parser`):
+
+| Model output format | `HARBOR_TOOL_PARSER` |
+| --- | --- |
+| Qwen3-Coder XML (`<function=...>`) | `qwen3_coder` |
+| Hermes/JSON tool calls | `hermes` |
+
+**Verify.** The vLLM logs stop printing `JSONDecodeError`, and the first one or
+two steps' `proxy_trajectory.json` show non-zero `tool_calls` with
+`finish_reason: tool_calls`.
+
+## Slow venv imports on a network filesystem
+
+**Symptom.** Every launch pays a cold-import tax — `import torch` takes ~8.7s
+(vs ~1.8s), because the venv lives on a network filesystem (CPFS /
+`fuse.aliyun-alinas-efc`) and small-file metadata I/O goes over the network.
+
+**Fix.** Copy the venv onto local NVMe once and point `VENV_PATH` at it:
+
+```bash
+cp -a .venv /root/venvs/rl-venv
+VENV_PATH=/root/venvs/rl-venv bash scripts/train/train.sh train/configs/my_run.env
+```
+
+`/root` is per-node local storage, so **each node needs its own copy**. Re-sync
+when `pyproject.toml` changes or packages are added:
+`rsync -a --delete <src>/.venv/ /root/venvs/rl-venv/`.
+
+<Callout title="Editable installs still apply" type="warn">
+A copied venv keeps its editable installs pointing at the original `repos/` trees.
+Verify with `python -c "import harbor, verl, verl_patch; print(harbor.__file__)"`
+— see [Core Concepts](/docs/core-concepts#the-training-venv).
+</Callout>

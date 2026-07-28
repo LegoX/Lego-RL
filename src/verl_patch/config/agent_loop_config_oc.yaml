@@ -1,0 +1,92 @@
+# DEPRECATED: OpenCode now uses agent_loop_config_oh.yaml via scaffold/oc.env.
+# Keep this file only for legacy scripts that still reference it directly.
+# Harbor × OpenCode agent loop config.
+#
+# Architecture:
+#   opencode (inside k8s pod, mounted runtime at /opt/custom-agent-runtime/opencode,
+#             hosted_vllm provider via @ai-sdk/openai-compatible)
+#     -> LiteLLM proxy (on training host, OpenAI Chat Completions API
+#                       + trajectory_logger callback)
+#       -> vLLM (managed by verl, OpenAI API format)
+#
+# - import_path = harbor_patch OpenCode = harbor.agents.custom.opencode.CustomOpenCode
+#   + populate_context_post_run override that fills metadata['all_messages'] / ['tools']
+#   from the LiteLLM trajectory JSONL (the proxy callback writes one record per call to
+#   ${trial}/agent/litellm-trajectory.jsonl via the x-trajectory-output-path header,
+#   which CustomOpenCode automatically injects into the hosted_vllm provider headers).
+# - environment.type=kubernetes uses harbor_patch's KubernetesEnvironment, which maps
+#   mounts_json[type=image] to an initContainer + emptyDir staging.
+- name: builtin_swe_agent
+  _target_: verl_patch.agent_loop.BuiltinOCAgentLoop
+  harbor_cfg:
+    agent:
+      # NOTE: do NOT set `name: opencode` here. harbor's AgentFactory.create_agent_from_config
+      # prefers `name` over `import_path` when both are present (factory.py:149-166), so setting
+      # name=opencode silently bypasses our harbor_patch override and instantiates the base
+      # `harbor.agents.installed.opencode.OpenCode`, which has a hardcoded provider whitelist
+      # in run() (no `hosted_vllm`) and raises "Unknown provider hosted_vllm" before ever
+      # writing ~/.config/opencode/opencode.json. Mirrors the agent_loop_config_cc.yaml pattern
+      # (also import_path-only). HARBOR_AGENT_NAME from the launch script becomes a no-op here.
+      import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_opencode:OpenCode}
+      # OpenCode parses provider/model_id from model_name. Use hosted_vllm/<served>
+      # so the @ai-sdk/openai-compatible provider in OPENCODE_CONFIG_CONTENT is picked.
+      model_name: hosted_vllm/${oc.env:SERVED_MODEL_NAME,vllm_model}
+      max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,1500}}
+      # override_timeout_sec is the *base* timeout the trial enforces; max_timeout_sec
+      # is only a cap on top of it. SWE-bench tasks don't carry their own
+      # agent.timeout_sec, so without this the cap was a no-op and trials ran 50+min.
+      override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,1500}}
+      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
+      kwargs:
+        max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
+        # Per-request temperature override. CustomOpenCode wires x-harbor-temperature
+        # into the hosted_vllm provider headers; trajectory_logger applies it before
+        # forwarding to vLLM.
+        # MUST match actor_rollout_ref.rollout.temperature so RL rollouts come
+        # from the same distribution verl computes log_prob under.
+        temperature: ${oc.decode:${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}}
+      # Env vars injected into the opencode process inside the k8s pod.
+      env:
+        # Hosted vLLM provider settings, referenced as {env:NAME} from
+        # OPENCODE_CONFIG_CONTENT below.
+        HOSTED_VLLM_BASE_URL: ${oc.env:HARBOR_OPENAI_BASE_URL,http://127.0.0.1:8002/v1}
+        HOSTED_VLLM_API_KEY: ${oc.env:HARBOR_OPENAI_API_KEY,sk-dummy}
+        OPENCODE_TEMPERATURE: ${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}
+        # JSON config that pins the hosted_vllm provider + model + disables
+        # streaming so the on-pod execution trace matches the LiteLLM record.
+        # Set by the launch script after SERVED_MODEL_NAME is resolved.
+        OPENCODE_CONFIG_CONTENT: ${oc.env:HARBOR_OPENCODE_CONFIG_CONTENT}
+        # Tell CustomOpenCode where the mounted runtime lives inside the pod.
+        CUSTOM_AGENT_RUNTIME_ROOT: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/opencode}
+        CUSTOM_AGENT_OPENCODE: ${oc.env:HARBOR_CUSTOM_AGENT_OPENCODE,/opt/custom-agent-runtime/opencode/bin/opencode}
+        CUSTOM_AGENT_RUNTIME_ENV_SCRIPT: ${oc.env:HARBOR_CUSTOM_AGENT_RUNTIME_ENV_SCRIPT,/opt/custom-agent-runtime/opencode/runtime-env.sh}
+    verifier:
+      enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+    environment:
+      # MUST be null (None) — harbor's EnvironmentType enum does not include
+      # 'kubernetes', so passing 'kubernetes' triggers a pydantic validation
+      # error and every trial fails at TrialConfig validation. The K8s
+      # implementation is loaded via import_path below.
+      type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+      import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment}
+      force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,False}}
+      delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+      override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+      kwargs:
+        kubeconfig_path: ${oc.env:K8S_KUBECONFIG,$HOME/.kube/config}
+        namespace: ${oc.env:K8S_NAMESPACE,default}
+        pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,900}}
+        pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
+        agent_runtime_image: ${oc.decode:${oc.env:HARBOR_AGENT_RUNTIME_IMAGE,null}}
+        agent_runtime_mount_path: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/opencode}
+        agent_runtime_image_subpath: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH,opt/custom-agent-runtime/opencode}
+        # JSON list of extra hostPath mounts injected into each task pod.
+        # Default null = no extra mounts (matches sync_1nodes_cc.sh's non-mlg
+        # rebench1663 dataset which has no /opt/rebench-v2 dependency).
+        host_path_mounts: ${oc.env:HARBOR_HOSTPATH_MOUNTS,null}
+    environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+    agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+    agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
+    verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
+    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}

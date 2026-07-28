@@ -1,0 +1,12 @@
+{
+    "title": "Block Design",
+    "pages": [
+        "environment",
+        "agent-loop-workers",
+        "in-process-proxy",
+        "global-load-balancer",
+        "session-scheduler",
+        "rollouter",
+        "trainer"
+    ]
+}

@@ -1,0 +1,14 @@
+{
+    "pages": [
+        "index",
+        "getting-started",
+        "data-preparation",
+        "run-training",
+        "core-concepts",
+        "architecture",
+        "agent-plugin",
+        "dashboard",
+        "troubleshooting",
+        "reference"
+    ]
+}

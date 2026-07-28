@@ -1,0 +1,61 @@
+---
+title: Environment
+description: Sandboxed execution, the verifier, the scaffolds, and the backends
+---
+
+The **Environment** is where a task actually runs. Every trial gets a **fresh
+sandbox**, a coding-agent **scaffold** drives the model through the task inside it,
+and the task's own **verifier** decides the reward. This is the layer that makes
+the reward *real*.
+
+## Sandboxed execution + verifier
+
+Each task ships a repository snapshot and a **verifier** — its own test script.
+A trial proceeds: the agent explores the repo, edits files, and runs commands in
+the sandbox until it submits or hits the turn/timeout limit; then the verifier
+runs the test suite and emits a **reward** (`1.0` if the issue is resolved, `0.0`
+otherwise). Because the grader is the task's real tests, there is no learned
+reward model to drift or hack. See [Reward](/docs/core-concepts#reward).
+
+## Scaffolds
+
+The **scaffold** is the agent harness that turns model outputs into actions.
+**Claude Code, OpenCode, OpenHands, and Terminus 2** are validated end to end
+and strictly adapted (adapters under `src/harbor_patch/agents/`); other
+scaffolds that speak the OpenAI/Anthropic API can be added as
+[custom adapters](/docs/architecture/agent-loop-workers#agent-loop-classes). The scaffold determines the rollout's shape and which
+runtime image Harbor launches; it is selected per run with
+`HARBOR_AGENT_IMPORT_PATH` (default
+`harbor_patch.agents.image_mounted_claude_code:ClaudeCode`). Whatever the
+scaffold's native protocol, it talks to the policy through the
+[In-Process Proxy](/docs/architecture/in-process-proxy).
+
+## Backends
+
+The sandbox itself runs on one of three backends, selected with
+`HARBOR_ENVIRONMENT_IMPORT_PATH`:
+
+| Backend | Unit of execution | Use |
+| --- | --- | --- |
+| **Kubernetes** | one pod per trial | production default, large parallel runs |
+| **Local / Remote Docker** | one container per trial | minimal setup, no cluster |
+| **Other Harbor backends** (GKE, Daytona, E2B, Modal, Runloop) | managed clusters / sandbox services | inherited from Harbor via the same import path; not validated in this stack |
+
+Cluster provisioning (including the `k8s-sandbox-install` skill), Docker daemon
+permissions, and the `site.env` wiring are covered in
+[Backends](/docs/run-training/backends).
+
+## Runtime features
+
+The Environment layer also carries the machinery that makes real sandboxes fast
+and trustworthy at scale:
+
+- **[Nydus](https://github.com/dragonflyoss/nydus) cold start** — lazy-loading container images so a pod is usable before
+  the whole image is pulled.
+- **Agent-runtime image mounting** — the scaffold/runtime is pre-baked into the
+  agent image and mounted in, rather than installed per pod (which fails on
+  no-egress task pods).
+- **Image cache** — shared image layers across trials to cut startup time.
+- **Anti-hacking** — guards against reward hacking (e.g. agents re-cloning a
+  repo's GitHub history to recover the fix), so the reward reflects a genuine
+  solution.

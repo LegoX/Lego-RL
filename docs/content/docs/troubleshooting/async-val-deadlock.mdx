@@ -1,0 +1,73 @@
+---
+title: Fully-Async val Deadlock
+description: The first validation hangs forever because do_validate blocks the actor's event loop — pinned with py-spy, not guessed
+---
+
+**Symptom.** A fully-async run reaches its first `test_freq` validation and **hangs
+permanently**. The driver `.out` goes silent, tqdm freezes, vLLM `Running` drops to
+0, the val agent pods are reaped by their 3600 s timeout — and the driver still never
+advances. No traceback, no dead node, no OOM. It is a deadlock, not a crash: waiting
+longer never helps. Because `save_freq` is scheduled after validation, such a run
+never writes a checkpoint at all.
+
+## Root cause
+
+Pinned with `py-spy`, not inferred:
+
+1. `do_validate` (`fully_async_rollouter.py:706`) is a **synchronous** method, and
+   Ray runs it on the actor's **`AsyncIO Thread: default`** — the event-loop thread.
+2. It calls the synchronous `_validate` (inherited from `RayPPOTrainer`,
+   `ray_trainer.py:643`), which reaches `generate_sequences` and its `@auto_await`
+   wrapper (`verl/utils/ray_utils.py:137`).
+3. The wrapper's Case 3 (a running loop exists, the caller is not async) does
+   `pool.submit(asyncio.run, coro)` and then **`future.result()` — blocking the
+   calling thread, which *is* the event-loop thread.** The wrapper's own comment says
+   it "cannot block the loop thread without deadlock"; it just never anticipated
+   being entered from the loop thread itself.
+4. With the loop frozen, the training generation tasks that were still in flight when
+   validation began (`"resuming generation early (active tasks remaining: 21)"` in the
+   log) can make no progress, so they never return their workers to the shared
+   `_worker_queue`.
+5. Validation's `_dispatch_to_workers` → `queue.get()` waits for a worker that a
+   frozen task is holding. Validation never finishes → `future.result()` never
+   returns → the loop stays blocked. Closed cycle.
+
+Ray's startup warning — *"Using blocking ray.get inside async actor. This blocks the
+event loop"* — is pointing at exactly this.
+
+**Why training is fine and only val hangs:** training goes through the normal `await`
+path; validation is the only caller that enters through a synchronous `do_validate`.
+
+## Diagnosis
+
+```bash
+ps aux | grep 'ray::FullyAsyncRollouter.do_validate'
+py-spy dump --pid <pid>
+```
+
+Confirmed when `"AsyncIO Thread: default"` is parked in `ray_utils.py:137` at
+`result()`.
+
+## Ruled-out causes
+
+- **Not** over-long prompts. The `131072` `ValueError` in the log is benign noise
+  caught by the proxy's `_handle_chat`; it fires throughout normal training too.
+- **Not** a missing patch. The relevant PRs were already applied — the
+  `threading.Queue` change fixes the worker queue, not this val path.
+- **Not** a missing per-sample timeout. Every val trial did write its `result.json`;
+  the "per-sample timeout patch" idea was withdrawn.
+
+## Fix
+
+Break the cycle at either point; doing both is preferred:
+
+- **A — stop blocking the loop.** Make `do_validate` genuinely asynchronous (`async`
+  + `await`), or hand the synchronous work to a real executor thread so the event
+  loop stays free.
+- **B — drain before validating.** Fully drain in-flight training generation before
+  validation starts, instead of resuming early with tasks still outstanding, so
+  validation owns the worker pool for its duration.
+
+> Related: [Low val scores](/docs/troubleshooting/val-false-zero) §1, where the same
+> validation path merely runs out of time instead of deadlocking. A node OOM caused by
+> unbounded environment pods is a different route to the same permanently stuck run.

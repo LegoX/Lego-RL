@@ -1,0 +1,65 @@
+---
+title: Trainer
+description: The verl actor — backends, algorithms, and training modes
+---
+
+The **Trainer** closes the loop. It samples the task batch, consumes finished
+rollouts from the [Rollouter](/docs/architecture/rollouter)'s data buffer,
+computes advantages, updates the actor (and critic, for PPO), and pushes new
+weights back via weight sync.
+
+## Algorithms
+
+Selected with `adv_estimator` / `policy_loss_mode` in the launch script:
+
+- **PPO** — actor + critic, clipped policy-gradient objective.
+- **GRPO** — group-relative advantages, no critic (`adv_estimator=grpo`).
+- **GSPO** — sequence-level policy optimization (`policy_loss_mode=gspo`).
+
+The default profile runs GRPO advantages with a GSPO loss. All three optimize over
+**full multi-turn rollouts**, not single completions. See
+[Algorithms](/docs/core-concepts#algorithms).
+
+```bash
+# in the run config
+adv_estimator=grpo            # ppo | grpo
+policy_loss_mode=gspo
+```
+
+## Backends
+
+The actor can run on three backends:
+
+| Backend | Best for |
+| --- | --- |
+| **FSDP** | dense models; the validated default and fully-async path |
+| **VeOmni** | large MoE policies (e.g. Qwen3-30B-A3B); enable with `USE_NEW_VERL=1` |
+| **Megatron** | the largest models, via tensor/pipeline parallelism |
+
+## Modes & features
+
+- **Sync** — generate → execute → reward → update in lockstep on shared GPUs; the
+  minimal-cost single-node default.
+- **Async** — a decoupled trainer pool consumes a streaming buffer from a separate
+  rollout pool (see [Rollouter](/docs/architecture/rollouter) and
+  [Scaling Up](/docs/run-training/scaling)).
+- **Partial Rollout** — a rollout interrupted mid-generation by a weight sync is
+  resumed rather than thrown away, recovering otherwise-wasted compute.
+- **R3 (routing replay)** — for MoE policies, replays the rollout's expert-routing
+  decisions during the training forward pass so the update matches what was
+  actually generated; required to keep MoE rollout/training logprobs aligned.
+
+```bash
+# in the run config
+TRAIN_MODE=async              # sync | async
+ENABLE_R3=True                # MoE only; requires USE_NEW_VERL=1
+staleness_threshold=1         # async: max param-versions a rollout may lag
+partial_rollout=True          # async: resume generations cut by a weight sync
+```
+
+## Outputs
+
+verl writes the actor as FSDP shards every `save_freq` steps to
+`checkpoints/<project>/<exp>/global_step_N/`, and logs per-step metrics to
+`logs/<exp>.log` and wandb. See [Metrics](/docs/core-concepts#metrics) and
+[Results & Artifacts](/docs/run-training/results-and-artifacts).

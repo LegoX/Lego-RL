@@ -1,0 +1,71 @@
+---
+title: Rewards & Throughput
+description: When the reward signal is stuck at zero, or the host degrades over time
+---
+
+Two issues that don't crash the run but silently make it worthless: a reward
+signal that is always zero, and a host whose throughput decays over hours.
+
+## Reward always zero (SWE-rebench-V2)
+
+**Symptom.** Every reward is `0.0`; `critic/score`, advantages, and gradients are
+all zero, so training learns nothing — even though the grader clearly runs and
+the agent's own tests appear to pass.
+
+**Root cause.** SWE-rebench-V2 task Dockerfiles `git clone` the rebench repo into
+`/opt/rebench-v2` at build time. On the **K8s backend** that clone runs *inside
+the pod at runtime*, where there is no GitHub egress: `git` exits 128, Harbor
+only logs a warning (it does not raise), `/opt/rebench-v2` is left empty, the
+grader's `parser.py` hits an `ImportError`, the test script exits 1, and
+`reward.txt` is written as `0`.
+
+**Fix.** Pre-position the repo on shared storage and mount it read-only into every
+pod, so the runtime clone short-circuits:
+
+1. Clone once to shared storage at the pinned commit, e.g.
+   `<shared-storage>/swe-rebench-v2-<commit>` (~53 MB).
+2. Mount it into the pod spec via a `hostPath` volume at `/opt/rebench-v2`
+   (`read_only: true`) — the runtime `git clone` sees an existing `.git` and skips.
+
+**Verify.** Inside a pod, `ls /opt/rebench-v2/lib/agent/log_parsers.py` succeeds;
+the test stdout shows `SWE-rebench-V2 results starts here` (not `parsers not
+found`); rewards become non-zero.
+
+<Callout title="The general rule" type="info">
+Any task whose container build clones from the internet will silently grade to
+zero on an egress-less sandbox. Pre-stage such assets on shared storage and mount
+them in, rather than relying on a runtime fetch.
+</Callout>
+
+## Training slowdown from a cgroup/memcg leak
+
+**Symptom.** Pod startup time grows roughly linearly over a long run (≈30s →
+63s → 96s → 145s) and throughput collapses, with **no** disk or I/O bottleneck to
+explain it. The high pod churn of RL rollouts is the trigger.
+
+**Root cause.** Each pod deletion leaks kernel state — `tmpfs`/shmem pins the
+memcg, percpu counters and dentry/slab objects accumulate, and systemd's dbus
+`cgroup_destroy` times out (~90s). The leak compounds: e.g. `num_cgroups` climbs
+into the hundreds of thousands (normal ≈150) and `percpu` memory into tens of GB
+(normal < 5 GB).
+
+**Fixes, by horizon.**
+
+- **Immediate:** `sudo reboot` clears the in-kernel leak; pod startup returns to
+  ~30s. The leak re-accumulates over days under the same churn.
+- **Short-term:** drop `medium: Memory` from pod `emptyDir` specs (tmpfs → disk)
+  via a Kyverno policy (cuts the leak ~50%); move toward a worker-pool model to
+  slash pod churn.
+- **Medium-term:** upgrade to a newer Linux kernel (6.10+ ships memcg-free
+  optimizations).
+
+**Monitor** (warn / crit):
+
+```bash
+awk 'NR==2{print $3}' /proc/cgroups                                 # num_cgroups  (>50k / >100k)
+awk '/^percpu/{print $2/1073741824" GB"}' /sys/fs/cgroup/memory.stat # percpu mem  (>20 / >50 GB)
+```
+
+Also watch kubelet `pod_start_duration`. See
+[health indicators](/docs/troubleshooting/sandbox-backends#kubernetes-health-baseline)
+for the full baseline.

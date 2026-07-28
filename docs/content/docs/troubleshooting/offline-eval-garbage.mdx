@@ -1,0 +1,102 @@
+---
+title: Offline Eval Garbled Output / All-Zero Reward
+description: A standalone val_only eval emits garbled output even for a known-good checkpoint — the colocated verl serving path, not the model
+---
+
+You have a trained MoE checkpoint (e.g. Qwen3-30B-A3B). Training rollouts are
+coherent and rewards move. But when you run a **standalone `val_only` eval** of
+the merged checkpoint, every trajectory is garbled repeated-token output (`"Homo Homo Homo …
+entityType … @foreach"`) and every reward is `0.0` — *including for the base
+model*, which cannot possibly be corrupt on disk.
+
+This page is the distilled runbook. Full dev write-up: session
+`5c94cb60` (2026-07-02).
+
+## Symptom
+
+- `proxy_trajectory.json` assistant messages are uniform repeated-token noise,
+  identical across astropy/django/sympy tasks.
+- Responses hit the `max_response_length` ceiling and **never emit EOS**; a
+  direct `curl` of the eval's vLLM (`/v1/chat/completions`, temp 0, "reverse a
+  string") returns e.g. `崛起崛起崛起…` or `Homo Homo…`.
+- vLLM shows requests **piling up past the concurrency cap** with **KV cache
+  climbing to ~90%** — the no-EOS signature.
+- Base-model (step 0) eval is *also* garbage → rules out the checkpoint/merge.
+
+## Root cause — the colocated verl serving path
+
+The standalone eval (`verl.trainer.main_ppo --val_only`) is **colocated**
+(`hybrid_engine=True`): vLLM and the actor share the same GPUs. vLLM launches
+with `--load_format dummy --enable_sleep_mode`, i.e. it loads *random* weights,
+then **sleeps and discards them** to free the GPU, and relies on the actor to
+sync the real weights back on wake-up. **That dummy→real sync mis-maps Qwen3's
+fused grouped-MoE experts**, so vLLM generates with near-random FFNs → garbled output.
+It is independent of what checkpoint you feed it.
+
+Things that are **not** the cause (all ruled out empirically):
+
+- **Not the merge / checkpoint.** Plain vLLM reading the same on-disk weights
+  serves coherent code. The `_unfuse_moe_experts` fix in
+  `merge_veomni_fsdp_to_hf.py` is real and required (vLLM wants HF per-expert
+  layout), but it is not what corrupts the eval output.
+- **Not `strategy=fsdp` vs `model_engine=veomni`.** Switching the eval to the
+  veomni engine still produces the same `Homo` output for the base model.
+- **Not `enforce_eager`.** Both cudagraph and `enforce_eager=True` produce garbled output.
+- Setting `enable_sleep_mode=False` (to match training) **OOMs** — colocated
+  vLLM stays resident at ~122 GiB and the actor has no room.
+
+**Why training rollouts are fine:** training is **disaggregated**
+(`hybrid_engine=False`, separate `rollout.nnodes` / `trainer.nnodes`). vLLM
+owns dedicated nodes, weights stay resident, nothing sleeps or re-syncs. So the
+colocated eval is a dead end: `sleep=True` → garbled output, `sleep=False` → OOM.
+
+## Fix — bypass verl entirely: harbor-native plain vLLM
+
+Serve the merged checkpoint with a **plain `vllm serve --load-format auto`**
+(real weights straight off disk, verified coherent) and drive the OpenHands-SDK
+agent with `harbor run`. No actor, no dummy weights, no sleep/wake sync.
+
+This path is now packaged as the **eval runner** — see
+[Evaluation](/docs/run-training/eval); the invocation below is the original
+script it grew out of.
+
+```bash
+GEN_TP=1 \
+MODEL_PATH=/path/to/data/eval_models/openswe1031_veomni_0629/global_step_20_hf \
+DATASET_PATH=/path/to/shared/harbor_swe_val_tasks_official \
+K8S_KUBECONFIG=$HOME/.kube/config \
+N_CONCURRENT=16 POD_PREFIX=evalhn STEP_TAG=20 \
+nohup bash scripts/eval/eval.sh eval/configs/my_eval.env > eval_step20.out 2>&1 &
+```
+
+This produces real scores (Qwen3-30B-A3B step-20 ≈ 31% pass); trajectories are
+proper agentic tool-calls (`terminal: find … loader.py`) with `reward=1` on
+solved tasks.
+
+## Operational pitfalls (all handled by the eval runner)
+
+- **Cluster.** A single node carrying `DiskPressure=True` + a `NoSchedule` taint
+  leaves pods Pending forever — point the eval at a pool of healthy nodes and
+  check taints first. With no `kubectl` on the GPU host, query with the `kubernetes` python
+  client, and use `list_namespaced_pod("default")` — `list_pod_for_all_namespaces`
+  times out.
+- **CPFS-slow venv → `GEN_TP=1`.** The `.venv` lives on CPFS; each vLLM worker
+  imports it in ~5 min, so a **TP≥2 multiproc launch times out its TCPStore
+  rendezvous and crashes** (`WorkerProc initialization failed`). Use **`GEN_TP=1`**
+  — a 30B-A3B (~61 GiB) fits on one 140 GiB GPU with no multiprocessing.
+  Copying the venv local is impractical (tens of thousands of small files on
+  CPFS); a different local venv is version hell (transformers/starlette skew).
+- **Harbor config is YAML/JSON, not TOML.** `harbor run --config` rejects
+  `.toml`. Field names: `AgentConfig.model_name` (not `model`),
+  `VerifierConfig.disable` (not `enabled`), no `version`. Validate offline with
+  `JobConfig.model_validate` before committing to a 15-min vLLM start.
+- **Mount the agent runtime image (critical).** OH-SDK needs Python ≥ 3.12 but
+  task images are `py<3.12`, so the **py3.12 runtime image must be mounted**
+  (`docker.io/jierun/c-oh-sdk-1.14.0:v0.1` → `/opt/custom-agent-runtime/oh-sdk`).
+  `KubernetesEnvironment` reads `agent_runtime_image` / `agent_runtime_mount_path`
+  / `agent_runtime_image_subpath` / `host_path_mounts` **only from
+  `environment.kwargs`** — *not* from `HARBOR_*` env vars (those were verl glue).
+  Miss them and every trial fails with `python3 is < 3.12`.
+- **Dataset** is a directory of harbor task dirs (`task.toml` each), pointed at
+  by `[[datasets]] path=`; e.g. `/path/to/shared/harbor_swe_val_tasks_official`
+  (500 tasks).

@@ -1,0 +1,50 @@
+---
+title: Rollouter
+description: The vLLM inference-server pool, the rollout data buffer, and weight sync
+---
+
+The **Rollouter** is the serving-and-data half of the loop: it runs the vLLM
+inference servers that produce rollouts, buffers the finished rollouts for the
+trainer, and pulls fresh weights from the trainer between updates.
+
+## Inference servers
+
+The policy is served as a pool of **vLLM replicas** (verl-managed, each
+`gen_tp`-way tensor-parallel). They register as Ray named actors
+(`vllm_server_*`) and receive requests through the
+[Global Load Balancer](/docs/architecture/global-load-balancer). On a 30B MoE
+(TP=4), CUDA-graph capture takes ~10–20 min before the first replica registers.
+
+## Data Buffer
+
+Completed rollouts stream into a **Data Buffer** that the
+[Trainer](/docs/architecture/trainer) consumes:
+
+- **Synchronous** (`TRAIN_MODE=sync`): the buffer is one step's batch —
+  generate the whole batch, then update, in lockstep, on shared GPUs.
+- **Fully-async** (`TRAIN_MODE=async`): the buffer **decouples** the two
+  pools. Rollouts (long-latency — most of a trial's wall-clock is sandbox
+  execution and tool waits, not GPU compute) stream into the queue while the
+  trainer consumes them, so neither side blocks the other.
+  `staleness_threshold` bounds how many weight-versions stale a buffered rollout
+  may be before the trainer waits; `partial_rollout` resumes a generation that a
+  weight sync interrupted instead of discarding it.
+
+## Weight Sync
+
+After each update the trainer pushes new actor weights into the inference
+replicas so the next rollouts are on-policy. In the synchronous loop this happens
+every step; in the async path it is governed by `trigger_parameter_sync_step`
+(and bounded by `staleness_threshold`). `rollout_corr/kl` is the health metric for
+sync fidelity — rollout-vs-training logprobs should track closely (≈3e-4); a
+spike means scaffold/routing corruption.
+
+```bash
+# in the run config
+GEN_TP=4                      # replicas = rollout GPUs ÷ GEN_TP
+staleness_threshold=1         # async: bound rollout staleness
+partial_rollout=True          # async: resume interrupted generations
+```
+
+> Scaling the rollouter into a dedicated pool, plus the async knobs, is covered in
+> [Scaling Up](/docs/run-training/scaling).

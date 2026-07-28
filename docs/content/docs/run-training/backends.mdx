@@ -1,0 +1,108 @@
+---
+title: Backends
+description: Kubernetes and Docker sandboxes for Harbor trials — config, provisioning, and permissions
+---
+
+Every trial runs in a fresh sandbox. Two backends are validated and strictly
+adapted in this stack — **Kubernetes** (production) and **Docker** (minimal) —
+selected per run by `BACKEND` (which resolves
+`HARBOR_ENVIRONMENT_IMPORT_PATH`). Because the backend is an import path,
+every environment Harbor ships is also selectable — GKE, Daytona, E2B, Modal,
+Runloop — inherited as-is, not validated in this stack:
+
+```bash
+# any Harbor environment class can be pointed at directly
+HARBOR_ENVIRONMENT_IMPORT_PATH=harbor.environments.daytona:DaytonaEnvironment
+```
+
+## Kubernetes (production)
+
+Each trial is a pod. This is the default for large, parallel runs.
+
+```bash
+# run config
+BACKEND=k8s
+
+# lib/site.env — cluster wiring
+K8S_KUBECONFIG=/path/to/kubeconfig.yaml
+K8S_NAMESPACE=default
+HARBOR_OPENSWE_IMAGE_REGISTRY=registry.internal:5001/openswe   # prebuilt task images
+HARBOR_NYDUS_MIRROR=...                                        # optional lazy-pull mirror
+
+# optional pod-level knobs
+K8S_POD_STARTUP_TIMEOUT=1200            # seconds to wait for a pod to start
+K8S_POD_ACTIVE_DEADLINE_SECONDS=6000    # hard per-pod deadline
+```
+
+Pods are labeled `harbor-managed=true`; `scripts/cleanup_before_run.sh` reaps only
+finished pods (phase Failed / Succeeded / Unknown) by that label, never running ones.
+
+### Provisioning a cluster from scratch
+
+The sandbox cluster has specific requirements — kubeadm 1.32+, containerd with
+`ImageVolume=true`, flannel, and optionally a shared image registry and nydus
+lazy-pull. Two resources cover it:
+
+- **The `k8s-sandbox-install` skill** (ships with this repo's Claude Code
+  plugin): a guided install/scale-out of exactly this cluster shape. It probes
+  the target machines, installs kubeadm + containerd + flannel + ImageVolume,
+  optionally sets up nydus / a shared registry / an isolated dockerd, and
+  finishes by generating a `site.<name>.env` wired for this repo.
+- **`scripts/lib/site.example.env`**: the annotated template for every
+  cluster-specific value (registry, mirror, mounts, kubeconfig, roots) — copy it
+  to `scripts/lib/site.env` and fill it in.
+
+## Docker (minimal)
+
+Each trial is a local or remote container — no cluster required.
+
+```bash
+# run config
+BACKEND=docker
+
+# lib/site.env — remote daemon (omit DOCKER_HOST to use the local daemon)
+DOCKER_HOST=tcp://<docker-host-ip>:2376
+```
+
+### Daemon permissions
+
+The training host must be able to reach the Docker daemon:
+
+- **Local** — the launching user needs access to `/var/run/docker.sock`
+  (i.e. membership in the `docker` group, or root).
+- **Remote** — the daemon must listen on TCP. On the sandbox host:
+
+```bash
+# /etc/docker/daemon.json  (TLS — for shared or production networks)
+{ "hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2376"],
+  "tlsverify": true,
+  "tlscacert": "/etc/docker/ca.pem",
+  "tlscert":   "/etc/docker/server-cert.pem",
+  "tlskey":    "/etc/docker/server-key.pem" }
+```
+
+<Callout title="2375 is root-equivalent access" type="warn">
+`tcp://<ip>:2375` is the **unencrypted** daemon port — anyone who can reach it
+has root-equivalent access to that host. Use TLS on `:2376` for anything shared;
+`:2375` is acceptable only on isolated test networks.
+</Callout>
+
+### Client-side requirement
+
+Docker mode needs the Python `docker` SDK in the venv — the `docker` CLI is not
+enough:
+
+```bash
+uv pip install --python .venv/bin/python docker
+.venv/bin/python -c "from docker import DockerClient; print('ok')"   # verify
+```
+
+Watch for namespace shadowing: a `docker/` directory on `sys.path` (e.g.
+`verl/docker/`) can mask the real SDK.
+
+## Switching
+
+`BACKEND` is a template axis — the K8s variables are ignored in Docker mode and
+vice versa, so switching backends is a config change, not a code change. For
+runtime failures on either backend, see
+[Sandbox backends troubleshooting](/docs/troubleshooting/sandbox-backends).

@@ -1,0 +1,67 @@
+---
+title: Troubleshooting
+description: Symptom-indexed fixes for the issues that actually block RL training
+---
+
+Failure modes that recur when operating SWE-Lego-RL, distilled to **symptom → root cause
+→ fix**. The pages here cover the ones you are most likely to hit; the
+[full index](#full-write-up-index) at the bottom lists every incident write-up in the
+repo, including the ones too situational to promote to a page.
+
+<Callout title="Most config-level problems never get this far" type="info">
+`PREFLIGHT_ONLY=1` catches the mistakes that would otherwise cost a multi-hour run —
+parser mismatch, topology that doesn't add up, R3 without the new verl tree, no
+reachable image source. Run it first; see [Preflight](/docs/run-training/preflight).
+</Callout>
+
+## Quick index by symptom
+
+**The run won't start, or dies on step 0**
+
+| Symptom | Page |
+| --- | --- |
+| `response_mask must contain at least one valid token` on the first step | [Tool-call parser mismatch](/docs/troubleshooting/training-startup#tool-call-parser-mismatch) |
+| `import torch` / `import vllm` costs ~9 s on every launch | [venv on a network FS](/docs/troubleshooting/training-startup#slow-venv-imports-on-a-network-filesystem) |
+| Every trial fails `env_setup` with empty trajectories | [Preflight §6](/docs/run-training/preflight#6-agent_name--scaffold) |
+| Pods end in `ImagePullBackOff` on a fresh cluster | [Image source](/docs/reference/io#site-variables) |
+
+**Training runs, but learns nothing**
+
+| Symptom | Page |
+| --- | --- |
+| Every reward is `0.0` though the grader clearly runs | [Reward always zero](/docs/troubleshooting/rewards-and-throughput#reward-always-zero-swe-rebench-v2) |
+| Pod startup creeps 30 s → 100 s+ over hours; throughput tanks | [cgroup / memcg leak](/docs/troubleshooting/rewards-and-throughput#training-slowdown-from-a-cgroupmemcg-leak) |
+| First validation hangs forever; no traceback, no dead node | [Fully-async val deadlock](/docs/troubleshooting/async-val-deadlock) |
+| Reward flat while `grad_norm` is a fraction of baseline | `training_env/fully-async-veomni-reward-flat-three-causes.md` |
+
+**val / eval numbers look wrong**
+
+| Symptom | Page |
+| --- | --- |
+| `num_turns` is 0 across the whole val pass | [Low val scores §3](/docs/troubleshooting/val-false-zero#3-the-whole-val-image-set-is-unpullable) |
+| Only ~170 of 500 val tasks get scored each time | [Low val scores §1](/docs/troubleshooting/val-false-zero#1-coverage-shortfall-only-170500-scored) |
+| Offline eval disagrees with the reported val number | [Low val scores §4](/docs/troubleshooting/val-false-zero#4-offline-regrade-the-tool-to-reach-for) |
+| Standalone `val_only` eval emits garbled output, even for the base model | [Offline eval garbled output](/docs/troubleshooting/offline-eval-garbage) |
+
+**Cluster and sandbox**
+
+| Symptom | Page |
+| --- | --- |
+| Remote Docker won't start (FlashInfer / Ray env / docker SDK / compose) | [Remote Docker pitfalls](/docs/troubleshooting/sandbox-backends#remote-docker-four-startup-pitfalls) |
+| nvme at 100% util with no pods being created; load 30+ | [Kyverno I/O storm](/docs/troubleshooting/sandbox-backends#kyverno-reports-controller-io-storm) |
+| Pods stuck `ContainerCreating`; uv installs storm the disk | [Pod-startup disk bottleneck](/docs/troubleshooting/sandbox-backends#pod-startup-disk-bottleneck-uv-cache) |
+
+## Pages by area
+
+- **[Training startup](/docs/troubleshooting/training-startup)** — model/serving
+  config issues that surface the moment a run starts.
+- **[Rewards & throughput](/docs/troubleshooting/rewards-and-throughput)** — the
+  reward signal is zero, or the host degrades over hours.
+- **[Fully-async val deadlock](/docs/troubleshooting/async-val-deadlock)** — the
+  first validation hangs and never returns.
+- **[Low val scores that are not the model](/docs/troubleshooting/val-false-zero)** — four
+  infrastructure causes of a low val score, and how to re-score a finished run.
+- **[Offline eval garbled output](/docs/troubleshooting/offline-eval-garbage)** — a
+  standalone eval emits garbled output because of the colocated serving path.
+- **[Sandbox backends](/docs/troubleshooting/sandbox-backends)** — Docker and
+  Kubernetes runtime issues.

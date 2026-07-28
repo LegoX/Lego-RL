@@ -1,0 +1,75 @@
+- name: builtin_swe_agent
+  _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
+  harbor_cfg:
+    agent:
+      name: ${oc.decode:${oc.env:HARBOR_AGENT_NAME,null}}
+      model_name: hosted_vllm/${oc.env:SERVED_MODEL_NAME,vllm_model}
+      # Tool-call parser BuiltinSWEAgentLoop uses to parse the model's tool calls (it reads
+      # agent.tool_parser, defaulting to "hermes" when absent). Qwen3.5 emits qwen3_coder
+      # format, so the missing field made OH fall back to hermes -> 100% tool-parse failures
+      # -> agents stopped after 1 turn (score 0). Mirrors agent_loop_config_cc.yaml.
+      tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+      # image_mounted variant (a11b504): detect+use the runtime pre-baked into the image
+      # (agent_runtime_image below) instead of an in-pod venv that fails on no-egress pods.
+      import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_openhands_ai.openhands:OpenHands}
+      max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,null}}
+      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
+      kwargs:
+        max_iterations: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
+        max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
+        version: ${oc.env:HARBOR_AGENT_VERSION,0.50.0}
+        disable_tool_calls: ${oc.decode:${oc.env:HARBOR_AGENT_DISABLE_TOOL_CALLS,False}}
+        # for terminus2
+        parser_name: ${oc.env:HARBOR_AGENT_PARSER_NAME,json}
+        # Required for hosted_vllm/* models; without max_input_tokens /
+        # max_output_tokens LiteLLM falls back to wildly conservative
+        # defaults (~4k) and trims every prompt. The env var holds a JSON
+        # blob, oc.decode parses it into a dict.
+        model_info: ${oc.decode:${oc.env:HARBOR_AGENT_MODEL_INFO,null}}
+        interleaved_thinking: ${oc.decode:${oc.env:HARBOR_AGENT_INTERLEAVED_THINKING,False}}
+        enable_summarize: ${oc.decode:${oc.env:HARBOR_AGENT_ENABLE_SUMMARIZE,True}}
+        proactive_summarization_threshold: ${oc.decode:${oc.env:HARBOR_AGENT_PROACTIVE_SUMMARIZATION_THRESHOLD,8000}}
+        record_terminal_session: ${oc.decode:${oc.env:HARBOR_AGENT_RECORD_TERMINAL_SESSION,True}}
+        suppress_max_turns_warning: ${oc.decode:${oc.env:HARBOR_AGENT_SUPPRESS_MAX_TURNS_WARNING,True}}
+      # Optional env block used by OpenCode when HARBOR_AGENT_IMPORT_PATH points to
+      # harbor_patch.agents.image_mounted_opencode:OpenCode. BuiltinSWEAgentLoop
+      # overwrites the hosted-vLLM URL per rollout session, while OpenHands/OH-SDK
+      # ignores these keys.
+      env:
+        HOSTED_VLLM_BASE_URL: ${oc.env:HARBOR_OPENAI_BASE_URL,http://127.0.0.1:8002/v1}
+        HOSTED_VLLM_API_KEY: ${oc.env:HARBOR_OPENAI_API_KEY,sk-dummy}
+        OPENCODE_TEMPERATURE: ${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}
+        OPENCODE_CONFIG_CONTENT: ${oc.env:HARBOR_OPENCODE_CONFIG_CONTENT,dummy-config-for-local-vllm}
+        CUSTOM_AGENT_RUNTIME_ROOT: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/opencode}
+        CUSTOM_AGENT_OPENCODE: ${oc.env:HARBOR_CUSTOM_AGENT_OPENCODE,/opt/custom-agent-runtime/opencode/bin/opencode}
+        CUSTOM_AGENT_RUNTIME_ENV_SCRIPT: ${oc.env:HARBOR_CUSTOM_AGENT_RUNTIME_ENV_SCRIPT,/opt/custom-agent-runtime/opencode/runtime-env.sh}
+    verifier:
+      enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+    environment:
+      type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+      import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment}
+      force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,False}}
+      delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+      override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+      override_memory_mb: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB,8192}}
+      kwargs:
+        kubeconfig_path: ${oc.env:K8S_KUBECONFIG,$HOME/.kube/config}
+        namespace: ${oc.env:K8S_NAMESPACE,default}
+        pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,3000}}
+        pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
+        agent_runtime_image: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE,yuantao428/harbor-openhands-ai-runtime:0.50.0}
+        agent_runtime_mount_path: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/openhands-ai}
+        agent_runtime_image_subpath: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH,opt/custom-agent-runtime/openhands-ai}
+        # JSON list of extra hostPath mounts injected into each task pod.
+        # Used on clusters where pods can't reach github (e.g. 240) to expose
+        # the SWE-rebench-V2 source at /opt/rebench-v2 from a CPFS mount.
+        # Default null = no extra mounts (preserves 1663 / non-v2 behavior).
+        # Passed through verbatim — _coerce_host_path_mounts() in
+        # kubernetes.py does the json.loads + validation.
+        host_path_mounts: ${oc.env:HARBOR_HOSTPATH_MOUNTS,null}
+    environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+    agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+    agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
+    verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
+    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}

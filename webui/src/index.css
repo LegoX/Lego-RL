@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Dark theme. Toned down from stock Tailwind slate: the top end was close to
+     pure white on a near-black ground, which reads as glare on a board people
+     keep open for hours. Highlights come down a few percent and the background
+     comes up slightly — same hierarchy, lower contrast. Mid tones (500-800) are
+     untouched: they carry borders and dividers, and moving them blurs structure. */
+  :root {
+    --c-slate-50: 234 238 245;
+    --c-slate-100: 220 226 236;
+    --c-slate-200: 200 209 223;
+    --c-slate-300: 178 189 205;
+    --c-slate-400: 140 154 175;
+    --c-slate-500: 100 116 139;
+    --c-slate-600: 71 85 105;
+    --c-slate-700: 51 65 85;
+    --c-slate-800: 30 41 59;
+    --c-slate-900: 18 26 45;
+    --c-slate-950: 9 14 31;
+
+    --chart-grid: #1e293b;
+    --chart-axis: #475569;
+    --chart-tick: #64748b;
+  }
+
+  [data-theme="light"] {
+    --c-slate-50: 2 6 23;
+    --c-slate-100: 15 23 42;
+    --c-slate-200: 30 41 59;
+    --c-slate-300: 51 65 85;
+    --c-slate-400: 100 116 139;
+    --c-slate-500: 148 163 184;
+    --c-slate-600: 179 189 204;
+    --c-slate-700: 203 213 225;
+    --c-slate-800: 226 232 240;
+    --c-slate-900: 241 245 249;
+    --c-slate-950: 255 255 255;
+
+    --chart-grid: #e2e8f0;
+    --chart-axis: #94a3b8;
+    --chart-tick: #64748b;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--c-slate-700));
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--c-slate-600));
+  }
+}

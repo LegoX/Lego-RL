@@ -1,0 +1,79 @@
+---
+title: Example Usages
+description: Launch and monitor training, evaluation, and batch-inference runs
+---
+
+SWE-Lego-RL runs three kinds of workload through one contract: **train** a
+policy, **eval** a checkpoint on a held-out set, and **infer** — batch-generate
+trajectories over a task index. Each kind has a runner and a set of templates;
+a run is defined by one `.env` config formed from a template, and can be
+launched **by hand** or **through the [agent plugin](/docs/agent-plugin)**.
+Shown for `train` — `eval` and `infer` follow the identical pattern:
+
+```bash
+# form the config once
+cp scripts/train/templates/sync_k8s_ohsdk_qwen35a3b.env scripts/train/configs/my_run.env
+
+# manual path
+PREFLIGHT_ONLY=1 bash scripts/train/train.sh train/configs/my_run.env   # checks only, no launch
+bash scripts/train/train.sh train/configs/my_run.env                    # launch
+
+# agent path (same runner, same validation, plus live-machine checks)
+/rl:check train/configs/my_run.env
+/rl:run   train/configs/my_run.env
+```
+
+| Kind | Runner | Guide |
+| --- | --- | --- |
+| train | `scripts/train/train.sh` | this section |
+| eval | `scripts/eval/eval.sh` | [Evaluation](/docs/run-training/eval) |
+| infer | `scripts/infer/infer.sh` | [Batch Inference](/docs/run-training/infer) |
+
+See [Inputs & Configuration](/docs/reference/io) for the config layers and
+[Getting Started](/docs/getting-started) for the first-run walkthrough.
+
+<Callout title="Launch in the background" type="info">
+Training runs for hours. Launch through `/rl:run` (backgrounds by default), or
+wrap a manual launch in `tmux` / `nohup setsid` so it survives shell
+disconnects, and tail `logs/<exp>.log`.
+</Callout>
+
+## Boot sequence
+
+A **train** run boots vLLM to serve the policy, starts the in-process proxy in
+front of it, and lets verl drive the RL loop while a coding agent rolls out
+across tasks inside Harbor sandboxes:
+
+1. **Config** — the runner sources `lib/site.env` + your config, applies the model
+   preset, and resolves the scaffold and backend.
+2. **Preflight** — nine classes of fatal assertion; the run stops here on any `✗`.
+3. **venv** — built once by `scripts/setup_env.sh` (or reused via `VENV_PATH`).
+4. **Ray** — the cluster comes up and waits for `NNODES` nodes to join.
+5. **vLLM** — verl launches DP × TP replicas; CUDA-graph capture on a 30B MoE
+   (TP=4) is ~10–20 min before the first replica registers.
+6. **In-process proxy** — started by the verl agent loop; it advertises a
+   per-session URL per trial (no standalone LiteLLM, no fixed port).
+7. **verl loop** — generate rollouts → run trials in Harbor → reward → update →
+   checkpoint every `SAVE_FREQ` steps.
+
+## In this section
+
+- **[Preflight](/docs/run-training/preflight)**: the nine assertion classes `PREFLIGHT_ONLY=1` runs before any launch
+- **[Inference Stack](/docs/run-training/inference-stack)**: the agent → in-process proxy → vLLM chain and its health checks
+- **[Backends](/docs/run-training/backends)**: Kubernetes vs Docker sandboxes
+- **[Results & Artifacts](/docs/run-training/results-and-artifacts)**: logs, checkpoints, trajectories
+- **[Evaluation](/docs/run-training/eval)**: score a checkpoint on a held-out set
+- **[Batch Inference](/docs/run-training/infer)**: trajectory generation and difficulty filtering
+- **[Scaling Up](/docs/run-training/scaling)**: *advanced:* multi-node, fully-async, VeOmni/MoE, partial rollout, R3
+
+<Callout title="Start single-node" type="info">
+A `sync_*` template on one 8×GPU host is the **minimal-cost** way to run SWE-Lego-RL.
+Only move to an `async_*` template and more machines when you outgrow it; see
+[Scaling Up](/docs/run-training/scaling).
+</Callout>
+
+<Callout title="Stop cleanly between runs" type="warn">
+Between runs, `bash scripts/cleanup_before_run.sh` stops Ray, frees ports, and
+reaps stale vLLM/verl processes. Checkpoints and wandb runs are preserved; set
+`KEEP_TRIALS=0` to also clear the trials dir. It never kills running GPU tasks.
+</Callout>

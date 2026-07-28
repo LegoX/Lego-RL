@@ -1,0 +1,95 @@
+hydra:
+  searchpath:
+    - pkg://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+trainer:
+  use_legacy_worker_impl: disable
+
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer, 
+  # One step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+  
+  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+  require_batches: 1
+
+  # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
+  # If True, AsyncLLMServerManager auto resume generation, making rollout interruption invisible to the AgentLoop.
+  partial_rollout: True
+
+  # whether to use trainer do_validate
+  use_trainer_do_validate: False
+
+# Rollout config
+rollout:
+
+  # Number of nodes used in the rollout
+  nnodes: 1
+
+  # Number of GPUs per node                     
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo
+  n: 4
+
+  # total rollout samples # TODO rename to total_rollout_samples
+  total_rollout_steps: 100
+
+data:
+  # Number of samples generated, currently only support 1
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+    checkpoint_engine:
+      backend: "nccl"
+    engine_kwargs:
+      vllm:
+        # Must match SERVED_MODEL_NAME (what the agent/LiteLLM forwards
+        # to vLLM as openai/<name>). Hardcoding it here desyncs from the agent
+        # side the moment SERVED_MODEL_NAME is overridden -> vLLM 404.
+        served-model-name: ${oc.env:SERVED_MODEL_NAME,vllm_model}
+        enable-expert-parallel: True
+        enable-auto-tool-choice: True
+        # Single source of truth: TOOL_CALL_PARSER drives BOTH this vLLM
+        # serving parser and the agent-side harbor_cfg.agent.tool_parser
+        # (agent_loop_config_cc*.yaml). Must match the model's chat_template
+        # tool-call format. Keep the default in sync with those configs.
+        tool-call-parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+        attention-config.backend: FLASH_ATTN
+        # Disable flashinfer-dependent fused allreduce+RMSNorm pass.
+        # vLLM 0.19 enables it by default but the flashinfer workspace
+        # is not initialized in TP>1 setups, causing:
+        #   "Flashinfer allreduce workspace must be initialized when using flashinfer"
+        compilation-config: '{"pass_config":{"fuse_allreduce_rms":false}}'
+    agent:
+      num_workers: 8
+      default_agent_loop: "builtin_swe_agent"
+      agent_loop_config_path: ${oc.env:SWE_LEGO_RL_ROOT}/src/verl_patch/config/agent_loop_config_${oc.env:AGENT_SCAFFOLD,oh}.yaml
+
+  actor:
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True

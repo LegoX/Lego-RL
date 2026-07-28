@@ -1,0 +1,93 @@
+---
+title: Introduction
+description: What SWE-Lego-RL is and how the pieces fit together
+---
+
+**SWE-Lego-RL** is a framework for training coding agents with online
+reinforcement learning on real software-engineering tasks. It connects
+unmodified agent harnesses — Claude Code, OpenHands, OpenCode, Terminus — to
+[verl](https://github.com/volcano-engine/verl)-based policy optimization:
+every trial runs in a fresh [Harbor](https://github.com/SWE-Lego/harbor)
+sandbox, the task's own test suite produces the reward, and training data is
+captured at token level directly from the serving path.
+
+<img
+  src="/pipeline.png"
+  alt="SWE-Lego-RL pipeline: data preparation, run validation, training run, live UI, human review"
+  style={{
+    display: "block",
+    width: "100%",
+    maxWidth: "980px",
+    height: "auto",
+    margin: "1.5rem auto",
+    background: "#fff",
+    border: "1px solid rgba(0,0,0,0.08)",
+    borderRadius: "8px",
+    padding: "0.5rem",
+  }}
+/>
+
+## Key features
+
+- **Native agents, unmodified**: the agent that produces a rollout is the same
+  agent you deploy — each scaffold is a thin adapter, not a fork, and drives
+  the policy it is training. Claude Code, OpenHands, OpenCode, and Terminus are
+  validated end to end; any scaffold speaking the OpenAI/Anthropic API can be
+  added as a
+  [custom adapter](/docs/architecture/agent-loop-workers#agent-loop-classes).
+- **Token-level trajectory capture**: an [in-process proxy](/docs/architecture/in-process-proxy)
+  serves one unified OpenAI/Anthropic API and records the exact token ids,
+  masks and log-probabilities at generation time — no transcript
+  re-tokenization, and history rewriting by the agent does not corrupt the
+  signal.
+- **MoE routing replay (R3)**: rollout-time expert routing is recorded and
+  replayed during the update, keeping rollout/training log-probabilities
+  aligned (`pearson ≈ 0.999`) for sparse policies.
+- **Verified rewards in real sandboxes**: each task's verifier runs its test
+  suite inside a fresh [Kubernetes or Docker](/docs/run-training/backends)
+  container, with image caching, lazy pull, and anti-hacking defenses; broken
+  environments are [filtered out of the loss](/docs/architecture/rollouter)
+  instead of polluting the gradient.
+- **Scalable training**: PPO / GRPO / GSPO over full multi-turn rollouts, on
+  [FSDP, VeOmni, or Megatron](/docs/core-concepts#trainer-backends); from a
+  synchronous single-node loop to a fully-asynchronous multi-node cluster with
+  [partial rollout](/docs/architecture/trainer) —
+  see [Scaling Up](/docs/run-training/scaling).
+- **Operations built in**: [Preflight](/docs/run-training/preflight) config
+  validation, an [agent plugin](/docs/agent-plugin) for guided launches, a
+  self-contained [dashboard](/docs/dashboard), and symptom-indexed
+  [troubleshooting](/docs/troubleshooting).
+
+## The training loop
+
+Each layer has its own page in [Architecture](/docs/architecture):
+
+1. **[Environment](/docs/architecture/environment)**: each task runs in a fresh
+   sandbox (a Kubernetes pod or a local/remote Docker container — setup and
+   permissions in [Backends](/docs/run-training/backends)) with sandboxed
+   execution plus the task's own **verifier**. A coding-agent scaffold — Claude
+   Code, OpenCode, OpenHands, Terminus 2 — drives the model through the task.
+2. **[AgentLoopWorkers](/docs/architecture/agent-loop-workers)**: run the scaffolds
+   concurrently and capture each rollout.
+3. **[In-Process Proxy](/docs/architecture/in-process-proxy)**: fronts every worker
+   with a single, unified OpenAI/Anthropic API — it captures the trajectory
+   (token-in / token-out) and forwards each call onward. No standalone LiteLLM.
+4. **[Global Load Balancer](/docs/architecture/global-load-balancer)**: spreads
+   requests across inference replicas with sticky, per-session routing.
+5. **[Rollouter](/docs/architecture/rollouter)**: a pool of vLLM inference servers
+   serves the policy, streams completed rollouts into a **Data Buffer**, and
+   receives **Weight Sync** updates.
+6. **[Trainer](/docs/architecture/trainer)**: verl consumes the buffer, computes
+   advantages, and updates the actor (PPO / GRPO / GSPO), then syncs new weights
+   back to the rollouter for the next round.
+
+## Documentation map
+
+- **[Getting Started](/docs/getting-started)**: prerequisites and your first training run
+- **[Data Preparation](/docs/data-preparation)**: raw issues → Harbor tasks, sandbox images, and a filtered task index
+- **[Example Usages](/docs/run-training)**: launch and monitor training, evaluation, and batch inference
+- **[Core Concepts](/docs/core-concepts)**: terminology, the training formulation, and references
+- **[Block Design](/docs/architecture)**: the architecture, one page per block of the diagram above
+- **[Agent Plugin](/docs/agent-plugin)**: validate, launch, and diagnose runs through the `/rl:*` skills
+- **[Dashboard](/docs/dashboard)**: serve the training board in one command, locally or on a public URL
+- **[Reference](/docs/reference/io)**: the runner configuration surface

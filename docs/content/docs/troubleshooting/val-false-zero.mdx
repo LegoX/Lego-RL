@@ -1,0 +1,131 @@
+---
+title: Low Val Scores That Are Not the Model
+description: Four infrastructure causes of a low or zero val score, how to tell them apart, and how to re-score a finished run without re-running the agent
+---
+
+A val score that is zero or "suspiciously low" is **more often broken
+infrastructure than a broken policy**. Four independent causes produce the same
+headline number, and each has a distinct fingerprint. Triage first, then fix; and
+when in doubt, re-grade offline — it is cheap and it settles the argument.
+
+## Triage: read `num_turns` before anything else
+
+Look at `val-aux/num_turns/{min,max,mean}` for the failing step:
+
+| Fingerprint | Cause | Go to |
+| --- | --- | --- |
+| `max = 0` — every trial zero turns | val images could not be pulled at all; the env never started | [§3](#3-the-whole-val-image-set-is-unpullable) |
+| `min ≥ 1`, but far fewer trials landed than the val set size | coverage shortfall — throughput / timeouts | [§1](#1-coverage-shortfall-only-170500-scored) |
+| trajectories look normal, the verifier ran, yet `reward = 0` | grading infrastructure, not the model | [§2](#2-no-egress-breaks-the-grader-official-swe-bench-only) |
+| numbers plausible but disagree with an offline number | grading noise — re-grade | [§4](#4-offline-regrade-the-tool-to-reach-for) |
+
+<Callout title="Make sure you are looking at val trials" type="info">
+Distinguish val from train trials by task path: `harbor_swe_val_tasks_official`
+is val; `openswe_filtered` / `swerebench_filtered` are train.
+</Callout>
+
+<Callout title="Training gradients are not affected by any of this" type="info">
+Training tasks use a self-contained verifier (`echo 1/0 > reward.txt`) that touches
+neither `uv` nor the network, and env failures are dropped by `trajectory_filter`
+rather than fed to the update as `reward=0`. So these bugs pollute the val *metric*
+while the gradients stay clean — which is exactly how you end up with train reward
+climbing while val looks flat or depressed.
+</Callout>
+
+## §1 Coverage shortfall (only ~170/500 scored)
+
+**Symptom.** The val set has 500 tasks, but only ~150–180 trials land per validation
+pass, and `val-core` divides by that smaller number. Reproduces on every model —
+it is a fully-async behavior, not a regression.
+
+**Root cause.** Validation dispatches all 500 with one `asyncio.gather` and no
+overall budget. A single rollout node cannot push 500 × ~58k-token trajectories
+through the ~7000 s validate window when each trial carries a 2400 s agent timeout,
+`max_retries=1`, and a 1200 s pod-startup allowance. Trials that miss the window
+return `_make_empty_output` (`ENV_SETUP_FAILED`) and are filtered out. The
+underlying driver is the very long responses.
+
+**Fix.** Set the val-specific timeout/retry knobs — they leave the training path
+alone. Unset, each falls back to its training value (retries 2 / startup 1200 s /
+timeout 2400 s / deadline 6000 s):
+
+```bash
+HARBOR_VAL_MAX_RETRIES=2
+HARBOR_VAL_AGENT_MAX_TIMEOUT_SEC=4800
+K8S_VAL_POD_STARTUP_TIMEOUT=1800
+K8S_VAL_POD_ACTIVE_DEADLINE_SECONDS=9000
+```
+
+<Callout title="This is why preflight warns about it" type="warn">
+These exports were originally hand-written into one launch script, and every new
+script that forgot to copy them silently regressed to ~170/500. Preflight now warns
+when `HARBOR_VAL_AGENT_MAX_TIMEOUT_SEC` is unset. A real fix is shorter responses
+(58k → ~15k) or more rollout capacity — the knobs only buy headroom.
+</Callout>
+
+## §2 No egress breaks the grader (official SWE-bench only)
+
+On an egress-less cluster, the *official* val set's grading path fails in two
+independent places, both of which surface as `reward = 0` on a perfectly good patch:
+
+1. **`uv` missing from the image.** The val task's `tests/test.sh` grades with
+   `uv run parser.py`, and the Dockerfile installs uv via
+   `RUN curl -LsSf https://astral.sh/uv/... | sh` with no `ENV PATH`. Without egress
+   the curl fetches nothing and `curl | sh` **exits 0 anyway** (sh reads an empty
+   script), so the image "builds successfully" without uv → `uv: command not found`.
+   This hits ~27–30% of pods and a *different* subset each run — the intersection of
+   two runs' broken sets was only 40/136, proving it is runtime-flaky, not a
+   permanently bad image.
+2. **The parser itself reaches the network.** Even with uv present, `parser.py`'s
+   `make_test_spec()` downloads test dependencies from `raw.githubusercontent.com` →
+   `NameResolutionError` → exit 1 → `reward.txt = 0`.
+
+**Fix (image side).** `COPY` the uv binary into the image and set
+`ENV PATH=/root/.local/bin:$PATH`; pre-cache the swebench dependencies at build time
+instead of downloading at runtime; add `set -o pipefail` so a broken `curl | sh` can
+never pass silently again.
+
+## §3 The whole val image set is unpullable
+
+**Symptom.** `num_turns` is 0 across the board, `verifier_result: null`, reward 0 —
+and the training half of the same run is completely healthy.
+
+**Root cause.** Official val tasks carry `docker_image=docker.io/swebench/sweb.eval.x86_64.*`
+in their parquet. On a cluster with no Docker Hub egress, whose local registry only
+holds the *training* images, and with `INLINE_BUILD=false` + `SKIP_DOCKERFILE=true`,
+the val pod fails to pull → `container not found("main")` → zero turns.
+
+**Fix.** Mirror the val images into the shared registry (one designated writer node;
+everyone else read-only) and point harbor at it:
+
+```bash
+export HARBOR_NYDUS_MIRROR=<registry-host>:5001   # rewrites docker.io/swebench/* → local mirror
+```
+
+The rewrite happens in `_maybe_rewrite_to_nydus_mirror`. **The run must be restarted
+to pick up the new export.** See also
+[Sandbox Backends](/docs/troubleshooting/sandbox-backends).
+
+## §4 Offline regrade: the tool to reach for
+
+For any finished run you can re-derive the score from the **archived pytest output**,
+bypassing every failure above. No agent re-run, no image rebuild.
+
+1. On a node with PyPI access:
+   `pip install swebench==4.0.3 datasets==2.16.1 'fastcore<1.11'`.
+2. For each trial, read `verifier/test-stdout.txt` (the raw pytest output, archived
+   at run time).
+3. Look up `FAIL_TO_PASS` / `PASS_TO_PASS` from
+   `harbor_swe_val_tasks_official/<instance_id>/tests/config.json`.
+4. Wrap the output in `START/END_TEST_OUTPUT` markers, then reproduce the official
+   grading with `get_logs_eval` → `get_eval_tests_report` → `get_resolution_status`.
+
+**Reliability.** Agreement with harbor's own record is 94.5%; every one of the 19
+disagreements was a harbor fake zero, confirmed by hand.
+
+<Callout title="What this found — read before trusting a val curve" type="warn">
+Re-grading a Qwen3.6-27B run moved step 5 from 0.451 to **0.687** and step 30 from
+0.541 to **0.697**. True val was ≈0.67–0.70 and essentially **flat**; the reported
+"RL improvement from 0.45 to 0.56" was mostly *decreasing grading noise*, not
+capability gain. If a val curve is the evidence for a claim, regrade it first.
+</Callout>

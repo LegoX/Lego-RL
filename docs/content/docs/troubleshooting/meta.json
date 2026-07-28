@@ -1,0 +1,15 @@
+{
+    "title": "Troubleshooting",
+    "pages": [
+        "---Startup---",
+        "training-startup",
+        "---Training runtime---",
+        "rewards-and-throughput",
+        "async-val-deadlock",
+        "---val & eval scores---",
+        "val-false-zero",
+        "offline-eval-garbage",
+        "---Cluster & sandbox---",
+        "sandbox-backends"
+    ]
+}

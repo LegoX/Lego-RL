@@ -1,0 +1,39 @@
+---
+title: Results & Artifacts
+description: Where logs, checkpoints, and trajectories land
+---
+
+A run produces several streams of output, all under the repo root (the runtime
+artifacts are gitignored).
+
+## Per-run outputs
+
+| Output | Path | Notes |
+| --- | --- | --- |
+| Training log | `logs/<exp>.log` | verl + Harbor integration log (contains the `step:` metric lines) |
+| Throughput log | `logs/<exp>_vllm.log` | filtered throughput-only log (dashboard skips it) |
+| Trajectories | `harbor_trials/<project>/<exp>/step_*/<session>/proxy_trajectory.json` | per-trial agent traffic (token ids / masks / logprobs) |
+| Checkpoints | `checkpoints/<project>/<exp>/global_step_N/` | actor FSDP shards, every `save_freq` steps |
+
+## Live state
+
+```bash
+pgrep -af 'train.sh|fully_async|main_ppo'          # is a run live?
+tail -F logs/<exp>.log                             # follow the step lines
+ls checkpoints/<project>/<exp>/                    # global_step_N/ ...
+ls harbor_trials/<project>/<exp>/step_*/           # per-trial trajectories
+```
+
+vLLM readiness: query the Ray-registered `vllm_server_*` actors (see
+[Inference Stack](/docs/run-training/inference-stack)).
+
+<Callout title="Do not commit checkpoints" type="warn">
+FSDP shards are large and stay where verl wrote them. Archive metadata and small
+trajectory samples — never the checkpoints themselves.
+</Callout>
+
+## Visualizing
+
+The [dashboard](/docs/dashboard) reads the training logs and renders reward, KL,
+MFU, entropy, and response-length curves, plus a browser over the per-trial
+trajectory JSON.

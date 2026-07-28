@@ -1,0 +1,129 @@
+---
+title: Session-Level Scheduler
+description: Admission control that protects the prefix cache when KV pressure is high
+---
+
+The **session-level scheduler** is an admission gate inside the
+[In-Process Proxy](/docs/architecture/in-process-proxy), in front of the
+[Global Load Balancer](/docs/architecture/global-load-balancer). It decides *when* a
+session's next turn is allowed to reach vLLM — not *which* replica it goes to.
+
+<Callout title="Opt-in, and engine support is still landing" type="warn">
+The gate ships **disabled** (`HARBOR_SESSION_LEVEL_SCHEDULER=0`). It also depends on
+two probe methods on verl's server manager; where those are absent, every probe
+returns empty, the scheduler reads "no pressure", and admits everything — so
+enabling the flag on an engine without probe support is a no-op, not a hazard.
+</Callout>
+
+## Cache thrashing
+
+An agentic rollout's prompt grows monotonically: every turn re-sends the whole
+history plus the last tool result. Early turns are short, so **high concurrency is
+good** — it keeps the replicas fed. Late in a run, dozens of sessions each carrying
+tens of thousands of tokens compete for the same KV cache, and vLLM starts evicting
+prefix blocks across sessions. Each eviction forces a full re-prefill of a very long
+prompt on the next turn, so throughput falls off a cliff *while* utilization still
+looks healthy.
+
+[Sticky routing](/docs/architecture/global-load-balancer) pins a session to one
+replica, but it cannot stop that replica from evicting the session's blocks under
+pressure. The missing control is **how many sessions are allowed to be in flight at
+all** once the cache is full.
+
+## Residency probes
+
+The hard part is that you cannot infer cache residency from the conversation:
+
+- a session whose prompt merely *extends* the previous one may still be **cold**, if
+  its blocks were evicted while it waited on a tool;
+- a session that had a prefix *mismatch* may be **hot** again, because vLLM already
+  recomputed and cached the new prefix.
+
+So the scheduler asks the engine instead of guessing. Two probes, deliberately
+different in cost:
+
+| Probe | Answers | Cost | Used |
+| --- | --- | --- | --- |
+| `kv_cache_usage_probe()` | current KV block-pool occupancy, `[0.0, 1.0]` | O(1) read | every admission |
+| `prefix_cache_probe(prompt_ids)` | longest prefix currently resident → `hit_tokens`, `hit_ratio` | one cache lookup | only above the high watermark |
+
+Both run as vLLM **`EngineCoreRequestType.UTILITY`** calls, not `ADD`. That matters:
+a probe never enters the waiting or running queue, never consumes `max_num_seqs` or
+scheduler token budget, never allocates KV blocks, and never runs a forward pass —
+so asking "is this session hot?" cannot itself warm a cold session or perturb
+scheduling.
+
+## The admission decision
+
+For each turn the proxy calls `acquire(session_id, prompt_ids)`:
+
+```text
+usage < high_watermark ──────────────────────────────▶ admit  "open"
+usage ≥ high_watermark
+  ├─ session already owns a reservation ─────────────▶ admit  "reserved_session"
+  ├─ prefix probe unavailable ───────────────────────▶ admit  "prefix_probe_unavailable"
+  ├─ hit_ratio ≥ hit_threshold ──────────────────────▶ admit  "resident_prefix"
+  └─ otherwise ──── wait (wait_poll_sec, or until another session releases) ── retry
+```
+
+Under pressure the gate therefore prefers sessions that can *reuse* what is already
+in the cache, and holds cold sessions in a pending queue until capacity frees up —
+at which point one of them is admitted and gets to rebuild its resident prefix
+instead of everyone thrashing at once.
+
+Every admission is a **lease**. Releasing it, not just finishing the HTTP request, is
+what lets the next waiter through.
+
+## Ownership windows
+
+The useful unit here is not the in-flight request. In an agent loop a session has at
+most one call outstanding, and after it returns the tool result usually arrives
+seconds later — and should keep using the same resident prefix.
+
+So a session admitted under pressure receives an **ownership window**:
+
+1. On admission with `retain_session`, the reservation is held for the whole
+   in-flight request.
+2. On `release()`, it converts into an idle grace window of `idle_grace_sec` — the
+   tool-result turn re-enters as `reserved_session` and skips probing entirely.
+3. The window ends when the session explicitly finishes (`finish_session`) or the
+   grace expires. Expired reservations are purged lazily by whichever waiter looks
+   next, and waiting sessions are notified.
+
+## Attempt preemption
+
+Retries make sessions overlap: a queued attempt can still be waiting for admission
+when the scaffold gives up and issues a newer one for the same session. When that
+happens the proxy sets the older attempt's abort event; it raises
+`_AdmissionPreempted` at its next checkpoint (the scheduler polls the flag around
+every probe and every wait) and is counted in the session's `num_preempted`. Only the
+newest attempt competes for admission, so a retry storm cannot fill the pending queue
+with work nobody is waiting on.
+
+## Knobs
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HARBOR_SESSION_LEVEL_SCHEDULER` | `0` | master switch; off means every call is admitted immediately |
+| `HARBOR_SESSION_SCHEDULER_HIGH_WATERMARK` | `0.85` | KV usage above which admission control engages |
+| `HARBOR_SESSION_SCHEDULER_HIT_THRESHOLD` | `0.80` | prefix hit ratio a cold session must reach to be admitted under pressure |
+| `HARBOR_SESSION_SCHEDULER_IDLE_GRACE_SEC` | `60` | how long a released session keeps its ownership window |
+| `HARBOR_SESSION_SCHEDULER_WAIT_POLL_SEC` | `5` | re-probe interval for a waiting session (floored at 5 s) |
+
+Tuning intuition: **lower the watermark** if you see prefix-cache hit rate collapse
+before the gate ever engages; **lower the hit threshold** if too many sessions stall
+in the pending queue; **raise the idle grace** if your tool calls are slow enough
+that sessions keep losing their window between turns.
+
+## Monitoring signals
+
+- vLLM prefix-cache hit rate — the metric this exists to defend. A sharp drop late in
+  a step is the symptom.
+- Rollout wall-clock per step, split by turn index: re-prefill cost shows up as late
+  turns getting disproportionately slower.
+- `num_preempted` per session — a high count means retries, not scheduling, are your
+  problem.
+
+> Related: [Global Load Balancer](/docs/architecture/global-load-balancer) (which
+> replica) · [Rollouter](/docs/architecture/rollouter) (how many replicas) ·
+> [In-Process Proxy](/docs/architecture/in-process-proxy) (where this gate lives).

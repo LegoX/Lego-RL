@@ -1,0 +1,60 @@
+---
+title: Block Design
+description: The layers of the SWE-Lego-RL framework, one page each
+---
+
+SWE-Lego-RL is a pipeline from a sandboxed coding task to a weight update. Requests
+flow **down** the stack (agent → proxy → load balancer → inference servers) and
+data + weights flow **back up** (rollouts → buffer → trainer → weight sync). Each
+layer below has its own page.
+
+<img
+  src="/framework.png"
+  alt="Framework architecture: environment, agent-loop workers, proxy and load balancer, rollouter, trainer"
+  style={{ display: "block", width: "100%", maxWidth: "920px", height: "auto", margin: "1.5rem auto" }}
+/>
+
+## The layers
+
+| Layer | Role |
+| --- | --- |
+| [Environment](/docs/architecture/environment) | Sandboxed execution + verifier; the coding-agent scaffolds and the backends (K8s / Docker, plus Harbor-inherited ones) that run them |
+| [AgentLoopWorkers](/docs/architecture/agent-loop-workers) | Run the scaffolds concurrently, one trial each, and capture the rollout |
+| [In-Process Proxy](/docs/architecture/in-process-proxy) | One unified OpenAI/Anthropic API in front of the policy; captures token-level trajectories |
+| [Global Load Balancer](/docs/architecture/global-load-balancer) | Spreads requests across inference replicas with sticky, per-session routing |
+| [Session-Level Scheduler](/docs/architecture/session-scheduler) | Opt-in admission control that protects the prefix cache when KV pressure is high |
+| [Rollouter](/docs/architecture/rollouter) | The vLLM inference-server pool, the rollout data buffer, and weight sync |
+| [Trainer](/docs/architecture/trainer) | verl actor on FSDP / VeOmni / Megatron; PPO / GRPO / GSPO; sync, async, partial rollout, R3 |
+
+## Pillar mapping
+
+The technical report groups the system into three pillars by **the problem each
+part solves**; this page groups it by **where the data goes**. They are two cuts
+through the same system, not two descriptions of different things:
+
+| Pillar | Lives in |
+| --- | --- |
+| Token-faithful rollouts | [In-Process Proxy](/docs/architecture/in-process-proxy) for capture, plus R3 routing replay in the [Trainer](/docs/architecture/trainer) |
+| Trustworthy sandboxes at scale | [Environment](/docs/architecture/environment) and the [AgentLoopWorkers](/docs/architecture/agent-loop-workers) driving it |
+| Operations for long runs | **nowhere on this diagram** |
+
+That last row is the point. Run validation, the dashboard and the
+failure-signature writeups sit *beside* the pipeline rather than inside it —
+nothing flows through them, so an architecture diagram cannot show them. That is
+also why they are easy to skip until a run has already been wasted: see the
+[Agent Plugin](/docs/agent-plugin), [Preflight](/docs/run-training/preflight),
+[Dashboard](/docs/dashboard) and [Troubleshooting](/docs/troubleshooting).
+
+## One training step
+
+1. The **trainer** samples a batch of tasks and hands them to the
+   **AgentLoopWorkers**.
+2. Each worker launches a scaffold inside an **Environment** sandbox and drives it
+   through the task; every model call goes through the **In-Process Proxy**.
+3. The proxy routes the call through the **Global Load Balancer** to a vLLM replica
+   in the **Rollouter**, and records the exact tokens for training.
+4. When the trial finishes, the **verifier** scores it; the completed rollout lands
+   in the **Data Buffer**.
+5. The **Trainer** consumes the buffer, computes advantages, updates the actor, and
+   pushes new weights back to the rollouter via **Weight Sync** — then the next
+   step begins.

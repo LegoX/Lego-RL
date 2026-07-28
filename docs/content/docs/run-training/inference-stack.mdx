@@ -1,0 +1,64 @@
+---
+title: Inference Stack
+description: The agent → in-process proxy → vLLM chain and its health checks
+---
+
+During training the policy serves itself. The agent inside each sandbox does not
+talk to vLLM directly — it goes through an **in-process proxy** started by the
+verl agent loop on the training host. There is **no standalone LiteLLM service**
+and **no fixed `:8002` port** anymore; the proxy binds an ephemeral port
+on the host's primary IPv4 and advertises a unique **per-session URL** to each
+trial.
+
+```text
+coding agent (K8s pod / Docker container)
+  └─▶ in-process proxy   (per-session URL, e.g. http://<host-ip>:<port>/sess/<id>/v1)
+        • OpenAI    /v1/chat/completions   (OpenHands / OpenCode / Terminus)
+        • Anthropic /v1/messages           (Claude Code)
+        • writes proxy_trajectory.json per trial
+        └─▶ server_manager.generate(...) ─▶ vLLM (verl-managed DP × TP replicas)
+```
+
+## Responsibilities
+
+- **Unified API** — the proxy presents an ordinary OpenAI *and* Anthropic
+  surface, so any standard scaffold works unchanged. All scaffolds route through
+  it: Claude Code via `/v1/messages`, OpenHands / OpenCode / Terminus via
+  `/v1/chat/completions`.
+- **Per-trial isolation** — each trial gets its own `session_id` and session URL.
+  `ANTHROPIC_BASE_URL` (Claude Code) and the OpenAI base URL are overridden
+  per trial with that session URL.
+- **Trajectory capture** — the proxy tokenizes through the same
+  `apply_chat_template` path as verl and writes one `proxy_trajectory.json` per
+  trial under `harbor_trials/`, carrying the per-token ids / masks / logprobs used
+  by the training update.
+- **Partial-rollout aware** — it forwards to verl's `server_manager.generate(...)`
+  rather than vLLM directly, so vLLM aborts/retries and the fully-async partial
+  rollout path are handled transparently.
+
+## Health checks
+
+On a 30B MoE (TP=4), vLLM CUDA-graph capture is ~10–20 min before the first
+replica registers. The proxy comes up with the agent loop, so check vLLM
+readiness via Ray and watch the GPUs:
+
+```bash
+# 1. Ray-registered vLLM actors (the rollout replicas)
+.venv/bin/python -c "import ray; ray.init(address='auto', ignore_reinit_error=True); \
+  print([a for a in ray.util.list_named_actors(all_namespaces=True) if 'vllm_server' in a['name']])"
+
+# 2. GPU utilization during rollout
+watch -n 2 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
+
+# 3. The proxy's advertised per-session URL is logged at trial start; per-trial
+#    traffic is captured in harbor_trials/<project>/<exp>/step_*/<session>/proxy_trajectory.json
+```
+
+## Symptoms
+
+| Symptom | Likely cause |
+| --- | --- |
+| vLLM never registers for >30 min | vLLM init error — check `logs/<exp>.log` and `logs/<exp>_vllm.log` |
+| GPU memory high, util 0% sustained during rollout | sandbox side stuck (no traffic from agent pods) — `kubectl get pods -l harbor-managed=true` |
+| `CUDA error: an illegal memory access` at first forward pass | `gen_tp` does not divide `num_key_value_heads` — see [Preflight](/docs/run-training/preflight) |
+| `proxy_trajectory.json` rows are zero-filled | sequence divergence forced a lossy rebuild — the proxy recomputes prefix logprobs via vLLM `prompt_logprobs` (kill-switch `HARBOR_RECOMPUTE_MISMATCH_LOGPROBS=0`) |

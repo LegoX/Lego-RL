@@ -1,0 +1,71 @@
+@import "tailwindcss";
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
+@import "tw-animate-css";
+
+/* Remove shadow from code blocks */
+figure.shiki {
+  box-shadow: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * SWE-Lego series theme — kept identical to swe-lego-live-docs so the two
+ * sites read as one family: warm paper background + rust primary in light
+ * mode, near-black neutral in dark mode.
+ * ------------------------------------------------------------------------- */
+:root {
+  --swe-lego-accent: #b3431f;
+}
+
+:root:not(.dark) {
+  --color-fd-background: #fafaf7;
+  --color-fd-foreground: #111;
+  --color-fd-card: #fafaf7;
+  --color-fd-popover: #fafaf7;
+  --color-fd-muted: #f1efe9;
+  --color-fd-muted-foreground: #6b6b66;
+  --color-fd-secondary: #f1efe9;
+  --color-fd-accent: #efece4;
+  --color-fd-accent-foreground: #111;
+  --color-fd-border: #e6e3da;
+  --color-fd-ring: #b3431f;
+  --color-fd-primary: #b3431f;
+  --color-fd-primary-foreground: #fafaf7;
+}
+
+.dark {
+  --color-fd-background: #121212;
+  --color-fd-foreground: #ebebeb;
+  --color-fd-muted: #212121;
+  --color-fd-muted-foreground: #b3b3b3cc;
+  --color-fd-popover: #1e1e1e;
+  --color-fd-popover-foreground: #dedede;
+  --color-fd-card: #191919;
+  --color-fd-card-foreground: #fafafa;
+  --color-fd-border: #6663;
+  --color-fd-primary: #fafafa;
+  --color-fd-primary-foreground: #171717;
+  --color-fd-secondary: #212121;
+  --color-fd-secondary-foreground: #ebebeb;
+  --color-fd-accent: #6868684d;
+  --color-fd-accent-foreground: #e6e6e6;
+  --color-fd-ring: #8c8c8c;
+  --color-fd-overlay: #0003;
+}
+
+/* Brand wordmark — same serif treatment as the SWE-Lego-Live docs */
+.docs-brand-title {
+  letter-spacing: 0;
+  font-family: Georgia, Cambria, "Times New Roman", Times, serif;
+  font-size: 1.18rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.docs-rl-word {
+  color: var(--swe-lego-accent);
+}
+
+.dark .docs-rl-word {
+  color: #e07a52;
+}

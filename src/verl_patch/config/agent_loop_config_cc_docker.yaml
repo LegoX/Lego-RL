@@ -1,0 +1,54 @@
+# Harbor × Claude Code agent loop config — Remote Docker variant.
+#
+# Copied from agent_loop_config_cc.yaml, replacing KubernetesEnvironment
+# with RemoteDockerEnvironment (no kubeconfig, namespace, pod settings).
+#
+# Architecture (Design A):
+#   claude-code (inside remote docker container, mounted runtime)
+#     -> in-process vLLM chat-completion proxy (started by BuiltinCCAgentLoop,
+#        serves Anthropic /v1/messages directly; ANTHROPIC_BASE_URL overridden
+#        per-trial with the proxy's per-session URL)
+#       -> vLLM (managed by verl, OpenAI API format)
+- name: builtin_swe_agent
+  _target_: verl_patch.agent_loop.BuiltinCCAgentLoop
+  harbor_cfg:
+    agent:
+      # Must match the model's chat_template tool-call format and the trainer
+      # config's engine_kwargs.vllm.tool-call-parser. Default fallback "hermes"
+      # (JSON) does not match Qwen3-Coder XML models -> 0 parsed tool calls.
+      tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+      import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_claude_code:ClaudeCode}
+      model_name: ${oc.env:SERVED_MODEL_NAME,vllm_model}
+      max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,1500}}
+      override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,1500}}
+      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
+      kwargs:
+        max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
+        temperature: ${oc.decode:${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}}
+      env:
+        # Design A: always overridden per-attempt with the in-process proxy's
+        # per-session URL; the :8002 literal is an inert placeholder (nothing
+        # listens there anymore) and is never reached on the real traffic path.
+        ANTHROPIC_BASE_URL: ${oc.env:HARBOR_ANTHROPIC_BASE_URL,http://127.0.0.1:8002}
+        ANTHROPIC_API_KEY: ${oc.env:HARBOR_ANTHROPIC_API_KEY,sk-dummy}
+        ANTHROPIC_MODEL: ${oc.env:HARBOR_ANTHROPIC_MODEL,vllm_model}
+        CLAUDE_CODE_ATTRIBUTION_HEADER: ${oc.env:CLAUDE_CODE_ATTRIBUTION_HEADER,0}
+        CUSTOM_AGENT_RUNTIME_ROOT: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/claude-code}
+        CUSTOM_AGENT_CLAUDE: ${oc.env:HARBOR_CUSTOM_AGENT_CLAUDE,/opt/custom-agent-runtime/claude-code/bin/claude}
+        CUSTOM_AGENT_RUNTIME_ENV_SCRIPT: ${oc.env:HARBOR_CUSTOM_AGENT_RUNTIME_ENV_SCRIPT,/opt/custom-agent-runtime/claude-code/runtime-env.sh}
+    verifier:
+      enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+    environment:
+      type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+      import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.remote_docker:RemoteDockerEnvironment}
+      force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,True}}
+      delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+      override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+      override_memory_mb: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB,8192}}
+      kwargs: {}
+    environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+    agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+    agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
+    verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
+    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}

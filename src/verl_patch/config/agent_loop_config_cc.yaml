@@ -1,0 +1,103 @@
+# Harbor × Claude Code agent loop config.
+#
+# Architecture (Design A):
+#   claude-code (inside k8s pod, mounted runtime at /opt/custom-agent-runtime/claude-code)
+#     -> in-process vLLM chat-completion proxy (started by BuiltinCCAgentLoop,
+#        serves Anthropic /v1/messages directly; ANTHROPIC_BASE_URL overridden
+#        per-trial with the proxy's per-session URL)
+#       -> vLLM (managed by verl, OpenAI API format)
+#
+# - import_path = harbor_patch ClaudeCode = harbor.agents.custom.claude_code.CustomClaudeCode.
+#   Under Design A the rollout trajectory (token ids / masks / logprobs) is built in
+#   memory from the proxy session and handed to verl; the proxy also dumps a
+#   human-readable ${trial}/proxy_trajectory.json per trial for inspection.
+# - environment.type=kubernetes uses harbor_patch's KubernetesEnvironment, which maps
+#   mounts_json[type=image] to an initContainer + emptyDir staging.
+- name: builtin_swe_agent
+  _target_: verl_patch.agent_loop.BuiltinCCAgentLoop
+  harbor_cfg:
+    agent:
+      # vLLM tool-call format this model emits. Must match the model's
+      # chat_template (Qwen3.5 base SFT uses Qwen3-Coder XML <function=...>),
+      # and match engine_kwargs.vllm.tool-call-parser in the trainer config.
+      # Popped by BuiltinCCAgentLoop and used to build the proxy trajectory
+      # tool parser; default fallback is "hermes" (JSON), which does NOT match
+      # this model and yields 0 parsed tool calls -> empty response_mask.
+      tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+      import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_claude_code:ClaudeCode}
+      # ANTHROPIC_MODEL the proxy routes; same as vLLM served-model-name.
+      model_name: ${oc.env:SERVED_MODEL_NAME,vllm_model}
+      max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,1500}}
+      # override_timeout_sec is the *base* timeout the trial enforces; max_timeout_sec
+      # is only a cap on top of it. SWE-bench tasks don't carry their own
+      # agent.timeout_sec, so without this the cap was a no-op and trials ran 50+min.
+      override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,1500}}
+      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
+      kwargs:
+        max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
+        # Per-request temperature override. Forwarded by CustomClaudeCode via
+        # the x-harbor-temperature header; the in-process proxy applies it
+        # before forwarding to vLLM.
+        # MUST match actor_rollout_ref.rollout.temperature so RL rollouts come
+        # from the same distribution verl computes log_prob under.
+        temperature: ${oc.decode:${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}}
+        # Default: subagent (Task tool) enabled. Subagent spawns multiply
+        # LLM calls per session and explode num_turns, but they may also help
+        # task completion. To disable, uncomment and set value, e.g.
+        # disallowed_tools: "Task"
+        # disallowed_tools: ${oc.env:HARBOR_AGENT_DISALLOWED_TOOLS,Task}
+      # Env vars injected into the claude-code process inside the k8s pod.
+      env:
+        # Design A: ANTHROPIC_BASE_URL is ALWAYS overridden per-attempt by
+        # BuiltinCCAgentLoop._run_harbor_trial with the in-process proxy's
+        # per-session URL (.../sess/{id}), so Claude Code hits the proxy's
+        # /v1/messages endpoint directly — no standalone LiteLLM. The literal
+        # below is an inert config-load placeholder (nothing listens on :8002
+        # anymore); it is never reached on the real traffic path.
+        ANTHROPIC_BASE_URL: ${oc.env:HARBOR_ANTHROPIC_BASE_URL,http://127.0.0.1:8002}
+        ANTHROPIC_API_KEY: ${oc.env:HARBOR_ANTHROPIC_API_KEY,sk-dummy}
+        ANTHROPIC_MODEL: ${oc.env:HARBOR_ANTHROPIC_MODEL,vllm_model}
+        # Disable CC SDK's per-session x-anthropic-billing-header / cch=<hash>
+        # injection. That hash sits in the first system text block, breaking
+        # vLLM's prefix cache from the first token. Default off; override
+        # via env to "1" if you need the header back.
+        CLAUDE_CODE_ATTRIBUTION_HEADER: ${oc.env:CLAUDE_CODE_ATTRIBUTION_HEADER,0}
+        # Tell CustomClaudeCode where the mounted runtime lives inside the pod.
+        CUSTOM_AGENT_RUNTIME_ROOT: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/claude-code}
+        CUSTOM_AGENT_CLAUDE: ${oc.env:HARBOR_CUSTOM_AGENT_CLAUDE,/opt/custom-agent-runtime/claude-code/bin/claude}
+        CUSTOM_AGENT_RUNTIME_ENV_SCRIPT: ${oc.env:HARBOR_CUSTOM_AGENT_RUNTIME_ENV_SCRIPT,/opt/custom-agent-runtime/claude-code/runtime-env.sh}
+    verifier:
+      enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+    environment:
+      # MUST be null (None) — harbor's EnvironmentType enum does not include
+      # 'kubernetes', so passing 'kubernetes' triggers a pydantic validation
+      # error and every trial fails at TrialConfig validation. The K8s
+      # implementation is loaded via import_path below.
+      type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+      import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment}
+      force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,False}}
+      delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+      override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+      kwargs:
+        kubeconfig_path: ${oc.env:K8S_KUBECONFIG,$HOME/.kube/config}
+        namespace: ${oc.env:K8S_NAMESPACE,default}
+        pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,900}}
+        pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
+        agent_runtime_image: ${oc.decode:${oc.env:HARBOR_AGENT_RUNTIME_IMAGE,null}}
+        agent_runtime_mount_path: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/claude-code}
+        agent_runtime_image_subpath: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH,opt/custom-agent-runtime/claude-code}
+        # JSON list of extra hostPath mounts injected into each task pod.
+        # Used on clusters where pods can't reach github (e.g. 240) to expose
+        # the SWE-rebench-V2 source at /opt/rebench-v2 from a CPFS mount.
+        # Default null = no extra mounts (preserves 1663 / non-v2 behavior).
+        # Passed through verbatim — _coerce_host_path_mounts() in
+        # kubernetes.py does the json.loads + validation. oc.decode is
+        # intentionally NOT used here because OmegaConf's grammar rejects
+        # JSON-quoted keys like {"host_path":"..."}.
+        host_path_mounts: ${oc.env:HARBOR_HOSTPATH_MOUNTS,null}
+    environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+    agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+    agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
+    verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
+    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}

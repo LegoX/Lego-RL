@@ -1,0 +1,80 @@
+---
+title: AgentLoopWorkers
+description: The concurrent workers that run scaffolds and capture rollouts
+---
+
+**AgentLoopWorkers** are the verl processes that actually *run* the trials. The
+trainer hands each step's batch of tasks to a pool of workers; each worker drives
+one scaffold through one task, start to finish, and returns the captured rollout.
+
+## The trial lifecycle
+
+For each trial a worker:
+
+1. Launches the configured scaffold inside a fresh [Environment](/docs/architecture/environment)
+   sandbox.
+2. Points the scaffold at the [In-Process Proxy](/docs/architecture/in-process-proxy)
+   (overriding its base URL with a unique per-session URL).
+3. Lets the agent run multi-turn — reason, edit, run tests — until it submits or
+   hits the turn/timeout limit.
+4. Collects the verifier's reward and the per-token trajectory for the training
+   update.
+
+The core of the loop
+(`src/verl_patch/agent_loop/builtin_cc_agent_loop.py`, simplified):
+
+```python
+class BuiltinCCAgentLoop(AgentLoopBase):
+    async def run(self, sampling_params, **kwargs) -> AgentLoopOutput:
+        task_path = kwargs["extra_info"]["harbor_task_path"]
+
+        # in-process proxy: one singleton per worker; a fresh session per attempt
+        proxy = await _ensure_proxy_started(self)
+
+        # sandboxed trial: env setup → agent execution → verifier (reward 0/1)
+        reward, trial_reason, session_meta = await self._run_harbor_trial(
+            task_path=task_path, sampling_params=sampling_params, proxy=proxy)
+
+        # token source of truth = the proxy trajectory — never a re-tokenized
+        # transcript; robust to crash/timeout trials (pre-failure tokens kept)
+        ids  = session_meta["traj_acc_ids"]
+        mask = session_meta["traj_response_mask"]
+        lps  = session_meta["traj_response_logprobs"]
+        return self._make_output(ids, mask, lps, reward, trial_reason)
+```
+
+## Worker concurrency
+
+`NUM_WORKERS` sets how many trials run in parallel (16 at cold start; raise for
+steady state). Most of a single trial's wall-clock is spent **outside the GPU** —
+provisioning the sandbox, running commands, waiting on tests — so one trial alone
+leaves the inference servers mostly idle. Running many trials concurrently is the
+main lever for keeping them — and, in synchronous mode, the trainer — busy.
+
+How far you can raise it depends on which side saturates first, and that shifts
+with the deployment: the ceiling can be **sandbox-side** — pod churn, image
+pulls, node I/O and memory (see [Environment](/docs/architecture/environment)) —
+or **rollouter-side** — [KV-cache pressure](/docs/architecture/session-scheduler)
+and [replica throughput](/docs/architecture/rollouter). Raise `NUM_WORKERS`
+against whichever resource limits your run — don't assume the sandbox is the
+bottleneck.
+
+## Agent-loop classes
+
+The worker's per-scaffold logic lives in an agent-loop class:
+
+- `BuiltinCCAgentLoop` — Claude Code (Anthropic protocol).
+- `BuiltinSWEAgentLoop` — OpenHands / OpenCode / Terminus (OpenAI protocol).
+
+Four scaffolds — **Claude Code, OpenHands, OpenCode, Terminus** — are validated
+end to end and strictly adapted. Any other scaffold that speaks the OpenAI or
+Anthropic API can be integrated the same way: implement an agent-loop adapter,
+drop it under `src/harbor_patch/agents/`, and select it with
+`HARBOR_AGENT_IMPORT_PATH`:
+
+```bash
+HARBOR_AGENT_IMPORT_PATH=harbor_patch.agents.my_scaffold:MyScaffold
+```
+
+Every adapter funnels through the same proxy, so a new scaffold gets trajectory
+capture, load balancing, and R3 routing replay for free.

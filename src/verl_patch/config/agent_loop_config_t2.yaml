@@ -1,0 +1,77 @@
+# Harbor x Terminus2 agent loop config.
+#
+# Architecture:
+#   Terminus2 (in trainer process, BaseAgent, drives tmux inside the pod and
+#             calls LiteLLM directly with model_name=hosted_vllm/<served>)
+#     -> in-process vLLM Chat Completions proxy (api_base injected per-trial
+#        by BuiltinOHAgentLoop, sticky session for KV reuse)
+#       -> vLLM
+#
+# No external LiteLLM proxy / runtime image is required — Terminus2 runs in
+# the trainer process, the pod just needs tmux (already present in standard
+# SWE-bench task images).
+- name: builtin_swe_agent
+  _target_: verl_patch.agent_loop.BuiltinOHAgentLoop
+  harbor_cfg:
+    agent:
+      name: ${oc.decode:${oc.env:HARBOR_AGENT_NAME,null}}
+      model_name: hosted_vllm/vllm_model
+      import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.terminus_2:Terminus2}
+      max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,null}}
+      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
+      kwargs:
+        # Required: BuiltinOHAgentLoop reads chat history from
+        # ``agent_result.metadata["all_messages"]``, but upstream Terminus2
+        # only writes that field when this flag is True. Without it, every
+        # trial returns empty messages -> trainer falls back to vLLM proxy's
+        # traj_response_mask, which is also empty when trials get cancelled
+        # at weight-sync time -> response_mask all-zero -> fit_step raises
+        # "response_mask must contain at least one valid token". Passing as
+        # an explicit kwarg ensures upstream Terminus2 honors it even when
+        # AgentFactory bypasses our patch class via the registered ``name``
+        # lookup (see harbor/agents/factory.py:149).
+        store_all_messages: True
+        # Terminus2 uses ``max_turns`` (alias of deprecated ``max_episodes``).
+        max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,200}}
+        # "json" or "xml" — picks the parser + prompt template.
+        parser_name: ${oc.env:HARBOR_AGENT_PARSER_NAME,json}
+        # Required for hosted_vllm/* models; without max_input_tokens /
+        # max_output_tokens LiteLLM falls back to wildly conservative
+        # defaults (~4k) and trims every prompt. The env var holds a JSON
+        # blob, oc.decode parses it into a dict.
+        model_info: ${oc.decode:${oc.env:HARBOR_AGENT_MODEL_INFO,null}}
+        interleaved_thinking: ${oc.decode:${oc.env:HARBOR_AGENT_INTERLEAVED_THINKING,False}}
+        enable_summarize: ${oc.decode:${oc.env:HARBOR_AGENT_ENABLE_SUMMARIZE,True}}
+        proactive_summarization_threshold: ${oc.decode:${oc.env:HARBOR_AGENT_PROACTIVE_SUMMARIZATION_THRESHOLD,8000}}
+        record_terminal_session: ${oc.decode:${oc.env:HARBOR_AGENT_RECORD_TERMINAL_SESSION,True}}
+        suppress_max_turns_warning: ${oc.decode:${oc.env:HARBOR_AGENT_SUPPRESS_MAX_TURNS_WARNING,True}}
+    verifier:
+      enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+    environment:
+      type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+      import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment}
+      force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,False}}
+      delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+      override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+      override_memory_mb: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB,8192}}
+      kwargs:
+        kubeconfig_path: ${oc.env:K8S_KUBECONFIG,$HOME/.kube/config}
+        namespace: ${oc.env:K8S_NAMESPACE,default}
+        pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,3000}}
+        pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
+        # Terminus2 does not need an agent runtime image (the agent runs in
+        # the trainer process, not in the pod). Leaving these null disables
+        # the ImageVolume mount path entirely.
+        agent_runtime_image: ${oc.decode:${oc.env:HARBOR_AGENT_RUNTIME_IMAGE,null}}
+        agent_runtime_mount_path: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/terminus_2}
+        agent_runtime_image_subpath: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH,opt/custom-agent-runtime/terminus_2}
+        # JSON list of extra hostPath mounts injected into each task pod.
+        # Default null = no extra mounts. Set this on clusters that need
+        # offline parsers (e.g. SWE-rebench-V2 at /opt/rebench-v2).
+        host_path_mounts: ${oc.env:HARBOR_HOSTPATH_MOUNTS,null}
+    environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+    agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+    agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
+    verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
+    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}

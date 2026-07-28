@@ -1,0 +1,92 @@
+---
+title: Evaluation
+description: Score a checkpoint on a held-out task set with the eval runner
+---
+
+Scores a checkpoint on a held-out Harbor dataset. Serving is a **plain vLLM
+server with real weights** (`load_format=auto`) plus `harbor run` — deliberately
+not the verl `val_only` path, whose colocated dummy-weight initialization can
+mis-map fused MoE weights
+([details](/docs/troubleshooting/offline-eval-garbage)).
+
+## 1. Config
+
+```bash
+cp scripts/eval/templates/qwen36-27b_official_verified.env \
+   scripts/eval/configs/my_eval.env
+```
+
+```bash
+# my_eval.env — the CHANGEME lines
+PROJECT_NAME=eval-qwen36-27b
+EXP_TAG=step30
+SCAFFOLD=ohsdk
+BACKEND=k8s
+MODEL_PATH=/models/checkpoints/global_step_30_hf   # or MODEL_PRESET=qwen36-27b
+
+# dataset: a directory of harbor task dirs, OR a registry name
+DATASET_PATH=/data/harbor_swe_val_tasks_official
+# DATASET_NAME=swebench-verified
+# N_TASKS=500
+
+# sampling / context
+EVAL_TEMPERATURE=1.0
+MAX_INPUT_TOKENS=200000
+MAX_OUTPUT_TOKENS=32768
+
+# serving — dense: EP=false; MoE: EP=true
+GEN_TP=8
+EVAL_ENABLE_EXPERT_PARALLEL=false
+EVAL_VLLM_EXTRA_ARGS="--enforce-eager --enable-prefix-caching --dtype bfloat16"
+N_CONCURRENT=16
+HARBOR_AGENT_MAX_TIMEOUT_SEC=7200
+```
+
+## 2. Validate
+
+```bash
+PREFLIGHT_ONLY=1 bash scripts/eval/eval.sh eval/configs/my_eval.env   # checks only, no launch
+# or:  /rl:check eval/configs/my_eval.env
+```
+
+## 3. Run
+
+```bash
+nohup setsid bash scripts/eval/eval.sh eval/configs/my_eval.env \
+  > logs/eval_$(date +%m%d).out 2>&1 &
+# or:  /rl:run eval/configs/my_eval.env
+```
+
+## 4. Results
+
+```bash
+tail -F logs/<exp_name>.log            # vLLM boot → per-task progress → final tally
+# === DONE: solved=163 / scored=489  (harbor_trials/<exp_name>) ===
+
+find harbor_trials/<exp_name> -name reward.txt | wc -l          # tasks scored
+find harbor_trials/<exp_name> -name reward.txt -exec cat {} + \
+  | grep -c '^1$'                                               # tasks solved
+```
+
+Per-task trajectories land under `harbor_trials/<exp_name>/<task>/`; the vLLM
+log is `logs/<exp_name>_vllm.log`.
+
+## Knobs
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MODEL_PRESET` / `MODEL_PATH` | — | checkpoint to score (`global_step_N_hf` for a training checkpoint) |
+| `DATASET_PATH` / `DATASET_NAME` | — | dataset directory or registry name; exactly one |
+| `N_TASKS` | all | cap the number of tasks |
+| `EVAL_TEMPERATURE` | `0.7` | sampling temperature (official templates: `1.0`) |
+| `GEN_TP` | `4` | vLLM tensor parallelism |
+| `EVAL_ENABLE_EXPERT_PARALLEL` | `true` | **MoE only** — dense must be `false` |
+| `EVAL_VLLM_EXTRA_ARGS` | — | extra vLLM flags, quoted |
+| `N_CONCURRENT` | `16` | concurrent trials |
+| `HARBOR_AGENT_MAX_TIMEOUT_SEC` | `2400` | per-task wall-clock limit — official long-context evals use `7200` (2 h/task; the value every shipped template sets) |
+
+<Callout title="Val score ≠ training reward" type="warn">
+In-training val and offline eval use different serving and grading paths; before
+reading a gap as a regression, rule out the grading-side causes in
+[Low val scores that are not the model](/docs/troubleshooting/val-false-zero).
+</Callout>

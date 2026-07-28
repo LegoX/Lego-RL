@@ -1,0 +1,89 @@
+---
+title: Data Preparation
+description: Raw issues → Harbor task instances → sandbox images → a filtered task index
+---
+
+Everything a training run samples from is produced before the run starts. The
+pipeline's first stage turns raw data into three artifacts — task instances on
+shared storage, prebuilt sandbox images, and a filtered **task index** the
+trainer reads:
+
+```text
+raw data (repos, issues, patches)
+  └─▶ Harbor task instances     one dir per task: Dockerfile + instruction + tests
+        └─▶ sandbox images      prebuilt & pushed to the cluster registry
+              └─▶ task filter   rollout-verified difficulty (pass@k selection)
+                    └─▶ task index (.parquet)  →  TRAIN_INDEX / VAL_INDEX
+```
+
+## Harbor task instances
+
+- **What a task is**: one directory per instance — a Dockerfile (environment), an
+  instruction (the issue), and an executable verifier (the hidden tests). This
+  is the unit the sandbox runs and the verifier grades.
+- **Converting a raw dataset**: `utils/convert_swerebench_filtered.py` converts
+  SWE-rebench-style records into Harbor task dirs and writes the matching index:
+
+```bash
+python utils/convert_swerebench_filtered.py \
+    --output-dir /data/harbor_tasks \
+    --index-dir  /data/harbor_indexes \
+    --index-name swerebench_train
+```
+
+## Task index
+
+The trainer never reads task content — it samples rows from a **task index**, a
+thin parquet table in which each row is only a pointer:
+
+```python
+# one index row (built by utils/create_task_index.py)
+{
+    "prompt": [{"role": "user", "content": "/data/tasks/astropy__astropy-12907"}],  # path, not text
+    "reward_model": {"style": "rule", "ground_truth": None},                        # verifier-graded
+    "extra_info": {
+        "harbor_task_path": "/data/tasks/astropy__astropy-12907",
+        "instance_id": "astropy__astropy-12907",
+        "data_source": "harbor",
+    },
+}
+```
+
+The split is deliberate:
+
+- **Task content stays on shared storage**: the task directory is loaded only
+  when a trial actually runs.
+- **The index stays light**: kilobytes per thousand tasks, so composing a
+  training set is plain dataframe work — filter to a difficulty band, drop
+  contaminated instances, union subsets across sources, build per-model
+  selections — all without copying or rewriting any task content.
+
+```bash
+# build an index from a directory of Harbor task dirs
+python utils/create_task_index.py \
+    --tasks_dir /data/harbor_tasks \
+    --output    /data/harbor_indexes/train.parquet \
+    --split     train
+```
+
+## Sandbox images
+
+- **Prebuilt (recommended)**: build each instance's environment image offline
+  and push it to a registry every sandbox node can pull from, then set
+  `HARBOR_OPENSWE_IMAGE_REGISTRY` in `lib/site.env`. Images are named
+  `<registry>/openswe-<instance_id>:latest`; a lazy-pull format such as nydus
+  cuts sandbox cold-start further.
+- **Inline build (fallback)**: with no registry configured, each trial builds
+  its image in-pod — portable but slow, and it needs egress. Both `INLINE_BUILD`
+  and a registry set together is a preflight fatal
+  ([why](/docs/run-training/preflight#7-image-source-and-kubeconfig-k8s-backend)).
+
+## Task filter
+
+Before an instance enters the training pool, screen it by **rollout-verified
+difficulty**: run [batch inference](/docs/run-training/infer) — `N_TRIALS`
+attempts per instance at training temperature — and keep the instances in the
+target band (e.g. solved 1–3 of 4, the ones that carry the most gradient signal
+under group-relative advantages). The output (`OUTPUT_INDEX`) is itself a task
+index: point a training config's `TRAIN_INDEX` at it, or keep composing it with
+other subsets.

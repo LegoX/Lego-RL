@@ -1,0 +1,34 @@
+---
+title: Status & State
+description: How to tell what is running and what a run did
+---
+
+SWE-Lego-RL keeps no run-state file — the launch script is one-shot configuration.
+Whether a run is live, and what it did, is answered from the process table, the
+logs, and the dashboard.
+
+## Run liveness
+
+```bash
+pgrep -af 'train.sh|fully_async'   # runner / async entrypoint
+pgrep -af 'main_ppo'               # verl trainer
+```
+
+Once nothing matches, the box is free — there is no stale flag to clean up after
+a crash. If a previous run left Ray/vLLM processes or ports behind, reset with
+`bash scripts/cleanup_before_run.sh`.
+
+## Rollout readiness
+
+The rollout replicas register as Ray named actors (`vllm_server_*`). Check them
+(and GPU utilization) as described in
+[Inference Stack](/docs/run-training/inference-stack).
+
+## Run history
+
+- **Logs** — `logs/<exp>.log` carries the per-step `step:N - key:value` metric
+  lines; `logs/<exp>_vllm.log` is the throughput-only stream.
+- **Checkpoints** — the newest `checkpoints/<project>/<exp>/global_step_N/` is the
+  latest saved actor.
+- **Dashboard** — the [dashboard](/docs/dashboard) reads the logs directly and
+  infers a run's state from log file mtime/size (running vs finished).
