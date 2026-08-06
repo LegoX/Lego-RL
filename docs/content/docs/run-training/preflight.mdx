@@ -117,8 +117,7 @@ on disk is always fatal.
 
 ## Manual checks
 
-It reads the config, not the cluster. Still worth confirming by hand before a long
-run:
+Preflight reads the config, not the cluster. Confirm these by hand before a long run:
 
 - **GPUs** — `nvidia-smi` shows what `NGPUS_PER_NODE` claims.
 - **Backend reachability** — `kubectl --kubeconfig $K8S_KUBECONFIG get nodes`, or the

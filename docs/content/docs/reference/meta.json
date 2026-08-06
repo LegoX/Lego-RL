@@ -1,4 +1,7 @@
 {
     "title": "Reference",
-    "pages": ["io", "status", "config-variants", "docs-site"]
+    "pages": [
+        "configuration",
+        "status"
+    ]
 }

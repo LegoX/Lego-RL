@@ -3,21 +3,20 @@ title: Scaling Up
 description: When and how to move from the single-node default to a multi-node, fully-async run
 ---
 
-The recommended way to run SWE-Lego-RL is the **single-node** path documented
-throughout this section: one 8×GPU host where verl runs the trainer and vLLM
-serves the policy on the *same* GPUs, launched from a `sync_*` template
-(`TRAIN_MODE=sync`). It is the **minimal-cost** way to get a real RL run
-going — one machine, one config, no cross-node plumbing.
+The default is the **single-node** path used throughout this section: one 8×GPU host
+where verl runs the trainer and vLLM serves the policy on the same GPUs, launched from
+a `sync_*` template (`TRAIN_MODE=sync`). One machine, one config, no cross-node
+plumbing.
 
-This page is the **advanced** path: what changes when one host is no longer
-enough. You almost certainly do **not** need it to start.
+This page covers what changes when one host is no longer enough. It is not needed for
+a first run.
 
-<Callout title="This costs more — reach for it only when you must" type="warn">
-The multi-node / fully-async stack needs **multiple machines**, more setup, and
-more operational care (cross-node networking, a separate rollout pool, staleness
-tuning). Stay on the single-node path until you actually hit its ceiling:
-a large **MoE** policy that won't fit one host's training + serving budget, very
-long contexts (≈131k), or rollout throughput that bottlenecks a synchronous loop.
+<Callout title="Higher cost — use only when required" type="warn">
+The multi-node / fully-async stack needs multiple machines, more setup, and more
+operational care: cross-node networking, a separate rollout pool, staleness tuning.
+Stay on the single-node path until one of its limits is reached: a large MoE policy
+that does not fit one host's training + serving budget, contexts near 131k, or rollout
+throughput that bottlenecks a synchronous loop.
 </Callout>
 
 ## Scaling triggers
@@ -100,8 +99,7 @@ install — the latter fails on no-egress task pods. Selecting it keeps
 
 ## Monitoring signals
 
-Beyond the [single-node metrics](/docs/core-concepts#metrics), the async path adds
-a few signals worth a glance each step:
+The async path adds these to the [single-node metrics](/docs/core-concepts#metrics):
 
 | Metric | Read |
 | --- | --- |

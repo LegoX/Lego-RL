@@ -1,11 +1,11 @@
 ---
-title: Status & State
-description: How to tell what is running and what a run did
+title: Run Status
+description: How to tell what is running now and what a finished run did
 ---
 
-SWE-Lego-RL keeps no run-state file — the launch script is one-shot configuration.
-Whether a run is live, and what it did, is answered from the process table, the
-logs, and the dashboard.
+There is no run-state file: the launch script is one-shot configuration. Whether a run
+is live, and what it did, is answered from the process table, the logs, and the
+dashboard.
 
 ## Run liveness
 
@@ -14,8 +14,8 @@ pgrep -af 'train.sh|fully_async'   # runner / async entrypoint
 pgrep -af 'main_ppo'               # verl trainer
 ```
 
-Once nothing matches, the box is free — there is no stale flag to clean up after
-a crash. If a previous run left Ray/vLLM processes or ports behind, reset with
+No match means the box is free; a crash leaves no stale flag to clean up. If a
+previous run left Ray/vLLM processes or ports behind, clear them with
 `bash scripts/cleanup_before_run.sh`.
 
 ## Rollout readiness

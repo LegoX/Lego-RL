@@ -1,158 +1,159 @@
 ---
 title: Core Concepts
-description: The terminology and training formulation used across SWE-Lego-RL, with references
+description: The terms used in configs, logs, and the dashboard
 ---
 
-This page defines the vocabulary you will encounter in configs, logs, and the
-dashboard, and grounds each concept in the work it derives from. The system
-itself is described layer by layer in [Architecture](/docs/architecture); the
-complete design rationale is given in the SWE-Lego-RL technical report.
+What the words in a config, a log line, and a dashboard panel refer to. Components are
+described in [Block Design](/docs/architecture), variables in
+[Configuration](/docs/reference/configuration).
 
-## Policy, trial, and rollout
+## Trial and rollout
 
-The **policy** is the model being optimized. Two related terms are kept
-deliberately distinct, following the technical report:
+The same attempt has two names, kept distinct throughout:
 
-- A **trial** is one complete, sandboxed attempt at a task — the execution-side
-  view. The agent reasons, edits files, and runs commands inside a fresh sandbox
-  until it submits or reaches the turn/timeout limit.
-- A **rollout** is the training-side view of the same attempt: the captured
-  token sequence — prompt context, sampled assistant tokens, behavior-policy
-  log-probabilities, and loss masks — that the trainer scores and optimizes.
+- **Trial** — one sandboxed execution of a task. The agent reasons, edits files, and
+  runs commands in a fresh sandbox until it submits or hits the turn or timeout limit.
+- **Rollout** — the token sequence captured from that trial: prompt context, sampled
+  assistant tokens, behavior-policy log-probabilities, loss mask.
 
-One training step samples a batch of
-`train_prompt_bsz × n_resp_per_prompt` trials across tasks
-(e.g. `64 × 8 = 512` trials per step).
+One trial produces one rollout. A step runs `TRAIN_BSZ × N_RESP` trials — by default
+`64 × 8 = 512`, that is 64 tasks with 8 attempts each.
+
+A **task** is an instruction, a repository snapshot, and a hidden test suite. The
+trainer never authors the prompt: the agent runs for as many turns as it needs and
+rebuilds the context each turn from its own template. Turn count and response length
+are therefore properties of the agent, measured per run, not settings in the config.
 
 ## Reward
 
-Each task ships an executable **verifier** — its own test script, in the style
-of SWE-bench ([Jimenez et al., 2024](https://arxiv.org/abs/2310.06770)). When a
-trial finishes, the verifier runs inside the sandbox and produces a binary
-outcome **reward**: `1.0` if the issue is resolved, `0.0` otherwise. Optimizing
-against verified task success rather than a learned reward model removes
-reward-model drift as a failure mode; what remains is protecting the verifier
-itself, which is handled by the sandbox layer's anti-hacking defenses (see
-[Environment](/docs/architecture/environment)). On the dashboard the reward
-surfaces as `critic/score/mean`.
+Each task carries an executable verifier — its own test script, in the SWE-bench sense
+([Jimenez et al., 2024](https://arxiv.org/abs/2310.06770)). It runs in the sandbox
+after the trial and returns **1** if every fail-to-pass test now passes and every
+pass-to-pass test still passes, **0** otherwise.
 
-## Agent scaffold
+The reward is binary and produced by execution, not by a learned reward model, which
+removes reward-model drift as a failure mode. What remains is protecting the verifier
+itself — see the anti-hacking defenses in
+[Environment](/docs/architecture/environment). Logged as `critic/score/mean`.
 
-The **scaffold** (the report also uses *agent harness*) is the coding agent
-that drives the model through a task — Claude Code, OpenHands (ai / sdk),
-OpenCode, or Terminus 2, with adapters under `src/harbor_patch/agents/`. It is
-selected per run via `HARBOR_AGENT_IMPORT_PATH` and determines the rollout's
-shape and which runtime image Harbor launches.
+## Advantage
 
-A central design constraint is that the scaffold runs **unmodified**: the
-optimization target is the deployed agent's behavior, not a trainer-side
-reimplementation of it. Whatever the scaffold's native protocol, it reaches the
-policy through the in-process proxy described next.
+GRPO ([Shao et al., 2024](https://arxiv.org/abs/2402.03300)) scores each rollout
+against the other attempts at the same task, so no critic is needed: the advantage of
+rollout $i$ in a group of $G$ is its reward minus the group mean, over the group
+standard deviation.
 
-## Inference chain
+$$
+\hat{A}_i=\frac{r_i-\operatorname{mean}(r_1,\dots,r_G)}{\operatorname{std}(r_1,\dots,r_G)}
+$$
 
-During training the policy serves *itself*: verl manages a pool of vLLM
-replicas ([Kwon et al., 2023](https://arxiv.org/abs/2309.06180)), and every
-model call a scaffold makes is routed through an **in-process proxy** that
-captures the exact token-level trajectory — ids, masks, log-probabilities — at
-generation time, so the trainer consumes the tokens the policy actually
-produced rather than a re-tokenized transcript. The mechanism (unified
-OpenAI/Anthropic surface, per-session URLs, partial-rollout handling) is
-documented in [In-Process Proxy](/docs/architecture/in-process-proxy) and its
-operational health checks in
-[Inference Stack](/docs/run-training/inference-stack).
+With a binary reward the consequence is concrete: a task solved in every attempt, or in
+none, has zero standard deviation and produces **zero gradient** — however many GPU
+hours its trials cost. A group carries signal only when it lands between the two
+extremes. Pool composition, not batch size, decides how much of a step trains
+anything; this is what the [task filter](/docs/data-preparation#task-filter) selects
+for.
 
-## Training loop
+## Policy loss
 
-[verl](https://github.com/volcano-engine/verl) — the open-source implementation
-of HybridFlow ([Sheng et al., 2025](https://arxiv.org/abs/2409.19256)) — drives
-the RL loop: generate rollouts with vLLM → execute each trial in a Harbor
-sandbox → collect rewards → compute advantages → update the actor (and critic,
-for PPO) → sync weights.
+Set by `adv_estimator` (advantage) and `policy_loss_mode` (loss). The default profile
+is `adv_estimator=grpo`, `policy_loss_mode=gspo`.
 
-With `TRAIN_MODE=sync` (a `sync_*` template) the trainer and the rollout engine
-share the same GPUs on one node — the recommended, minimal-cost default. With
-`TRAIN_MODE=async` the cluster splits into a rollout pool and a trainer pool
-that run concurrently; see [Scaling Up](/docs/run-training/scaling).
+**GSPO** ([Qwen Team, 2025](https://arxiv.org/abs/2507.18071)) clips on a
+sequence-level importance ratio, normalized by response length:
 
-### Algorithms
+$$
+s_i=\left(\frac{\pi_\theta(y_i\mid x)}{\pi_{\theta_{\text{old}}}(y_i\mid x)}\right)^{1/\lvert y_i\rvert}
+$$
 
-Selected via the `adv_estimator` / `policy_loss_mode` config variables:
+The $1/\lvert y_i \rvert$ exponent puts the clip bounds in units of *average per-token*
+log-ratio. That is why `clip_ratio_low` / `clip_ratio_high` are of order $10^{-4}$
+here, and why they need no retuning as responses grow from 43k to 90k tokens.
 
-- **PPO** ([Schulman et al., 2017](https://arxiv.org/abs/1707.06347)) — actor +
-  critic, clipped policy-gradient objective.
-- **GRPO** ([Shao et al., 2024](https://arxiv.org/abs/2402.03300)) —
-  group-relative advantage estimation introduced in DeepSeekMath; no critic
-  (`adv_estimator=grpo`).
-- **GSPO** ([Qwen Team, 2025](https://arxiv.org/abs/2507.18071)) —
-  sequence-level policy optimization (`policy_loss_mode=gspo`).
+**PPO** ([Schulman et al., 2017](https://arxiv.org/abs/1707.06347)) uses the same
+clipped form on a per-token ratio instead, with a critic supplying the advantage.
 
-The default profile combines GRPO advantage estimation with a GSPO loss. All
-three optimize over **full multi-turn rollouts**, not single completions.
+Both optimize over full multi-turn rollouts, not single completions.
 
-## Trainer backends
+## Rollout fidelity
 
-verl can drive the actor on different backends, chosen by the model preset:
+The loss is computed on a rollout the trainer did not generate. It is only valid if,
+for every token that carries gradient, the log-probability the trainer recomputes
+equals the one the serving engine emitted at generation time.
 
-- **FSDP** — the default for dense models and the validated fully-async path.
-- **VeOmni** — for large MoE policies (e.g. Qwen3-30B-A3B); selected with
-  `USE_NEW_VERL=1` so `import verl` resolves to the
-  `verl-swe_agent_opd_dev` checkout that carries the routing-replay (R3)
-  wiring. Replaying rollout-time expert routing during the training forward
-  pass is what keeps MoE rollout/training log-probabilities aligned (cf.
-  [Ma et al., 2025](https://arxiv.org/abs/2510.11370)).
-- **Megatron** ([Shoeybi et al., 2019](https://arxiv.org/abs/1909.08053)) —
-  tensor/pipeline-parallel backend for the largest models.
+Meeting that requires the same token ids, the same mask, the same weights, and — for a
+sparse model — the same expert routing. Retokenizing a transcript, reconstructing a
+prompt, or resampling routing each break it **silently**: the loss still looks
+reasonable, and the gradient refers to a policy that never ran. The
+[in-process proxy](/docs/architecture/in-process-proxy) records log-probabilities at
+generation time for this reason.
 
-## Sandbox backend
+The check is the correlation between the two sets of log-probabilities over a batch.
+Healthy is ≥ 0.99, and a drop is the first symptom of a broken path — see
+[Training Startup](/docs/troubleshooting/training-startup).
 
-Every trial runs in a fresh sandbox, selected via `HARBOR_ENVIRONMENT_IMPORT_PATH`:
+**R3 (routing replay)** covers the sparse-model case: the experts the router picked at
+generation are recorded and replayed during the training forward pass, so both sides
+route each token identically. Enabled with `ENABLE_R3=1` (requires `USE_NEW_VERL=1`);
+cf. [Ma et al., 2025](https://arxiv.org/abs/2510.11370).
 
-- **Kubernetes** — each trial is a pod; production default
-  (`harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment`,
-  configured with `K8S_KUBECONFIG` / `K8S_NAMESPACE`).
-- **Docker** — each trial is a local or remote container; the minimal setup, no
-  cluster required (`harbor_patch.environments.remote_docker:RemoteDockerEnvironment`).
+## Importance correction
 
-These two are validated and hardened in this stack. Because the backend is just
-an import path, every environment Harbor ships is also selectable the same
-way — GKE, and managed sandbox providers (Daytona, E2B, Modal, Runloop) — they
-are inherited as-is and not validated here. See
-[Backends](/docs/run-training/backends) for the trade-offs and config.
+When rollout and training log-probabilities differ by construction — a different
+engine, or stale weights under async — `ROLLOUT_IS` corrects the mismatch instead of
+assuming it away, at token or sequence level. A sequence weight is the product of its
+per-token ratios, so its variance grows with response length.
 
-## Checkpoints
+The diagnostic is the **effective sample size**: how many of the batch's rollouts the
+weights actually leave in play. On the long rollouts this stack produces,
+`ROLLOUT_IS=sequence` has been measured at ESS ≈ 0.06 — the batch collapses onto a
+handful of samples and the gradient starves. Token-level correction is the default for
+that reason.
 
-verl writes the actor as FSDP shards every `save_freq` steps to
-`checkpoints/<project>/<exp>/global_step_N/`. These are the primary training
-output and survive cleanup runs.
+## Training step
 
-## The training venv
+[verl](https://github.com/volcano-engine/verl) — the open-source implementation of
+HybridFlow ([Sheng et al., 2025](https://arxiv.org/abs/2409.19256)) — drives one step:
+sample tasks → run the trials in Harbor sandboxes, serving the policy from vLLM
+([Kwon et al., 2023](https://arxiv.org/abs/2309.06180)) → collect rewards → compute
+advantages → update the actor → sync weights.
 
-All training code runs from a single venv (default `.venv`, built by
-`scripts/setup_env.sh`) with **editable** installs of `harbor`, `verl`, and this
-repo itself. The editable paths must point at the trees you intend to run —
-otherwise the process silently executes different code. Verify with:
+| `TRAIN_MODE` | Placement | Use |
+| --- | --- | --- |
+| `sync` | Trainer and rollout engine share one GPU pool | Default; lowest cost |
+| `async` | Disjoint trainer and rollout pools, running concurrently | Multi-node — see [Scaling Up](/docs/run-training/scaling) |
 
-```bash
-.venv/bin/python -c "import harbor, verl, verl_patch; print(harbor.__file__)"
-```
+Rollouts whose trial ended in an infrastructure failure are dropped by the trajectory
+filter before the loss, so the batch reaching the optimizer is smaller than the batch
+that was launched.
 
 ## Metrics
 
-verl logs one `step:N - key:value - ...` line per step (to the launch log and
-wandb). The ones to watch:
+verl writes one `step:N - key:value - …` line per step to the launch log and to wandb.
 
-| Metric | Meaning |
+| Metric | Definition |
 | --- | --- |
-| `critic/score/mean` | Mean reward (task success signal) |
-| `actor/entropy` | Policy entropy — exploration / collapse |
-| `actor/ppo_kl` | KL between old and new policy |
-| `actor/pg_clipfrac` | Fraction of clipped policy-gradient updates |
-| `perf/mfu/actor` | Model FLOPs utilization (throughput) |
+| `critic/score/mean` | Mean reward over the step's rollouts — the task success signal |
+| `actor/entropy` | Mean per-token policy entropy — exploration, or collapse |
+| `actor/ppo_kl` | Mean per-token log-ratio between the old and the new policy |
+| `actor/pg_clipfrac` | Fraction of terms where the clip branch is active |
+| `actor/grad_norm` | Gradient norm before clipping |
+| `perf/mfu/actor` | Model FLOPs utilization — achieved FLOPs over peak |
 | `response_length/mean` | Mean rollout length in tokens |
 | `rollout_corr/kl` | Rollout-vs-training distribution shift |
 
-The [dashboard](/docs/dashboard) renders all of these as live charts.
+The [dashboard](/docs/dashboard) renders these as live charts.
+
+## Defined elsewhere
+
+| Term | Page |
+| --- | --- |
+| Scaffold / agent harness | [Environment](/docs/architecture/environment#scaffolds) |
+| Inference chain, trajectory capture | [In-Process Proxy](/docs/architecture/in-process-proxy) |
+| Trainer backend (FSDP, VeOmni, Megatron) | [Trainer](/docs/architecture/trainer#backends) |
+| Sandbox backend (Kubernetes, Docker) | [Backends](/docs/run-training/backends) |
+| Task index, task filter | [Data Preparation](/docs/data-preparation) |
+| Checkpoints, trajectories, logs | [Results & Artifacts](/docs/run-training/results-and-artifacts) |
 
 ## References
 

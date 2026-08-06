@@ -32,7 +32,7 @@ all** once the cache is full.
 
 ## Residency probes
 
-The hard part is that you cannot infer cache residency from the conversation:
+Cache residency cannot be inferred from the conversation:
 
 - a session whose prompt merely *extends* the previous one may still be **cold**, if
   its blocks were evicted while it waited on a tool;

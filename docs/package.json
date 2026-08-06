@@ -13,10 +13,13 @@
     "fumadocs-core": "^16.4.2",
     "fumadocs-mdx": "^14.2.4",
     "fumadocs-ui": "^16.4.2",
+    "katex": "^0.18.1",
     "next": "^16.0.10",
     "next-themes": "^0.4.6",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "rehype-katex": "^7.0.1",
+    "remark-math": "^6.0.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.16",

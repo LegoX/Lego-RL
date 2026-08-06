@@ -3,7 +3,7 @@ title: AgentLoopWorkers
 description: The concurrent workers that run scaffolds and capture rollouts
 ---
 
-**AgentLoopWorkers** are the verl processes that actually *run* the trials. The
+**AgentLoopWorkers** are the verl processes that run the trials. The
 trainer hands each step's batch of tasks to a pool of workers; each worker drives
 one scaffold through one task, start to finish, and returns the captured rollout.
 

@@ -32,8 +32,7 @@ over the per-trial `harbor_trials/` logs.
 
 ## Panels
 
-The sidebar carries fourteen panels, roughly in the order you need them while a
-run is in flight:
+Fourteen panels, ordered as they are needed while a run is in flight:
 
 | Panel | What it answers |
 | --- | --- |
@@ -79,9 +78,8 @@ Two things make the number trustworthy, and both are easy to get wrong:
 
 ## Guided launch
 
-If you use Claude Code, `/rl:dashboard` brings the board up on whatever machine
-you are on, which is the point: paths, log locations and free ports differ per
-box, and the launcher script hard-codes this repo's.
+`/rl:dashboard` brings the board up on the current machine. Paths, log locations, and
+free ports differ per box, while the launcher script hard-codes this repo's.
 
 ```
 /rl:dashboard [log-dir]
@@ -106,23 +104,20 @@ proposed plan
 Proceed? [Y]/[N]
 ```
 
-After a yes it starts in the background, verifies `/api/runs` actually returns
-runs, and reports the public URL, local address, and PIDs. It also diagnoses the
-two common failures — a tunnel URL that 502s (the tunnel outliving its server)
-and an empty board (the wrong log dir) — and never kills an instance it did not
-start.
+On confirmation it starts in the background, verifies that `/api/runs` returns runs,
+and reports the public URL, local address, and PIDs. It diagnoses the two common
+failures — a tunnel URL that 502s (the tunnel outliving its server) and an empty board
+(the wrong log dir) — and never kills an instance it did not start.
 
 <Callout title="The public URL needs no Cloudflare account" type="info">
 `cloudflared tunnel --url http://127.0.0.1:8090` gets a random
-`*.trycloudflare.com` hostname **anonymously** — no login, no token, no domain.
-You never need `cloudflared tunnel login` for this, and logging in does not make
-the URL any more stable.
+`*.trycloudflare.com` hostname anonymously — no login, no token, no domain.
+`cloudflared tunnel login` is not required and does not make the URL more stable.
 
-On a new machine the two things that actually stop you are the `cloudflared`
-binary being absent, and the box having no egress to Cloudflare's edge — common
-on an isolated training node, where the tunnel hangs at startup rather than
-failing loudly. The probe reports both, and the fallback in either case is an SSH
-port-forward: `ssh -L 8090:127.0.0.1:8090 <host>`.
+Two conditions block it on a new machine: a missing `cloudflared` binary, and no
+egress to Cloudflare's edge. The second is common on an isolated training node, where
+the tunnel hangs at startup instead of failing loudly. The probe reports both; the
+fallback for either is an SSH port-forward, `ssh -L 8090:127.0.0.1:8090 <host>`.
 </Callout>
 
 ### Stable public URLs

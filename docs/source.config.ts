@@ -4,6 +4,8 @@ import {
   frontmatterSchema,
   metaSchema,
 } from 'fumadocs-mdx/config';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 
 export const docs = defineDocs({
   dir: 'content/docs',
@@ -16,5 +18,10 @@ export const docs = defineDocs({
 });
 
 export default defineConfig({
-  mdxOptions: {},
+  mdxOptions: {
+    // KaTeX: $…$ inline, $$…$$ display. remark-math must run before the
+    // fumadocs defaults, rehype-katex after them.
+    remarkPlugins: (v) => [remarkMath, ...v],
+    rehypePlugins: (v) => [rehypeKatex, ...v],
+  },
 });

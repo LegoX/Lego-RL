@@ -23,7 +23,7 @@ reachable image source. Run it first; see [Preflight](/docs/run-training/preflig
 | `response_mask must contain at least one valid token` on the first step | [Tool-call parser mismatch](/docs/troubleshooting/training-startup#tool-call-parser-mismatch) |
 | `import torch` / `import vllm` costs ~9 s on every launch | [venv on a network FS](/docs/troubleshooting/training-startup#slow-venv-imports-on-a-network-filesystem) |
 | Every trial fails `env_setup` with empty trajectories | [Preflight §6](/docs/run-training/preflight#6-agent_name--scaffold) |
-| Pods end in `ImagePullBackOff` on a fresh cluster | [Image source](/docs/reference/io#site-variables) |
+| Pods end in `ImagePullBackOff` on a fresh cluster | [Image source](/docs/reference/configuration#site-variables) |
 
 **Training runs, but learns nothing**
 

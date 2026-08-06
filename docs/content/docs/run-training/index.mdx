@@ -3,12 +3,11 @@ title: Example Usages
 description: Launch and monitor training, evaluation, and batch-inference runs
 ---
 
-SWE-Lego-RL runs three kinds of workload through one contract: **train** a
-policy, **eval** a checkpoint on a held-out set, and **infer** — batch-generate
-trajectories over a task index. Each kind has a runner and a set of templates;
-a run is defined by one `.env` config formed from a template, and can be
-launched **by hand** or **through the [agent plugin](/docs/agent-plugin)**.
-Shown for `train` — `eval` and `infer` follow the identical pattern:
+Three workloads share one contract: **train** a policy, **eval** a checkpoint on a
+held-out set, **infer** — batch-generate trajectories over a task index. Each has a
+runner and a set of templates. A run is one `.env` config copied from a template, and
+launches either by hand or through the [agent plugin](/docs/agent-plugin). Shown for
+`train`; `eval` and `infer` are identical in form:
 
 ```bash
 # form the config once
@@ -29,20 +28,19 @@ bash scripts/train/train.sh train/configs/my_run.env                    # launch
 | eval | `scripts/eval/eval.sh` | [Evaluation](/docs/run-training/eval) |
 | infer | `scripts/infer/infer.sh` | [Batch Inference](/docs/run-training/infer) |
 
-See [Inputs & Configuration](/docs/reference/io) for the config layers and
+See [Configuration](/docs/reference/configuration) for the config layers and
 [Getting Started](/docs/getting-started) for the first-run walkthrough.
 
 <Callout title="Launch in the background" type="info">
-Training runs for hours. Launch through `/rl:run` (backgrounds by default), or
-wrap a manual launch in `tmux` / `nohup setsid` so it survives shell
-disconnects, and tail `logs/<exp>.log`.
+A training run lasts hours. `/rl:run` backgrounds it by default; a manual launch
+needs `tmux` or `nohup setsid` to survive a shell disconnect. Follow it with
+`tail -F logs/<exp>.log`.
 </Callout>
 
 ## Boot sequence
 
-A **train** run boots vLLM to serve the policy, starts the in-process proxy in
-front of it, and lets verl drive the RL loop while a coding agent rolls out
-across tasks inside Harbor sandboxes:
+A **train** run serves the policy from vLLM, fronts it with the in-process proxy, and
+lets verl drive the RL loop while the agent rolls out across tasks in Harbor sandboxes:
 
 1. **Config** — the runner sources `lib/site.env` + your config, applies the model
    preset, and resolves the scaffold and backend.
@@ -67,8 +65,8 @@ across tasks inside Harbor sandboxes:
 - **[Scaling Up](/docs/run-training/scaling)**: *advanced:* multi-node, fully-async, VeOmni/MoE, partial rollout, R3
 
 <Callout title="Start single-node" type="info">
-A `sync_*` template on one 8×GPU host is the **minimal-cost** way to run SWE-Lego-RL.
-Only move to an `async_*` template and more machines when you outgrow it; see
+A `sync_*` template on one 8×GPU host is the minimal-cost configuration. Move to an
+`async_*` template and more machines only when it is no longer sufficient; see
 [Scaling Up](/docs/run-training/scaling).
 </Callout>
 

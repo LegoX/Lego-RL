@@ -1,6 +1,7 @@
 import { RootProvider } from "fumadocs-ui/provider/next";
 import { Metadata } from "next";
 import "./global.css";
+import "katex/dist/katex.min.css";
 
 export const metadata: Metadata = {
   title: "SWE-Lego-RL",

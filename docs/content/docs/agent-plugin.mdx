@@ -94,29 +94,28 @@ parameters verbatim, and numbered next steps. Exactly five things block a launch
 a `✗ FATAL`, a run already in flight, foreign GPUs, a port conflict, a missing
 import. Warnings never flip the verdict.
 
-<Callout title="A shared machine is the normal case" type="info">
-On a machine several people use, the common blocker is not a bad config — it is
-someone else's vLLM holding all 8 GPUs. `/rl:check` walks the process parent chain
-to decide whether those processes belong to your run tree, and reports the PID and
-memory so you can confirm with the owner rather than guess.
+<Callout title="Shared machines" type="info">
+On a shared machine the common blocker is not a bad config but someone else's vLLM
+holding all 8 GPUs. `/rl:check` walks the process parent chain to decide whether those
+processes belong to your run tree, and reports the PID and memory so the owner can be
+identified.
 </Callout>
 
 ### `/rl:run`
 
-Runs `/rl:check` first and **refuses on any blocking failure**; there is no force
-flag. On a pass it shows the run configuration block, draws attention to the few
-fields that decide whether the hours are worth spending (data indexes, scale,
-resume behavior, naming), and asks for a yes before touching anything.
+Runs `/rl:check` first and refuses on any blocking failure; there is no force flag. On
+a pass it prints the resolved run configuration, highlights the fields that determine
+whether the GPU hours are well spent (data indexes, scale, resume behavior, naming),
+and requires a confirmation before launching.
 
-Launching defaults to the background (`nohup setsid`), since these runs last
-hours and a foreground launch would tie your session to them. Afterwards it
-reports the **real** `exp_name` — the runner derives it at launch time, so it is
-not the name preflight printed — plus the PIDs, the log paths, and the first-step
-gates worth checking (pearson ≈ 0.999, `lr` non-zero, reward and `num_turns`
-non-zero).
+Launch defaults to the background (`nohup setsid`): these runs last hours, and a
+foreground launch would hold the session. It then reports the real `exp_name` — the
+runner derives it at launch time, so it differs from the name preflight printed —
+plus the PIDs, the log paths, and the first-step gates to check (pearson ≈ 0.999,
+`lr` non-zero, reward and `num_turns` non-zero).
 
-For a multi-node train or infer run it prints the exact per-node command for you
-to run on each node. It never SSHes anywhere.
+For a multi-node train or infer run it prints the per-node command to run on each
+node. It never SSHes anywhere.
 
 ### `/rl:status`
 

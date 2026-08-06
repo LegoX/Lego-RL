@@ -75,7 +75,7 @@ docs/
 │   ├── run-training/      #   preflight, inference stack, backends, results, scaling
 │   ├── dashboard.mdx
 │   ├── troubleshooting/   #   startup · training runtime · val & eval scores · cluster & sandbox
-│   └── reference/         #   io, status, config-variants
+│   └── reference/         #   configuration, status
 ├── src/                   # app shell (docs route, layouts, source loader)
 ├── public/_redirects      # Cloudflare Pages root redirect (/ -> /docs)
 ├── next.config.mjs        # createMDX() + output: 'export'
@@ -90,5 +90,36 @@ docs/
 2. Add its slug to the folder's `meta.json` `pages` array to place it in the
    sidebar order.
 3. Link to other pages by their route, e.g. `/docs/run-training/backends`.
+
+Do **not** list `index` in a folder's `pages` array. A folder's `index.mdx`
+becomes the folder's own sidebar link; listing it as well drops that link and
+renders the title twice (`Example Usages > Example Usages`).
+
+## Writing conventions
+
+- **Titles** — the shortest noun phrase that names the thing. `Configuration`,
+  not `Config Variants`; `2. Site config`, not `2. Describe your cluster once`.
+- **Sentences** — reference register: state the fact, the command, or the
+  constraint. No narration ("you almost certainly do not need"), no hedges
+  ("worth a glance"), no filler ("actually", "simply", "just"). A sentence
+  introducing a code block names what the block does and stops.
+- **Math** — `$…$` / `$$…$$`, rendered by KaTeX (`remark-math` +
+  `rehype-katex`, wired in `source.config.ts`; CSS imported in
+  `src/app/layout.tsx`). Use a formula only where it states the rule more
+  precisely than a sentence would. This is a manual, not a paper — as of the
+  current revision the whole site has two.
+- **Terminology follows the technical report** — *run validation*, *agent
+  plugin*, *trial* (execution-side) vs *rollout* (training-side), *routing
+  replay (R3)*. `Preflight` / `PREFLIGHT_ONLY` are kept because they name the
+  actual script surface.
+- **American English** (behavior, not behaviour).
+- **Cite sources** for concepts from the literature; the reference list lives at
+  the bottom of `core-concepts.mdx`.
+
+## llms.txt
+
+`npm run build` regenerates `public/llms.txt` — a machine-readable index of
+every page and its description — via `scripts/gen-llms.mjs`, served at
+`/llms.txt`. Override the base URL with `DOCS_SITE_URL`.
 
 Build outputs (`node_modules/`, `.next/`, `.source/`, `out/`) are gitignored.

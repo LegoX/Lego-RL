@@ -18,7 +18,7 @@ Selected with `adv_estimator` / `policy_loss_mode` in the launch script:
 
 The default profile runs GRPO advantages with a GSPO loss. All three optimize over
 **full multi-turn rollouts**, not single completions. See
-[Algorithms](/docs/core-concepts#algorithms).
+[Algorithms](/docs/core-concepts#policy-loss).
 
 ```bash
 # in the run config
@@ -47,7 +47,7 @@ The actor can run on three backends:
   resumed rather than thrown away, recovering otherwise-wasted compute.
 - **R3 (routing replay)** — for MoE policies, replays the rollout's expert-routing
   decisions during the training forward pass so the update matches what was
-  actually generated; required to keep MoE rollout/training logprobs aligned.
+  generated; required to keep MoE rollout/training logprobs aligned.
 
 ```bash
 # in the run config

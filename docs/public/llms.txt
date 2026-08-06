@@ -18,7 +18,7 @@
 - [Inference Stack](https://swe-lego-rl.pages.dev/docs/run-training/inference-stack): The agent → in-process proxy → vLLM chain and its health checks
 - [Results & Artifacts](https://swe-lego-rl.pages.dev/docs/run-training/results-and-artifacts): Where logs, checkpoints, and trajectories land
 
-- [Core Concepts](https://swe-lego-rl.pages.dev/docs/core-concepts): The terminology and training formulation used across SWE-Lego-RL, with references
+- [Core Concepts](https://swe-lego-rl.pages.dev/docs/core-concepts): The terms used in configs, logs, and the dashboard
 
 ## Block Design
 
@@ -45,7 +45,5 @@
 
 ## Reference
 
-- [Inputs & Configuration](https://swe-lego-rl.pages.dev/docs/reference/io): The three config layers, the runner contract, and what a run writes out
-- [Status & State](https://swe-lego-rl.pages.dev/docs/reference/status): How to tell what is running and what a run did
-- [Config Variants](https://swe-lego-rl.pages.dev/docs/reference/config-variants): The config lines for the edits you make most often
-- [Contributing to the Docs](https://swe-lego-rl.pages.dev/docs/reference/docs-site): How this documentation site is built, previewed, and deployed
+- [Configuration](https://swe-lego-rl.pages.dev/docs/reference/configuration): The three config layers, every variable a run reads, and what it writes out
+- [Run Status](https://swe-lego-rl.pages.dev/docs/reference/status): How to tell what is running now and what a finished run did

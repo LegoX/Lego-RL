@@ -28,9 +28,8 @@ layer below has its own page.
 
 ## Pillar mapping
 
-The technical report groups the system into three pillars by **the problem each
-part solves**; this page groups it by **where the data goes**. They are two cuts
-through the same system, not two descriptions of different things:
+The technical report groups the system by **the problem each part solves**; this page
+groups it by **where the data goes**. Two cuts through the same system:
 
 | Pillar | Lives in |
 | --- | --- |
@@ -38,12 +37,10 @@ through the same system, not two descriptions of different things:
 | Trustworthy sandboxes at scale | [Environment](/docs/architecture/environment) and the [AgentLoopWorkers](/docs/architecture/agent-loop-workers) driving it |
 | Operations for long runs | **nowhere on this diagram** |
 
-That last row is the point. Run validation, the dashboard and the
-failure-signature writeups sit *beside* the pipeline rather than inside it —
-nothing flows through them, so an architecture diagram cannot show them. That is
-also why they are easy to skip until a run has already been wasted: see the
+The third pillar has no box because no data flows through it. Run validation, the
+dashboard, and the failure-signature write-ups sit beside the pipeline:
 [Agent Plugin](/docs/agent-plugin), [Preflight](/docs/run-training/preflight),
-[Dashboard](/docs/dashboard) and [Troubleshooting](/docs/troubleshooting).
+[Dashboard](/docs/dashboard), [Troubleshooting](/docs/troubleshooting).
 
 ## One training step
 
