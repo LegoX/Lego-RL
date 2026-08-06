@@ -90,10 +90,10 @@ fi
 # 4. Ensure the Pages project exists (idempotent), then deploy.
 #
 # Do NOT grep the project list for the name: grep treats "-" as a word boundary, so
-# "\blego-rl\b" happily matches an unrelated "swe-lego-rl-dashboard" row, the script
-# concludes the project exists, skips creation, and the deploy fails with
-# "The Pages project ... does not exist". Just attempt the create and let an
-# already-exists error through — that is the only reliable existence test.
+# "\blego-rl\b" also matches an older "swe-lego-rl" row, the script concludes the
+# project exists, skips creation, and the deploy fails with "The Pages project ...
+# does not exist" — after a full build has already run. Just attempt the create and
+# let an already-exists error through; that is the only reliable existence test.
 log "Ensuring Cloudflare Pages project '$PROJECT_NAME' exists (production branch '$BRANCH_NAME')"
 create_out="$(npx --yes "$WRANGLER_PKG" pages project create "$PROJECT_NAME" \
   --production-branch "$BRANCH_NAME" 2>&1)" && create_rc=0 || create_rc=$?
