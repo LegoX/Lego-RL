@@ -26,19 +26,51 @@ ls -t logs/*.log | head -5
 ```
 
 Identify the live run from the `job:trainer` / `job:runner` lines, then map it
-to its log. The runner's own log is `logs/<exp_name>.log` (train/eval) — take
-`<exp_name>` from the `run configuration` block near the top of the matching
-`logs/launch_*.log`, not from a guess.
+to its log.
 
-If nothing is alive, say so and offer the **last finished** run instead
-(newest `logs/*.log`); make it explicit in the report which of the two you are
-describing. If several runs are alive, list them and ask which one — do not
-merge metrics from two runs.
+**Do not assume the log is under `logs/`.** `scripts/templates/verl/common.env`
+derives `TRAIN_LOG=${HARBOR_LOG_DIR}/${TRAINER_EXPERIMENT_NAME}.log`, and a real
+config overrides `HARBOR_LOG_DIR` to a per-experiment directory under the shared
+trials root; only the template default lands in `<repo>/logs`. Get the real path
+from the runner itself, in this order:
+
+```bash
+# 1. the runner printed it at startup (works even for a run launched by hand)
+grep -hoE 'train log: +\S+' logs/launch_*.log *.out 2>/dev/null | tail -3
+# 2. or resolve it from the config without launching anything
+bash scripts/train/train.sh --dry-run <config> 2>&1 | grep -E 'train log|vLLM log|trials'
+# 3. or find what is actually being written right now
+find "$(dirname "$HARBOR_TRIALS_DIR")" -mindepth 3 -maxdepth 3 -type d -name logs \
+     -mmin -30 2>/dev/null | head   # or point it at your trials root
+```
+
+A run launched by hand as `nohup bash scripts/train/train.sh <config> > foo.out`
+leaves `foo.out` wherever the launcher's cwd was — usually the repo root, not
+`logs/`. It holds the launch summary *plus* the same `tee`d stream, so it is a
+superset of `TRAIN_LOG` and equally good to read; the `train log:` line near its top
+is the fastest way to recover the canonical path. What it is **not** is a file the
+dashboard can see, since it is outside any served log dir.
+
+Because the repo lives on shared storage, that `.out` is visible from every box
+while the process is not: on a multi-node run only the ray-head node has the
+`train.sh` / `tee` / trainer processes. Seeing a growing log with **no matching pid
+here** means you are on the wrong node — not that the run died. Check
+`stat -c %Y` on the log before concluding anything from an empty `pgrep`.
+
+Multi-node: each node evaluates `EXP_NAME=…$(date …)` separately, so one launch
+produces `NNODES` exp dirs whose timestamps differ by seconds. Only the ray-head
+dir holds the trainer log; the others hold just `*_train_gpu_wandb.log`. Diagnose
+from the head's, but remember trial counts must be summed across **all** sibling
+dirs.
+
+If nothing is alive, say so and offer the **last finished** run instead; make it
+explicit in the report which of the two you are describing. If several runs are
+alive, list them and ask which one — do not merge metrics from two runs.
 
 ## Step 2 — How far has it got?
 
 ```bash
-LOG=logs/<exp_name>.log
+LOG=<TRAIN_LOG resolved in Step 1>                # NOT assumed to be logs/<exp>.log
 grep -oE 'step:[0-9]+ ' "$LOG" | tail -1          # latest step
 grep -cE ' step:[0-9]+ - training/global_step' "$LOG"
 ls -t harbor_trials/<project>/<exp_name> 2>/dev/null | head -3

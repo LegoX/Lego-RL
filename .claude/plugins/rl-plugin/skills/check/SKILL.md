@@ -193,6 +193,21 @@ Chinese — the field labels and probe names stay as written here.
 <paste the whole "run configuration (<kind>)" block from PREFLIGHT_ONLY, verbatim>
 ```
 
+**Log destination / dashboard visibility**
+```
+train log   <TRAIN_LOG, taken from the runner's "train log:" line — never assembled by hand>
+dashboard   <pid=<P> port=<P> serving <log-dir> → visible / not visible / no instance running>
+```
+
+Not a pass/fail check, but it belongs in the report because it is invisible
+otherwise: `scripts/templates/verl/common.env` puts `TRAIN_LOG` under
+`${HARBOR_LOG_DIR}`, and a real config overrides that to a per-experiment
+directory under the shared trials root — **not** `<repo>/logs`. The webui globs
+its `--log-dir` one level with no recursion (`webui/server.py`), so such a run
+trains normally and never appears on the board. Read the served dirs from
+`pgrep -af 'server\.py.*--log-dir'` and say which way it falls. `/rl:run` turns
+this line into a question before launching; `/rl:check` only has to report it.
+
 **Next steps**
 1. <one line per blocker, blockers before warnings; quote kubectl/curl/git errors verbatim>
 2. ...

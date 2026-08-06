@@ -186,6 +186,65 @@ done < <(_pg 'server\.py.*--log-dir')
 for _sib in "$(dirname "$REPO_ROOT")"/*/logs; do
     [ -d "$_sib" ] && _probe_logdir "$_sib" sibling
 done
+# Where the RUNNER actually writes, which since the config/template refactor is
+# usually NOT <repo>/logs: templates/verl/common.env derives
+#   TRAIN_LOG=${HARBOR_LOG_DIR}/${TRAINER_EXPERIMENT_NAME}.log
+# and every real config overrides HARBOR_LOG_DIR to a per-exp dir under the shared
+# harbor_trials root. server.py globs one level only, so a board serving
+# <repo>/logs shows nothing for those runs even though training is perfectly fine.
+# Report those dirs as candidates so the caller can serve/link them deliberately.
+_trials_roots=""
+for _cfg in "$REPO_ROOT"/scripts/*/configs/*.env; do
+    [ -f "$_cfg" ] || continue
+    while IFS= read -r _v; do
+        # keep the literal prefix up to the first ${...} expansion
+        _root="${_v%%\$\{*}"; _root="${_root%/}"
+        case "$_root" in
+            ""|"$REPO_ROOT"/logs) continue;;
+        esac
+        case " $_trials_roots " in *" $_root "*) continue;; esac
+        [ -d "$_root" ] || continue
+        _trials_roots="$_trials_roots $_root"
+    done < <(grep -hoE '^[A-Z_]*LOG_DIR=[^ ]*' "$_cfg" 2>/dev/null | cut -d= -f2- | tr -d '"'"'")
+done
+# One pass over the candidate dirs' symlinks (a single find per dir, no per-entry
+# subprocess): these are how an off-repo run gets surfaced to a served dir.
+_linked_targets=""
+if [ -n "$_trials_roots" ]; then
+    for _sd in $_seen_dirs; do
+        _linked_targets="$_linked_targets
+$(find "$_sd" -maxdepth 1 -type l -printf '%l\n' 2>/dev/null)"
+    done
+fi
+_n_off=0
+for _root in $_trials_roots; do
+    _info logdir:trialsroot "$_root — per-exp run logs live under <project>/<exp>/logs (configs point TRAIN_LOG here)"
+    # Bounded: only dirs written in the last 3 days, freshest 8. The shared FS
+    # makes an unbounded walk here cost minutes.
+    while IFS= read -r _ld; do
+        [ -d "$_ld" ] || continue
+        _lnew="$(ls -t "$_ld"/*.log "$_ld"/*.out 2>/dev/null | grep -v -e '_vllm\.log$' -e '_train_gpu_wandb\.log$' | head -1)"
+        [ -n "$_lnew" ] || continue
+        _n_off=$((_n_off + 1))
+        # Is it reachable from any dir the probe already listed as a candidate —
+        # either because that dir IS this one, or via a symlink pointing at it?
+        _linked=no
+        case " $_seen_dirs " in *" $_ld "*) _linked=yes;; esac
+        case "
+$_linked_targets
+" in *"
+$_lnew
+"*) _linked=yes;; esac
+        if [ "$_linked" = yes ]; then
+            _ok "logdir:trials" "$_ld — $(basename "$_lnew") $(_age_min "$_lnew")min ago, already visible via a link under a served dir"
+        else
+            _warn "logdir:offrepo" "$_ld — $(basename "$_lnew") $(_age_min "$_lnew")min ago, NOT visible from any candidate dir above"
+        fi
+    done < <(find "$_root" -mindepth 3 -maxdepth 3 -type d -name logs -mtime -3 2>/dev/null | head -8)
+done
+[ "$_n_off" -gt 0 ] && _info logdir:hint \
+    "off-repo run logs exist: either --extra-log-dir them, or ln -s each into the served dir (server.py globs one level, no recursion)"
+
 [ -z "$_seen_dirs" ] && _warn logdir:none "no candidate log directory found — pass LOG_DIR= explicitly"
 
 echo "──────────────────────────────────────────────────────────────────────"

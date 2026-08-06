@@ -6,10 +6,12 @@ description: >
   resolved run parameters and waits for explicit confirmation, then launches the
   runner in the background by default — these runs take hours, so a foreground
   default would hold the session hostage. For multi-node train/infer it prints
-  the exact per-node command instead of SSH-ing anywhere. After launch it
-  surfaces the real exp_name, the PIDs, the log paths and the first-step gates
-  worth watching. Triggers on "launch this config", "run harbor training",
-  "start the eval", "kick off training", "get this config running".
+  the exact per-node command instead of SSH-ing anywhere. Before launching it
+  states where the run's log will actually land and whether the running dashboard
+  can see it, asking when it cannot. After launch it surfaces the real exp_name,
+  the PIDs, the resolved log paths and the first-step gates worth watching.
+  Triggers on "launch this config", "run harbor training", "start the eval",
+  "kick off training", "get this config running".
 ---
 
 # /rl:run — launch one SWE-Lego-RL run
@@ -72,9 +74,52 @@ Worth double-checking before this run:
   • scale    <N nodes × 8 gpu>, <trials/step>, epochs=<N>  ← roughly <estimate> hours/step
   • resume   <RESUME_FROM, or "auto: picks up the newest ckpt in the exp dir">
   • naming   project=<...>  exp=<...>
+  • logs     <the real TRAIN_LOG path>
+             dashboard <visible / not visible: it is serving <log-dir>>
   • first step  <R3 on → pearson ≈ 0.999; otherwise routing misalignment silently
                 destroys the gradients>
 ```
+
+**Where the log lands, and whether the board will see it** — this line is not
+cosmetic. `scripts/templates/verl/common.env` derives
+`TRAIN_LOG=${HARBOR_LOG_DIR}/${TRAINER_EXPERIMENT_NAME}.log`, and a real config
+overrides `HARBOR_LOG_DIR` to a per-experiment directory under the shared trials
+root. Only the template *default* is `<repo>/logs`. The dashboard globs its
+`--log-dir` **one level, no recursion** (`webui/server.py`) — so a config that
+overrides `HARBOR_LOG_DIR` produces a run that trains fine and is **invisible on
+the board for its whole life** unless something links it in. Resolve both sides
+before asking for the yes:
+
+```bash
+bash scripts/train/train.sh --dry-run <config> 2>&1 | grep -E 'train log|vLLM log'
+pgrep -af 'server\.py.*--log-dir'      # which dirs a board actually serves
+```
+
+If `dirname(TRAIN_LOG)` is not one of the served dirs — and "no board running at
+all" counts as not served — **say so and ask**. Do not launch silently, and do not
+pick for them:
+
+```
+This config writes its training log to
+  <TRAIN_LOG>
+but the dashboard (pid=<P>, port=<P>) is serving
+  <served log-dir>
+One-level glob, no match → this run will never appear on the board
+(training itself is unaffected).
+
+  [1] symlink it into <served-dir>/<name>.log right after launch
+      (no dashboard restart — recommended)
+  [2] leave it, watch wandb only
+  [3] stop and change HARBOR_LOG_DIR in the config first
+Which one?
+```
+
+Option 1 is one `ln -s` in Step 6, after the real `exp_name` is known. It is the
+only choice needing neither a restart nor a config edit, and the symlink name
+becomes the run's id in the UI — the analysis panels get their exp-dir mapping
+from the log *contents*, so any readable name works. Never *move* the log (the
+runner holds it open through `tee`), and never leave a dangling symlink under a
+log dir — that breaks `/api/runs` for every run.
 
 Then ask, in one line:
 
@@ -155,6 +200,19 @@ Then, without polling in a tight loop:
    `pgrep -f 'scripts/<kind>/<kind>.sh'` and, for train,
    `pgrep -f 'fully_async_main|main_ppo'` (the trainer takes a few minutes to
    show up — report it as pending rather than waiting for it).
+4. If Step 3 chose `[1]`, link the log into the served dir now that `exp_name` is
+   real. Verify with the API rather than assuming — the run only shows up once it
+   has training steps, so an empty `steps` right after launch is expected:
+
+   ```bash
+   ln -sfn "<TRAIN_LOG>" "<served-dir>/<readable-name>.log"
+   curl -s -m 300 "http://127.0.0.1:<P>/api/runs" | grep -c '<readable-name>'
+   ```
+
+   For a multi-node run, link only the **ray-head** node's log — that is the one
+   carrying the trainer output; the worker exp dirs hold just
+   `*_train_gpu_wandb.log`, and the analysis panels recover the sibling exp dirs
+   on their own.
 
 If the log stays empty for 60s, or the runner exits non-zero within 60s, print
 the tail of the launch log and stop. **Do not retry automatically** and do not
@@ -178,9 +236,10 @@ Launched (background)
   exp_name:       <the real name read back from the launch log; if not there yet,
                    "starting — check the log in 30s">
   launch log:     logs/launch_<TS>.log
-  train log:      logs/<exp_name>.log            # train
-  vllm log:       logs/<exp_name>_vllm.log
-  trials:         harbor_trials/<project>/<exp_name>
+  train log:      <absolute TRAIN_LOG path, read from the launch log's "train log:" line>
+  vllm log:       <absolute VLLM_LOG path, same source>
+  trials:         <HARBOR_TRIALS_DIR>
+  dashboard:      <URL, run name = <readable-name> / not visible (user chose [2])>
   pids:           runner=<pid>  trainer=<pid or "starting">
   stage:          vLLM loading weights + cuda-graph capture; ~10–20 min before step 1
 
@@ -213,5 +272,9 @@ Check these at the first step (~20–40 minutes in):
 - never SSH to another node, or launch anything on a node other than this one
 - never run in the foreground without asking — it locks the session for hours
 - never report the preflight-time `exp_name` as the run's real name (Step 3)
+- never print `logs/<exp_name>.log` as the training log without checking — that is
+  the *old* scripts' path; the config decides, and it is usually under
+  `harbor_trials/`. Read the runner's own `train log:` line instead of composing one
+- never launch without telling the user whether the dashboard will see this run
 - never delete or move logs, `harbor_trials/`, or checkpoints; a dangling
   symlink under a run dir is enough to break the webui run list

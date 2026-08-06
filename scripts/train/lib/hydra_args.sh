@@ -66,6 +66,8 @@ append_common_hydra_args() {
     add actor_rollout_ref.rollout.log_prob_use_dynamic_bsz "$ROLLOUT_LOG_PROB_USE_DYNAMIC_BSZ"
     add actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu "$ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
     add actor_rollout_ref.rollout.max_model_len "$ROLLOUT_MAX_MODEL_LEN"
+    # Opt-in only: unset leaves verl's own default (1024) untouched for existing configs.
+    add_if_set actor_rollout_ref.rollout.max_num_seqs ROLLOUT_MAX_NUM_SEQS
     add actor_rollout_ref.rollout.enable_rollout_routing_replay "$ENABLE_ROLLOUT_ROUTING_REPLAY"
     add actor_rollout_ref.rollout.mode "$ROLLOUT_MODE"
     add actor_rollout_ref.rollout.n "$N_RESP"
@@ -87,7 +89,14 @@ append_common_hydra_args() {
     add algorithm.rollout_correction.rollout_is_threshold "$ROLLOUT_IS_THRESHOLD"
     add algorithm.rollout_correction.seq_dist_metrics "$SEQ_DIST_METRICS"
     add algorithm.trajectory_filter.enable "$TRAJ_FILTER_ENABLE"
-    add algorithm.trajectory_filter.filter_overlong "$TRAJ_FILTER_FILTER_OVERLONG"
+    # Two verl checkouts expose different trajectory_filter schemas: the older one takes
+    # per-reason booleans (filter_overlong, ...), the newer one a single drop_reasons list.
+    # Setting TRAJ_FILTER_DROP_REASONS selects the newer schema; unset keeps the old one.
+    if var_is_set TRAJ_FILTER_DROP_REASONS; then
+        add algorithm.trajectory_filter.drop_reasons "$TRAJ_FILTER_DROP_REASONS"
+    else
+        add algorithm.trajectory_filter.filter_overlong "$TRAJ_FILTER_FILTER_OVERLONG"
+    fi
     add algorithm.use_kl_in_reward "$USE_KL_IN_REWARD"
 
     add data.gen_batch_size "$GEN_PROMPT_BSZ"

@@ -7,11 +7,12 @@ description: >
   dist/ needs rebuilding and whether an instance is already serving, then proposes
   one concrete plan, waits for confirmation, and starts it in the background —
   optionally behind a Cloudflare quick tunnel. Also diagnoses a board that is up
-  but showing nothing, and a tunnel URL that 502s. Never kills someone else's
+  but showing nothing, and a run that trains fine yet never appears because the
+  config wrote its log outside the served directory. Never kills someone else's
   instance. Triggers on "start the dashboard", "deploy the webui", "put the board
   online", "bring the dashboard up", "deploy the dashboard", "start the webui",
-  "the dashboard will not open",
-  "tunnel 502".
+  "the dashboard will not open", "tunnel 502", "why does this run have no
+  curves", "wandb has it but the board does not", "training curves not showing".
 ---
 
 # /rl:dashboard — serve the training dashboard here
@@ -83,6 +84,50 @@ board — say so rather than starting it. If two candidates both look live (a
 sibling checkout is the usual case), **ask** which one; do not merge them silently.
 When the user wants several at once, that is what `--extra-log-dir` is for — the
 primary stays the one with the runs they care about.
+
+#### `<repo>/logs` is NOT where the runner writes any more
+
+Since the config/template refactor, `scripts/templates/verl/common.env:126` derives
+
+```
+TRAIN_LOG=${HARBOR_LOG_DIR}/${TRAINER_EXPERIMENT_NAME}.log
+```
+
+and **a real config overrides `HARBOR_LOG_DIR`** to a per-experiment directory
+under the shared trials root (`<trials-root>/<project>/<exp>/logs`). Only the
+template *default* falls back to `<repo>/logs`, which is why serving `<repo>/logs`
+alone can look correct and still show nothing.
+
+`server.py` globs **one level, no recursion** (`webui/server.py:133`), so a board
+on `<repo>/logs` shows nothing for those runs while training is perfectly healthy.
+
+The probe reports this directly — act on these lines, never assume:
+
+| Probe line | Meaning | What to do |
+|---|---|---|
+| `INFO logdir:trialsroot` | the shared root the configs point `TRAIN_LOG` at | context for the two lines below |
+| `OK logdir:trials … already visible via a link` | a real run log that a served dir already reaches through a symlink | nothing — it will show up |
+| `WARN logdir:offrepo … NOT visible from any candidate dir` | **a real run whose curve the board cannot show** | surface it in the plan and pick one of the two fixes below |
+
+Two fixes, both fine; pick by how many runs and whether the board is already up:
+
+- `--extra-log-dir <exp>/logs` per run dir — explicit, but needs a restart, and
+  you add a flag for every new exp;
+- `ln -s <exp>/logs/<exp>.log <served-dir>/<readable-name>.log` — no restart (run
+  discovery re-globs per request), and the name becomes the run's id in the UI.
+  The trials/exp-dir mapping for the analysis panels is parsed out of the **log
+  contents**, not the filename, so any readable name works.
+
+Never *move* a run log to make it visible — the runner is holding it open through
+`tee`, and a stale symlink left under a log dir is its own outage
+(`webui/server.py:141`).
+
+#### Say which directories you scanned
+
+Whatever you decide, the plan and the final report must **name the directories
+being served** and account for any `logdir:offrepo` line — including the ones you
+chose to leave out. "The board is up" while a live run is invisible is the exact
+failure this skill exists to prevent, and the user cannot see the probe output.
 
 ### 2c — Does the frontend need rebuilding?
 
@@ -157,11 +202,16 @@ verbatim.
 ## Dashboard deployment plan
 
   log dir   <path>            (<N> run logs, newest <T> minutes old)
+  extra dir <each --extra-log-dir path, or —>
   port      <P>               (<free / user-specified, currently held by pid X>)
   frontend  <reuse the existing dist / rebuild needed (<reason>)>
   tunnel    <on (publicly reachable — anyone with the link can open it) /
              reuse existing pid=<P> / off: this machine only>
   existing  <none / pid=<P> on <port>, serving <log-dir>, leaving it alone>
+
+  runs the board cannot see (logdir:offrepo):
+    <exp>/logs/<exp>.log        <T> min ago   → <symlink it / add --extra-log-dir / leave it>
+    <write "none" when there are none>
 
 <one line on why this log dir was chosen — from evidence, not guesswork>
 
@@ -170,6 +220,10 @@ Start with this plan? [Y]/[N]
 
 If a tunnel is part of the plan, the confirmation line must say so explicitly —
 the user is publishing an internal training board to a public URL.
+
+If any `logdir:offrepo` run is fresh (written in the last hour — i.e. probably the
+run the user actually wants), **do not silently write it off**: propose the
+symlink or the `--extra-log-dir`, and let them decline.
 
 ## Step 4 — Start
 
@@ -230,10 +284,15 @@ report a URL whose status code you have actually seen.
 Dashboard is up → <public URL>        ← the one to click
   local    http://127.0.0.1:<P>
   log dir  <path> (<N> runs)
+           <one line per --extra-log-dir>
   pid      server=<pid>  tunnel=<pid or —>
   log      <launch log path>
+  not served  <run logs still outside every served dir, or "none">
 Stop: kill <server_pid> <tunnel_pid>
 ```
+
+The `log dir` lines are the answer to "why is my run missing" three days from now,
+so spell out every directory this instance serves — not just the primary.
 
 If no tunnel was opened, the first line instead says the board is local-only and
 gives the SSH port-forward command — never leave the user without a way in.
@@ -256,10 +315,31 @@ Two shapes come up constantly; both are answered from the probe alone.
 behind it. Fix by starting a server on that port, or by opening a new tunnel to
 the port that does have one. Do not assume the URL expired.
 
-**"The board is empty / my run is missing."** In order: is the log dir the one
-holding that run (`logdir:*` counts)? Is the run's file named `*_vllm.log`
-(deliberately skipped)? Is a dangling symlink under the log dir breaking
-`/api/runs` (curl it and look for a non-200)? Only then suspect the UI.
+**"The board is empty / my run is missing."** Check in this order — the first one
+is now the common answer and costs one probe line to rule out:
+
+1. **`WARN logdir:offrepo` names the run** → the runner wrote it under the trials
+   root, the served dir never had it. Fix per 2b (symlink or `--extra-log-dir`).
+   Confirm by resolving the config's own `HARBOR_LOG_DIR` rather than guessing:
+   `bash scripts/train/train.sh --dry-run <config> | grep -E 'train log|vLLM log'`.
+   Do **not** go looking at the training itself first — a run at step 12 with
+   healthy metrics in its own log is not a training problem.
+2. Wrong served dir entirely (compare `logdir:*` counts).
+3. The run's file is `*_vllm.log` / `*_train_gpu_wandb.log` / `launch_*` — all
+   deliberately skipped (`webui/server.py:86-92`).
+4. The run reached ≤ 5 training steps and is not currently being written to —
+   `_handle_runs` hides those on purpose. A run visible in wandb but not here,
+   with a cold log, is usually this.
+5. A dangling symlink under the log dir breaking `/api/runs` — curl it and look
+   for a non-200.
+
+Only then suspect the UI.
+
+A multi-node async run has one exp dir **per node** (`EXP_NAME=…$(date …)` is
+evaluated on each node, so the timestamps differ by seconds). Only the ray-head
+dir has the full trainer log; the others hold just `*_train_gpu_wandb.log`. Link
+the head's log — the analysis panels recover the sibling dirs themselves
+(`_expand_sibling_exp_dirs`, 600s window).
 
 **"My UI change isn't showing."** `WARN dist:stale` — rebuild, per 2c.
 
