@@ -1,7 +1,7 @@
 ---
 name: dashboard
 description: >
-  Bring up the LiveRL training dashboard (webui/) on whatever machine you are on,
+  Bring up the Lego-RL training dashboard (webui/) on whatever machine you are on,
   adapting to that box's layout instead of assuming this repo's paths. Probes for
   the repo root, the directories that actually hold run logs, a free port, whether
   dist/ needs rebuilding and whether an instance is already serving, then proposes

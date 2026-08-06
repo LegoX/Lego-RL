@@ -2,7 +2,7 @@ import { createContext, useContext } from "react";
 
 export type Lang = "en" | "zh";
 
-const STORAGE_KEY = "swe-lego-rl-lang";
+const STORAGE_KEY = "lego-rl-lang";
 
 export function getSavedLang(): Lang {
   const saved = localStorage.getItem(STORAGE_KEY);
@@ -16,7 +16,7 @@ export function saveLang(lang: Lang) {
 
 const dict: Record<string, Record<Lang, string>> = {
   // App — sidebar
-  "app.title": { en: "LiveRL", zh: "LiveRL" },
+  "app.title": { en: "Lego-RL", zh: "Lego-RL" },
   "app.subtitle": { en: "Training Dashboard", zh: "训练看板" },
   "app.runs": { en: "Runs", zh: "运行记录" },
   "app.refresh": { en: "Refresh", zh: "刷新频率" },

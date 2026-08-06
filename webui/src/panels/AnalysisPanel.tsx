@@ -31,7 +31,7 @@ interface Report {
   isDemo?: boolean;
 }
 
-const REPORTS_KEY = "swe-lego-rl-reports";
+const REPORTS_KEY = "lego-rl-reports";
 
 const RECO_PATTERNS = [
   /^#{1,3}\s*\d*\.?\s*Top[- ]Priority Recommendations/im,

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CONTENT = join(ROOT, "content", "docs");
-const SITE = process.env.DOCS_SITE_URL || "https://swe-lego-rl.pages.dev";
+const SITE = process.env.DOCS_SITE_URL || "https://lego-rl.pages.dev";
 
 function frontmatter(file) {
   const src = readFileSync(file, "utf8");
@@ -33,9 +33,9 @@ function pageLine(dir, slug, urlBase) {
 
 const rootMeta = JSON.parse(readFileSync(join(CONTENT, "meta.json"), "utf8"));
 const lines = [
-  "# SWE-Lego-RL Documentation",
+  "# Lego-RL Documentation",
   "",
-  "> SWE-Lego-RL trains real coding agents with online reinforcement learning on real repositories: the agent drives the same model it is training, a verifier grades the result, and the trainer updates the weights.",
+  "> Lego-RL trains real coding agents with online reinforcement learning on real repositories: the agent drives the same model it is training, a verifier grades the result, and the trainer updates the weights.",
   "",
 ];
 

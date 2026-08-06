@@ -6,14 +6,14 @@ export function baseOptions(): BaseLayoutProps {
       title: (
         <div className="flex items-center gap-2 mr-4">
           <img
-            src="/liverl_emblem.png"
+            src="/legorl_emblem.png"
             alt=""
             width={24}
             height={24}
             style={{ width: 24, height: 24 }}
           />
           <p className="docs-brand-title">
-            SWE-Lego-<span className="docs-rl-word">RL</span>
+            Lego-<span className="docs-rl-word">RL</span>
           </p>
         </div>
       ),

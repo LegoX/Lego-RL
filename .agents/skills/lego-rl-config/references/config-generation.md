@@ -1,7 +1,7 @@
-# SWE-Lego-RL Config Generation Reference
+# Lego-RL Config Generation Reference
 
 This reference summarizes the current repository-specific config model for
-creating or refactoring SWE-Lego-RL train, infer, and eval configs.
+creating or refactoring Lego-RL train, infer, and eval configs.
 
 ## Current Runner Contract
 

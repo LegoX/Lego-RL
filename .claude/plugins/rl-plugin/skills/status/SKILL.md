@@ -1,7 +1,7 @@
 ---
 name: status
 description: >
-  Diagnose a SWE-Lego-RL run that is already in flight (or just finished):
+  Diagnose a Lego-RL run that is already in flight (or just finished):
   which run is alive, how far it has got, and whether its numbers are healthy.
   Reads the process table, the run log's metric lines and the trials directory,
   then checks the metrics against this cluster's known failure signatures —

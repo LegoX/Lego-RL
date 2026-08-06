@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "swe-lego-rl"
+name = "lego-rl"
 version = "0.1.0"
 description = "Integration patches for agentic RL training with VeRL and Harbor."
 readme = "README.md"
@@ -11,7 +11,7 @@ requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
-  { name = "SWE-Lego-RL maintainers" }
+  { name = "Lego-RL maintainers" }
 ]
 keywords = ["agentic-rl", "verl", "harbor", "ppo", "grpo", "kubernetes"]
 dependencies = [

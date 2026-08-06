@@ -31,7 +31,7 @@ assistant tokens are produced and `response_mask` is all zeros.
 
 **Fix.** Match the parser to the model. The runtime exposes one knob,
 `HARBOR_TOOL_PARSER` (default `qwen3_coder`), which drives every config point
-(`swe_lego_rl_*.yaml` → `tool-call-parser`, `agent_loop_config_cc.yaml` →
+(`lego_rl_*.yaml` → `tool-call-parser`, `agent_loop_config_cc.yaml` →
 `tool_parser`):
 
 | Model output format | `HARBOR_TOOL_PARSER` |

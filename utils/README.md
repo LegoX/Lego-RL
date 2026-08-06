@@ -1,6 +1,6 @@
 # utils/ — Python helper scripts
 
-Standalone Python tools used by the SWE-Lego-RL training / evaluation flow. `scripts/` holds
+Standalone Python tools used by the Lego-RL training / evaluation flow. `scripts/` holds
 only the `.sh` runners, which call into this directory as `$SCRIPT_DIR/../utils/xxx.py` or
 `$REPO_ROOT/utils/xxx.py`.
 

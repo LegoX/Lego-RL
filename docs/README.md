@@ -1,10 +1,10 @@
-# SWE-Lego-RL docs
+# Lego-RL docs
 
-User-facing documentation for [SWE-Lego-RL](../README.md), built as a
+User-facing documentation for [Lego-RL](../README.md), built as a
 [fumadocs](https://fumadocs.dev/) (Next.js) site and deployed to Cloudflare
 Pages as a static export.
 
-Live site: **<https://swe-lego-rl.pages.dev>**
+Live site: **<https://lego-rl.pages.dev>**
 
 The prose lives in `content/docs/`; everything else is the minimal app shell
 needed to render and deploy it.
@@ -41,9 +41,9 @@ npx serve out      # preview the exported site
 bash deploy_cloudflare_pages.sh
 ```
 
-Builds and deploys `out/` to the `swe-lego-rl` Cloudflare Pages project
-(published at <https://swe-lego-rl.pages.dev>, separate from the training
-dashboard's `swe-lego-rl-dashboard`). It activates Node 22 via nvm, asserts
+Builds and deploys `out/` to the `lego-rl` Cloudflare Pages project
+(published at <https://lego-rl.pages.dev>, separate from the training
+dashboard's `lego-rl-dashboard`). It activates Node 22 via nvm, asserts
 Node >= 20, and reuses the dashboard's Cloudflare credentials
 (`CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` from `.env.cf` or
 `~/.config/rl_dashboard_cloudflare.env`). Override the project with

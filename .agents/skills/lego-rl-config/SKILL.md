@@ -1,11 +1,11 @@
 ---
-name: swe-lego-rl-config
-description: Compose, edit, refactor, and validate SWE-Lego-RL train/eval/infer .env configs and reusable scripts/templates modules. Use when Codex is asked to generate an experiment config, migrate legacy wrappers into configs, edit template modules, dry-run a train/eval/infer workload, or explain the runner/template/site-env contract for this repository.
+name: lego-rl-config
+description: Compose, edit, refactor, and validate Lego-RL train/eval/infer .env configs and reusable scripts/templates modules. Use when Codex is asked to generate an experiment config, migrate legacy wrappers into configs, edit template modules, dry-run a train/eval/infer workload, or explain the runner/template/site-env contract for this repository.
 ---
 
-# SWE-Lego-RL Config
+# Lego-RL Config
 
-Use this skill for SWE-Lego-RL configuration work. The current design is a
+Use this skill for Lego-RL configuration work. The current design is a
 single runner per workload plus small `.env` experiment configs composed from
 reusable modules under `scripts/templates`.
 

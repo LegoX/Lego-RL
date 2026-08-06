@@ -97,6 +97,9 @@ initialize_runtime() {
     export NGPUS_PER_NODE RAY_PORT RAY_DASHBOARD_PORT RAY_OBJECT_STORE_MEMORY \
            SERVED_MODEL_NAME TOOL_CALL_PARSER
 
+    export LEGO_RL_ROOT="$REPO_ROOT"
+    # SWE_LEGO_RL_ROOT is the pre-rename name, kept as an alias so an older config or
+    # hydra file that still reads it keeps resolving.
     export SWE_LEGO_RL_ROOT="$REPO_ROOT"
     export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}$REPO_ROOT/src"
 

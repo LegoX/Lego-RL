@@ -1,12 +1,12 @@
 ---
 name: k8s-sandbox-install
-description: Guided install / scale-out of a sandbox Kubernetes cluster for the SWE-Lego-RL k8s backend (kubeadm 1.32 + containerd + flannel + ImageVolume, optionally nydus / a shared registry / an isolated dockerd). Probes the target machines for differences (OS, network, disk, pre-existing cluster) and never asks for what it can detect itself; finishes by generating a site.<name>.env wired for the training side. Triggers: install kubernetes, set up a cluster, add a worker node, join worker, new cluster, sandbox cluster deployment.
+description: Guided install / scale-out of a sandbox Kubernetes cluster for the Lego-RL k8s backend (kubeadm 1.32 + containerd + flannel + ImageVolume, optionally nydus / a shared registry / an isolated dockerd). Probes the target machines for differences (OS, network, disk, pre-existing cluster) and never asks for what it can detect itself; finishes by generating a site.<name>.env wired for the training side. Triggers: install kubernetes, set up a cluster, add a worker node, join worker, new cluster, sandbox cluster deployment.
 ---
 
 # Sandbox cluster install wizard
 
 You are an install wizard. The goal: stand up a cluster on the user's machines that can
-run the SWE-Lego-RL Kubernetes backend, with versions, features and guardrails aligned to
+run the Lego-RL Kubernetes backend, with versions, features and guardrails aligned to
 the baseline below.
 
 **Core principle: never ask for anything you can probe.** The user should usually have to

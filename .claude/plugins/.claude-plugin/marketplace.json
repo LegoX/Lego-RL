@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "swe-lego-rl",
-  "description": "Local marketplace for SWE-Lego-RL's preflight / launch / monitor skills.",
+  "name": "lego-rl",
+  "description": "Local marketplace for Lego-RL's preflight / launch / monitor skills.",
   "owner": {
     "name": "SWE-Lego"
   },
@@ -9,7 +9,7 @@
     {
       "name": "rl",
       "source": "./rl-plugin",
-      "description": "SWE-Lego-RL skills — preflight a config (dryrun + local live probe), launch a train/eval/infer run with an explicit parameter review, diagnose a run in flight, serve the training dashboard on whatever machine you are on, and install a sandbox Kubernetes cluster. Provides /rl:check, /rl:run, /rl:status, /rl:dashboard, /rl:k8s-sandbox-install."
+      "description": "Lego-RL skills — preflight a config (dryrun + local live probe), launch a train/eval/infer run with an explicit parameter review, diagnose a run in flight, serve the training dashboard on whatever machine you are on, and install a sandbox Kubernetes cluster. Provides /rl:check, /rl:run, /rl:status, /rl:dashboard, /rl:k8s-sandbox-install."
     }
   ]
 }

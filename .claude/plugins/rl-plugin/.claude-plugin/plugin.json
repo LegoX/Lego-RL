@@ -1,6 +1,6 @@
 {
   "name": "rl",
-  "description": "SWE-Lego-RL skills — config preflight (scripts/lib/preflight.sh) plus a local live probe, a launcher that always shows the resolved run parameters and waits for confirmation, a run-health diagnoser for the recurring failure signatures of this training stack, a dashboard deployer that adapts to the local machine's layout, and a guided sandbox-Kubernetes installer. Provides /rl:check, /rl:run, /rl:status, /rl:dashboard, /rl:k8s-sandbox-install.",
+  "description": "Lego-RL skills — config preflight (scripts/lib/preflight.sh) plus a local live probe, a launcher that always shows the resolved run parameters and waits for confirmation, a run-health diagnoser for the recurring failure signatures of this training stack, a dashboard deployer that adapts to the local machine's layout, and a guided sandbox-Kubernetes installer. Provides /rl:check, /rl:run, /rl:status, /rl:dashboard, /rl:k8s-sandbox-install.",
   "version": "0.1.0",
   "author": { "name": "SWE-Lego" }
 }

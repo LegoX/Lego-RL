@@ -1,7 +1,7 @@
 ---
 name: run
 description: >
-  Preflight and launch a SWE-Lego-RL run (train, eval or infer). Runs
+  Preflight and launch a Lego-RL run (train, eval or infer). Runs
   /rl:check internally and refuses on any blocking failure, shows the fully
   resolved run parameters and waits for explicit confirmation, then launches the
   runner in the background by default — these runs take hours, so a foreground
@@ -14,7 +14,7 @@ description: >
   "kick off training", "get this config running".
 ---
 
-# /rl:run — launch one SWE-Lego-RL run
+# /rl:run — launch one Lego-RL run
 
 Preflight, review the parameters, confirm, then launch in the background.
 Refuses if any check blocks, or if a run is already live on this box.

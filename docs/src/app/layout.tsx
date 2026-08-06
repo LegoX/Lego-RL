@@ -4,7 +4,7 @@ import "./global.css";
 import "katex/dist/katex.min.css";
 
 export const metadata: Metadata = {
-  title: "SWE-Lego-RL",
+  title: "Lego-RL",
   description:
     "Online RL (PPO/GRPO/GSPO) for SWE coding agents — verl + Harbor + vLLM.",
 };

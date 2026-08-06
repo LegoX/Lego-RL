@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lego-RL Config"
+  short_description: "Generate and validate Harbor RL configs"
+  default_prompt: "Use $lego-rl-config to compose a train config from templates and preflight it."

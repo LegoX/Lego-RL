@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the SWE-Lego-RL docs (fumadocs/Next.js static export) and deploy to a dedicated
+# Build the Lego-RL docs (fumadocs/Next.js static export) and deploy to a dedicated
 # Cloudflare Pages project. Independent of the training dashboard project
-# (swe-lego-rl-dashboard); this one defaults to swe-lego-rl.
+# (lego-rl-dashboard); this one defaults to lego-rl.
 #
 # Reuses the same Cloudflare credentials as the dashboard sync:
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PROJECT_NAME="${PROJECT_NAME:-swe-lego-rl}"
+PROJECT_NAME="${PROJECT_NAME:-lego-rl}"
 BRANCH_NAME="${BRANCH_NAME:-main}"
 OUT_DIR="${OUT_DIR:-out}"
 # Node 22 supports current wrangler; the dashboard pins v3 only for system Node 18.

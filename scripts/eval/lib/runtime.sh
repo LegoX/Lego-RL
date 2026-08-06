@@ -100,6 +100,9 @@ validate_runtime_config() {
 initialize_runtime() {
     unset MODELING_BACKEND 2>/dev/null || true
 
+    export LEGO_RL_ROOT="$REPO_ROOT"
+    # SWE_LEGO_RL_ROOT is the pre-rename name, kept as an alias so an older config or
+    # hydra file that still reads it keeps resolving.
     export SWE_LEGO_RL_ROOT="$REPO_ROOT"
     export PYTHONPATH="${EVAL_EXTRA_PYTHONPATH:+${EVAL_EXTRA_PYTHONPATH}:}${PYTHONPATH:+${PYTHONPATH}:}$REPO_ROOT/src"
     export SERVED_MODEL_NAME TOOL_CALL_PARSER LLM_BASE_URL LLM_API_KEY

@@ -1,7 +1,7 @@
 ---
 name: check
 description: >
-  Preflight a SWE-Lego-RL config: answer "is it safe to launch this run
+  Preflight a Lego-RL config: answer "is it safe to launch this run
   right now?". Runs every deterministic check through the runner's own
   PREFLIGHT_ONLY path (config summary + scripts/lib/preflight.sh), adds the
   local live checks a config-only script cannot judge (is a run already in
@@ -13,7 +13,7 @@ description: >
   "validate the config", "list the key parameters for this run".
 ---
 
-# /rl:check — preflight one SWE-Lego-RL run
+# /rl:check — preflight one Lego-RL run
 
 Answers one question: **is it safe to launch this config right now?**
 
@@ -45,7 +45,7 @@ missing its insecure-registry config) are out of scope here; they surface as
 
 ## Step 0 — Orient
 
-Repo root is the `SWE-Lego-RL` checkout (contains `scripts/lib/preflight.sh`).
+Repo root is the `Lego-RL` checkout (contains `scripts/lib/preflight.sh`).
 If the user ran this from elsewhere, locate it; if there is none, abort — but
 still print the Step 3 report with a `NO` verdict whose reason is the abort.
 

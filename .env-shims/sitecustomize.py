@@ -3,7 +3,7 @@
 # PYTHONPATH. Bumps harbor's hard-coded agent-setup timeout from an env var.
 #
 # Usage (set before launching the infer run):
-#   export PYTHONPATH=/path/to/SWE-Lego-RL/.env-shims:$PYTHONPATH
+#   export PYTHONPATH=/path/to/Lego-RL/.env-shims:$PYTHONPATH
 #   export HARBOR_AGENT_SETUP_TIMEOUT_SEC=1200
 import os
 

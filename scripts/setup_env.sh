@@ -2,7 +2,7 @@
 # -----------------------------------------------------------------------------
 # scripts/setup_env.sh
 #
-# Bootstraps a training-ready environment for `SWE-Lego-RL`:
+# Bootstraps a training-ready environment for `Lego-RL`:
 #   1. Install `uv` (if missing)
 #   2. Create a virtualenv at $VENV_PATH with the requested Python version
 #   3. Clone + checkout harbor & verl at the configured branch/tag
@@ -234,7 +234,7 @@ fi
 
 # ---------------- 6. this repo ----------------------------------------------
 
-log "installing SWE-Lego-RL (-e) from $REPO_ROOT"
+log "installing Lego-RL (-e) from $REPO_ROOT"
 uv pip install -e "$REPO_ROOT"
 
 # ---------------- 7. transformers pin ---------------------------------------
@@ -325,7 +325,7 @@ log "======================================================================"
 log "Setup complete."
 log "  harbor           : $HARBOR_DIR  @ $(git -C "$HARBOR_DIR" rev-parse --short HEAD) ($HARBOR_REF)"
 log "  verl             : $VERL_DIR    @ $(git -C "$VERL_DIR"   rev-parse --short HEAD) ($VERL_REF)"
-log "  SWE-Lego-RL: $REPO_ROOT"
+log "  Lego-RL: $REPO_ROOT"
 log "  venv             : $VENV_PATH"
 if [ "$SKIP_VEOMNI" = "1" ]; then
     log "  veomni           : (skipped)"

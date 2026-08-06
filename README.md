@@ -1,24 +1,24 @@
 <div align="center">
 
-<img src="img/swe-lego-rl-emblem.png" alt="SWE-Lego-RL" width="120"/>
+<img src="img/legorl_emblem.png" alt="Lego-RL" width="120"/>
 
-# SWE-Lego-RL
+# Lego-RL
 
 **Online RL training for real coding agents — on real repositories.**
 
-[![Docs](https://img.shields.io/badge/docs-swe--lego--rl.pages.dev-2563eb?logo=readthedocs&logoColor=white)](https://swe-lego-rl.pages.dev)
+[![Docs](https://img.shields.io/badge/docs-lego--rl.pages.dev-2563eb?logo=readthedocs&logoColor=white)](https://lego-rl.pages.dev)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**[Documentation](https://swe-lego-rl.pages.dev)**
+**[Documentation](https://lego-rl.pages.dev)**
 
-SWE-Lego-RL integrates [**verl**](https://github.com/verl-project/verl) (trainer + rollout)
+Lego-RL integrates [**verl**](https://github.com/verl-project/verl) (trainer + rollout)
 with [**Harbor**](https://github.com/SWE-Lego/harbor) (sandboxed task execution + verifier reward) to train an
 open coding model with online RL (PPO / GRPO / GSPO) from the trajectories of a real coding agent —
 **Claude Code**, **OpenHands**, **OpenCode**, or **Terminus** — solving SWE-bench-style tasks.
 
 <br/>
 
-<img src="docs/public/pipeline.png" alt="SWE-Lego-RL pipeline" width="720"/>
+<img src="docs/public/pipeline.png" alt="Lego-RL pipeline" width="720"/>
 
 </div>
 
@@ -56,7 +56,7 @@ captures the rollout trajectory straight from that session.
 ## Getting Started
 
 Every workload — training, evaluation, batch inference — is the same five steps.
-Full walkthrough: **[Getting Started](https://swe-lego-rl.pages.dev/docs/getting-started)**.
+Full walkthrough: **[Getting Started](https://lego-rl.pages.dev/docs/getting-started)**.
 
 ```text
 1. build the venv        bash scripts/setup_env.sh                              (once per machine)
@@ -185,7 +185,7 @@ values belong in `scripts/lib/site.env`; per-run values belong in the run config
 | Group | Variable | Notes |
 |---|---|---|
 | **Required** | `WANDB_API_KEY` | export it, or put it in `scripts/lib/.secrets.sh` (gitignored). Set `WANDB_MODE=offline`/`disabled` to opt out. **Never commit a key.** |
-| **Repo / Python** | `SWE_LEGO_RL_ROOT` | consumed by Hydra configs; auto-set to repo root |
+| **Repo / Python** | `LEGO_RL_ROOT` | consumed by Hydra configs; auto-set to repo root |
 | | `PYTHONPATH` | must include `<repo>/src` (auto-set) |
 | | `VENV_PATH` | venv to `source`; default `<repo>/.venv` |
 | **Data / Model** | `MODEL_ROOT`, `MODEL_PATH` | model root (site) and the checkpoint to train |
@@ -215,8 +215,8 @@ values belong in `scripts/lib/site.env`; per-run values belong in the run config
 │       │   ├── builtin_cc_agent_loop.py          #   Claude Code bridge (in-process Anthropic proxy)
 │       │   └── vllm_chat_completion_proxy.py     #   in-process proxy: OpenAI + Anthropic → vLLM
 │       └── config/                               # Hydra configs
-│           ├── swe_lego_rl_sync.yaml             #   synchronous PPO/GRPO
-│           ├── swe_lego_rl_fully_async_{fsdp,megatron}.yaml
+│           ├── lego_rl_sync.yaml             #   synchronous PPO/GRPO
+│           ├── lego_rl_fully_async_{fsdp,megatron}.yaml
 │           └── agent_loop_config_{cc,oh,oc,t2}.yaml [+ *_docker.yaml]
 ├── scripts/                                      # Runners: template → config → preflight → run
 │   ├── setup_env.sh                              #   one-shot installer
@@ -227,7 +227,7 @@ values belong in `scripts/lib/site.env`; per-run values belong in the run config
 │   └── {train,eval,infer}/                       #   the three runners + their configs
 ├── utils/                                        # Task index, R3 patches, checkpoint merge
 ├── webui/                                        # Optional dashboard (stdlib backend + React UI)
-├── docs/                                         # Docs site (fumadocs → swe-lego-rl.pages.dev)
+├── docs/                                         # Docs site (fumadocs → lego-rl.pages.dev)
 ├── patches/                                      # pinned upstream verl patch
 ├── pyproject.toml
 └── requirements.txt
@@ -249,7 +249,7 @@ values belong in `scripts/lib/site.env`; per-run values belong in the run config
 ### Config wiring
 
 ```
-src/verl_patch/config/swe_lego_rl_sync.yaml  (or fully_async_*.yaml)
+src/verl_patch/config/lego_rl_sync.yaml  (or fully_async_*.yaml)
   └─ actor_rollout_ref.rollout.agent.agent_loop_config_path
        └─ src/verl_patch/config/agent_loop_config_{cc,oh,oc,t2}.yaml
             └─ _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop   (per-agent loop class)
@@ -258,7 +258,7 @@ src/verl_patch/config/swe_lego_rl_sync.yaml  (or fully_async_*.yaml)
 Each `agent_loop_config_*.yaml` injects the Harbor adapters via dynamic import — the agent adapter
 (`harbor_patch.agents.image_mounted_claude_code.claude_code:...`) and the environment adapter
 (`harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment`). Trainer YAMLs resolve
-`agent_loop_config_path` from `SWE_LEGO_RL_ROOT` (auto-set by the runners).
+`agent_loop_config_path` from `LEGO_RL_ROOT` (auto-set by the runners).
 
 ## Anti-reward-hacking
 
@@ -332,7 +332,7 @@ when a task declares nothing. Toggles:
 ## Docs
 
 User-facing documentation is the [fumadocs](https://fumadocs.dev/) site under `docs/`, published at
-**[swe-lego-rl.pages.dev](https://swe-lego-rl.pages.dev)** (build + deploy with
+**[lego-rl.pages.dev](https://lego-rl.pages.dev)** (build + deploy with
 `bash docs/deploy_cloudflare_pages.sh`). It covers architecture, the runner system, data preparation,
 scaling, the dashboard, and a symptom-indexed troubleshooting section.
 

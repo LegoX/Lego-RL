@@ -23,6 +23,9 @@ SITE_ENV_FILE="${SITE_ENV_FILE:-$REPO_ROOT/scripts/lib/site.env}"
 # do not want to export it in your shell.
 [ -f "$REPO_ROOT/scripts/lib/.secrets.sh" ] && source "$REPO_ROOT/scripts/lib/.secrets.sh"
 
+export LEGO_RL_ROOT="${LEGO_RL_ROOT:-$REPO_ROOT}"
+# SWE_LEGO_RL_ROOT is the pre-rename name, kept as an alias so an older config or
+# hydra file that still reads it keeps resolving.
 export SWE_LEGO_RL_ROOT="${SWE_LEGO_RL_ROOT:-$REPO_ROOT}"
 export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
 
