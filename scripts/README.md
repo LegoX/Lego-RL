@@ -7,7 +7,7 @@ bug in one place fixes it for every experiment.
 ```
 pick template   cp <kind>/templates/<scenario>.env  <kind>/configs/my_run.env
 fill required   edit the CHANGEME lines (data, topology, naming)
-preflight       PREFLIGHT_ONLY=1 bash scripts/<kind>/<kind>.sh <kind>/configs/my_run.env
+preflight       PREFLIGHT_ONLY=1 bash scripts/train/train.sh train/configs/my_run.env   (train only)
 see the cmd     DRY_RUN=1        bash scripts/<kind>/<kind>.sh <kind>/configs/my_run.env
 run                              bash scripts/<kind>/<kind>.sh <kind>/configs/my_run.env
 ```
@@ -26,7 +26,6 @@ scripts/
 │   ├── common_env.sh            #   process env + venv + python + verl selection (sources site.env)
 │   ├── site.env                 #   * THIS cluster's infra: registry/mounts/kubeconfig/accel/MODEL_ROOT
 │   ├── site.example.env         #   * copy to site.env when moving to a different cluster
-│   ├── model_presets.sh         #   model presets (swap models by changing MODEL_PRESET only)
 │   ├── harbor_env.sh            #   harbor agent (§8) + backend (§7), branches on SCAFFOLD × BACKEND
 │   ├── ray_bringup.sh           #   ray cluster bring-up + /dev/shm cleanup (train)
 │   ├── vllm_serve.sh            #   vLLM kill/ready helpers (eval/infer)
@@ -62,7 +61,7 @@ parameter or a default.
 | `ENGINE` | `veomni` \| `fsdp` | veomni: `model_engine=veomni`+`veomni.*` (required for hybrid GDN); fsdp: `strategy=fsdp2`+`fsdp_config.*` (R3 forces SP=1). **Chosen by the model preset** — usually leave it alone |
 | `SCAFFOLD` | `ohsdk` \| `oh` \| `cc` \| `oc` | agent class + runtime image + loop config. ohsdk = primary; cc = Claude-Code; oc = OpenCode (R3 off by default) |
 | `BACKEND` | `k8s` \| `docker` | task-env backend. k8s = pull prebuilt only (`force_build` ignored, never builds); docker = pull prebuilt (`force_build=False`) or build on a remote daemon. docker currently only has an oh loop config. See **Environment images** |
-| model | `MODEL_PRESET=` `qwen35a3b` / `qwen3-30b-a3b` / `qwen36-27b` | fills `MODEL_PATH`+`TOOL_PARSER`+`SP_SIZE`+window+engine. For a model not in the table, set those explicitly |
+| model | `MODEL_PATH` + `TOOL_PARSER` + `ENGINE` + `SP_SIZE` + `MAX_PROMPT`/`MAX_RESP` | set explicitly per model; the per-model values worth copying are tabulated in the docs under Configuration |
 | node count | `NNODES`/`N_NODES_TRAIN`/`N_NODES_ROLLOUT` | pure parameters, not a template axis |
 
 **tool_parser is not a pure function of the model**: qwen3.5/3.6 → `qwen3_coder` (XML);
@@ -75,7 +74,7 @@ SCAFFOLD automatically; preflight double-checks it.
 
 | tier | who changes it | examples | where it lives |
 |---|---|---|---|
-| **T0 axes** | picked when choosing a template | `TRAIN_MODE` `SCAFFOLD` `BACKEND` `MODEL_PRESET` | template filename + first lines |
+| **T0 axes** | picked when choosing a template | `TRAIN_MODE` `SCAFFOLD` `BACKEND` `MODEL_ENGINE` | template filename + first lines |
 | **T1 required** | every run | `PROJECT_NAME` `EXP_TAG` `TRAIN_INDEX`/`VAL_INDEX` (or `DATASET_PATH`, or `RESULTS_DIR`+`OUTPUT_INDEX`) `NNODES`+topology | the CHANGEME lines in the config |
 | **T2 often tuned** | frequently | `SAVE_FREQ` `TOTAL_EPOCHS` `TRAIN_BSZ` `N_RESP` `MAX_RESP` `VAL_BEFORE_TRAIN` `N_CONCURRENT` `EVAL_TEMPERATURE` | config, add as needed |
 | **T3 advanced** | rarely, know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `VAL_TIMEOUT` `KL_LOSS_COEF` `CLIP_*` | config, override the default |
@@ -148,7 +147,7 @@ failure modes (`No pre-built rootfs`, `KeyError: 'config'`, empty-`position_ids`
 |---|---|
 | preflight (no cluster) | `PREFLIGHT_ONLY=1 bash scripts/train/train.sh <config>` |
 | print the final launch command | `DRY_RUN=1 bash scripts/train/train.sh <config>` |
-| swap model | change `MODEL_PRESET=` (for an out-of-table model, set `MODEL_PATH/TOOL_PARSER/SP_SIZE`) |
+| swap model | change `MODEL_PATH` + `TOOL_PARSER` + `ENGINE`/`SP_SIZE` + the context window |
 | swap scaffold | change `SCAFFOLD=` (ohsdk/cc/oc) |
 | sync ↔ async | change `TRAIN_MODE=` and use the matching template |
 | change cluster | edit `lib/site.env` (or a one-off `K8S_KUBECONFIG=... bash ...`) |

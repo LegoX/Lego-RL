@@ -22,7 +22,7 @@ PROJECT_NAME=eval-qwen36-27b
 EXP_TAG=step30
 SCAFFOLD=ohsdk
 BACKEND=k8s
-MODEL_PATH=/models/checkpoints/global_step_30_hf   # or MODEL_PRESET=qwen36-27b
+MODEL_PATH=/models/checkpoints/global_step_30_hf
 
 # dataset: a directory of harbor task dirs, OR a registry name
 DATASET_PATH=/data/harbor_swe_val_tasks_official
@@ -75,7 +75,7 @@ log is `logs/<exp_name>_vllm.log`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MODEL_PRESET` / `MODEL_PATH` | — | checkpoint to score (`global_step_N_hf` for a training checkpoint) |
+| `MODEL_PATH` | — | checkpoint to score (`global_step_N_hf` for a training checkpoint) |
 | `DATASET_PATH` / `DATASET_NAME` | — | dataset directory or registry name; exactly one |
 | `N_TASKS` | all | cap the number of tasks |
 | `EVAL_TEMPERATURE` | `0.7` | sampling temperature (official templates: `1.0`) |

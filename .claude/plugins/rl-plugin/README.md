@@ -23,9 +23,9 @@ the whole reason it exists.
 ```
 config.env
    │
-   ├─ scripts/<kind>/<kind>.sh          resolves preset × axes × site × harbor env
-   │     ├─ lib/run_summary.sh          → "run configuration" block  (the parameters)
-   │     └─ lib/preflight.sh            → ✓OK / ⚠WARN / ✗FATAL       (the assertions)
+   ├─ scripts/<kind>/<kind>.sh          resolves axes × site × harbor env
+   │     ├─ print_run_configuration     → "run configuration" block  (the parameters)
+   │     └─ lib/preflight.sh            → ✓OK / ⚠WARN / ✗FATAL       (the assertions, train only)
    │
    ├─ scripts/lib/live_probe.sh         → local facts: jobs, GPUs, ports, shm, disk, imports
    │

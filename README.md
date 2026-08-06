@@ -173,7 +173,7 @@ DRY_RUN=1        bash scripts/train/train.sh train/configs/mine.env   # + the fi
                  bash scripts/train/train.sh train/configs/mine.env   # go
 ```
 
-A config is ~20 lines: pick the axes (`TRAIN_MODE`, `SCAFFOLD`, `BACKEND`, `MODEL_PRESET`), set the
+A config is ~20 lines: pick the axes (`TRAIN_MODE`, `SCAFFOLD`, `BACKEND`, `MODEL_ENGINE`), set the
 required fields (data, topology, naming), and everything else takes a default from `scripts/lib/`.
 See [`scripts/README.md`](scripts/README.md) for the axes and parameter tiers.
 

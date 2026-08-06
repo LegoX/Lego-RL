@@ -133,7 +133,8 @@ Edit only the `CHANGEME` lines — experiment name, data indexes, topology:
 ```bash
 PROJECT_NAME=my-project
 EXP_TAG=first-run
-MODEL_PRESET=qwen35a3b            # fills MODEL_PATH / TOOL_PARSER / ENGINE / SP_SIZE / window
+MODEL_PATH=/models/Qwen3.5-35B-A3B
+TOOL_PARSER=qwen3_coder           # must match the model's chat template
 TRAIN_INDEX=/data/harbor_indexes/train.parquet
 VAL_INDEX=/data/harbor_indexes/val.parquet
 NNODES=1

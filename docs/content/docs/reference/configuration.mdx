@@ -42,7 +42,7 @@ Copy `lib/site.example.env` when onboarding a new cluster.
 
 | Tier | Who changes it | Examples | Lives in |
 | --- | --- | --- | --- |
-| **T0 axes** | picked once, by choosing a template | `TRAIN_MODE` `SCAFFOLD` `BACKEND` `MODEL_PRESET` | template filename + first lines |
+| **T0 axes** | picked once, by choosing a template | `TRAIN_MODE` `SCAFFOLD` `BACKEND` `MODEL_ENGINE` | template filename + first lines |
 | **T1 required** | every run | `PROJECT_NAME` `EXP_TAG` `TRAIN_INDEX`/`VAL_INDEX` topology | the `CHANGEME` lines |
 | **T2 often tuned** | frequently | `SAVE_FREQ` `TOTAL_EPOCHS` `TRAIN_BSZ` `N_RESP` `MAX_RESP` `VAL_BEFORE_TRAIN` `N_CONCURRENT` | config, add a line |
 | **T3 advanced** | rarely, and know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `KL_LOSS_COEF` | config, overrides a default |
@@ -60,33 +60,33 @@ Only these four require a different template. Everything else is a parameter.
 | Axis | Values | What it switches |
 | --- | --- | --- |
 | `TRAIN_MODE` | `async` \| `sync` | `fully_async_main` + `fully_async_fsdp.yaml` (split train/rollout pools) vs `main_ppo` + `sync.yaml` (one colocated pool) |
-| `ENGINE` | `veomni` \| `fsdp` | `model_engine=veomni` + `veomni.*` (required for hybrid-GDN models) vs `strategy=fsdp2` + `fsdp_config.*`. Set by the model preset — normally leave it alone |
+| `ENGINE` | `veomni` \| `fsdp` | `model_engine=veomni` + `veomni.*` (required for hybrid-GDN models) vs `strategy=fsdp2` + `fsdp_config.*`. Follows the model — see the table below |
 | `SCAFFOLD` | `ohsdk` \| `oh` \| `cc` \| `oc` | agent class + runtime image + agent-loop config. `ohsdk` is primary; `cc` = Claude Code; `oc` = OpenCode |
 | `BACKEND` | `k8s` \| `docker` | sandbox backend — see [Backends](/docs/run-training/backends) |
-| `MODEL_PRESET` | see below | fills `MODEL_PATH` `TOOL_PARSER` `ENGINE` `SP_SIZE` + context window |
 
 Node counts (`NNODES`, `N_NODES_TRAIN`, `N_NODES_ROLLOUT`) are parameters, not axes:
 the same template scales from one node to four.
 
-### Model presets
+### Per-model values
 
-A preset fills a slot of correlated values, so switching models is a one-line change.
-It only fills what the config left unset — an explicit `MODEL_PATH` always wins.
+These values are correlated: pick a model and the rest follow. Set them explicitly in
+the config — there is no preset mechanism that fills them for you.
 
-| Preset | Model | Engine | `SP_SIZE` | Window (prompt + response) | `TOOL_PARSER` |
+| Model | `ENGINE` | `SP_SIZE` | Window (prompt + response) | `TOOL_PARSER` | `ENABLE_R3` |
 | --- | --- | --- | --- | --- | --- |
-| `qwen35a3b` | Qwen3.5-35B-A3B (hybrid-GDN MoE) | veomni | 4 | 40 000 + 91 072 | `qwen3_coder` |
-| `qwen3-30b-a3b` | Qwen3-30B-A3B-Instruct-2507 (MoE) | veomni | 4 | 40 000 + 91 072 | by scaffold † |
-| `qwen36-27b` | Qwen3.6-27B (dense hybrid-mamba) | fsdp | 1 | 167 232 + 32 768 | `qwen3_coder` |
+| Qwen3.5-35B-A3B (hybrid-GDN MoE) | veomni | 4 | 40 000 + 91 072 | `qwen3_coder` | auto → True |
+| Qwen3-30B-A3B-Instruct-2507 (MoE) | veomni | 4 | 40 000 + 91 072 | by scaffold † | auto → True |
+| Qwen3.6-27B (dense hybrid-mamba) | fsdp | 1 | 167 232 + 32 768 | `qwen3_coder` | auto → False |
+
+`ENABLE_R3` is the one value you do not normally set: it defaults to whether
+`MODEL_PATH` is a MoE checkpoint, read from its `config.json`. Forcing it on for a
+dense model is a preflight FATAL — see [Preflight](/docs/run-training/preflight).
 
 † `tool_parser` is not a function of the model alone. Qwen3.5/3.6 chat templates emit
 XML → always `qwen3_coder`. The 30B needs `qwen3_coder` under `cc` but `hermes` under
-`ohsdk`/`oh`. The preset resolves this from `SCAFFOLD` and preflight re-checks it; a
-wrong value means a 100% tool-parse failure rate on step 0 (see
+`ohsdk`/`oh`. Preflight checks the combination; a wrong value means a 100% tool-parse
+failure rate on step 0 (see
 [Tool-call parser mismatch](/docs/troubleshooting/training-startup#tool-call-parser-mismatch)).
-
-For a model outside the table, leave `MODEL_PRESET` empty and set `MODEL_PATH`,
-`TOOL_PARSER`, `ENGINE`, `SP_SIZE`, `MAX_PROMPT`, and `MAX_RESP` explicitly.
 
 ## Required fields
 
@@ -114,8 +114,9 @@ same config on every node; the node whose IP matches `VLLM_HEAD_HOST` becomes ra
 One line each, in the run config (`scripts/{train,eval,infer}/configs/*.env`):
 
 ```bash
-MODEL_PRESET=qwen36-27b        # switch policy model
-# MODEL_PATH=/models/my-model TOOL_PARSER=qwen3_coder SP_SIZE=1   # model outside the preset table
+MODEL_PATH=/models/my-model    # switch policy model — also revisit
+TOOL_PARSER=qwen3_coder        # the values that travel with it
+SP_SIZE=1
 
 SCAFFOLD=cc                    # ohsdk | oh | cc | oc
 TRAIN_MODE=async               # sync ↔ async — also copy the matching template (entrypoint + YAML change)
@@ -150,7 +151,7 @@ you expect — see [Venv](/docs/getting-started#1-venv).
 
 ```bash
 K8S_KUBECONFIG=/path/to/kubeconfig.yaml        # which K8s cluster
-MODEL_ROOT=/models                             # where presets resolve model paths
+MODEL_ROOT=/models                             # convenience root for MODEL_PATH
 NEW_VERL_DIR=/repos/verl-swe_agent_opd_dev     # required with USE_NEW_VERL=1
 HARBOR_OPENSWE_IMAGE_REGISTRY=reg:5001/openswe # prebuilt task images
 HARBOR_NYDUS_MIRROR=...                        # mirror official val images
@@ -162,7 +163,7 @@ acceleration off.
 
 | Variable | Purpose | Empty means |
 | --- | --- | --- |
-| `MODEL_ROOT` | where `model_presets` looks up `<model-name>` | presets cannot resolve paths — set `MODEL_PATH` yourself |
+| `MODEL_ROOT` | convenience root a config can interpolate: `MODEL_PATH=$MODEL_ROOT/<name>` | nothing — always set `MODEL_PATH` in full |
 | `NEW_VERL_DIR` | the `verl-swe_agent_opd_dev` worktree carrying the veomni / R3 / async fixes | required whenever `USE_NEW_VERL=1` |
 | `K8S_KUBECONFIG` | k8s backend cluster | falls back to `$HOME/.kube/config` |
 | `HARBOR_OPENSWE_IMAGE_REGISTRY` | prebuilt per-instance task images | in-pod inline build (slow, needs egress) |
