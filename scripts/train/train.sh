@@ -4,19 +4,27 @@ set -euo pipefail
 usage() {
     cat >&2 <<'USAGE'
 Usage:
-  scripts/train/train.sh [--dry-run] path_to_config
+  scripts/train/train.sh [--dry-run|--preflight-only] path_to_config
 
 The config is sourced first, then its TEMPLATE_MODULES are sourced from
 scripts/templates in order. Config values should be explicit experiment choices;
 templates provide module defaults and derived values.
+
+  --preflight-only   resolve the config, run scripts/lib/preflight.sh, exit.
+                     Equivalent to PREFLIGHT_ONLY=1. Launches nothing.
+  --dry-run          the above, plus the fully expanded launch command.
 USAGE
 }
 
 DRY_RUN=0
-if [ "$#" -gt 0 ] && [ "$1" = "--dry-run" ]; then
-    DRY_RUN=1
-    shift
-fi
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run)        DRY_RUN=1; shift ;;
+        --preflight-only) PREFLIGHT_ONLY=1; shift ;;
+        *) break ;;
+    esac
+done
 
 [ "$#" -eq 1 ] || { usage; exit 2; }
 
@@ -31,7 +39,7 @@ if [[ "$CONFIG_PATH" != /* ]]; then
 fi
 [ -f "$CONFIG_PATH" ] || { echo "[FATAL] config not found: $CONFIG_PATH" >&2; exit 1; }
 
-export REPO_ROOT TEMPLATE_ROOT TRAIN_LIB_DIR CONFIG_PATH DRY_RUN
+export REPO_ROOT TEMPLATE_ROOT TRAIN_LIB_DIR CONFIG_PATH DRY_RUN PREFLIGHT_ONLY
 
 # shellcheck disable=SC1091
 source "$TRAIN_LIB_DIR/runtime.sh"
@@ -45,6 +53,16 @@ validate_runtime_config
 initialize_runtime
 print_launch_summary
 print_final_environment
+print_run_configuration
+
+# Config-only health check. Runs after the summary so a failing config is still
+# shown in full, and before anything expensive: every rule here is a mistake that
+# otherwise surfaces minutes into a run, or not at all.
+run_preflight
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+    echo "[preflight-only] checks passed; not launching (PREFLIGHT_ONLY=1)."
+    exit 0
+fi
 
 build_hydra_args
 build_verl_command

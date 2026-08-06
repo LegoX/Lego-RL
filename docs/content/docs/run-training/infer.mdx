@@ -22,7 +22,7 @@ cp scripts/infer/templates/qwen36-27b_1node.env \
 PROJECT_NAME=infer-qwen36-27b
 SCAFFOLD=ohsdk
 BACKEND=k8s
-MODEL_PRESET=qwen36-27b            # or MODEL_PATH=/models/global_step_N_hf
+MODEL_PATH=/models/Qwen3.6-27B     # or a training checkpoint: /models/global_step_N_hf
 
 # data / output
 TRAIN_INDEX=/data/base_index.parquet     # base index of all candidate instances
@@ -43,8 +43,9 @@ VLLM_MAX_MODEL_LEN=128000
 ## 2. Validate
 
 ```bash
-PREFLIGHT_ONLY=1 bash scripts/infer/infer.sh infer/configs/my_infer.env   # checks only, no launch
+bash scripts/infer/infer.sh --dry-run infer/configs/my_infer.env   # resolve + print, no launch
 # or:  /rl:check infer/configs/my_infer.env
+# PREFLIGHT_ONLY (scripts/lib/preflight.sh) is wired into the train runner only.
 ```
 
 ## 3. Run

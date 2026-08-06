@@ -35,7 +35,7 @@ Each check lives in **exactly one** layer:
 
 | Layer | Run by | Covers |
 |---|---|---|
-| **Deterministic** | `scripts/lib/preflight.sh` via the runner | tool_parser × model × scaffold · topology · SP/device-mesh · VRAM · veomni constraints · R3 × engine × verl · agent_name × scaffold · image source · kubeconfig · lr_scheduler · val timeout · rollout_is · path existence |
+| **Deterministic** | `scripts/lib/preflight.sh` via the runner | tool_parser × model × scaffold · topology · SP/device-mesh · VRAM · veomni constraints · R3 × model family (MoE/dense) × engine × verl · agent_name × scaffold · image source · kubeconfig · lr_scheduler · val timeout · rollout_is · path existence |
 | **Live (judgment)** | this skill, from `scripts/lib/live_probe.sh` facts | is a run already in flight? · is that GPU/port mine, stale, or a foreign job's? · venv imports · disk / shm headroom |
 
 Everything is **local host only** — no SSH to 221/222/240/243, no cluster
@@ -69,12 +69,19 @@ echo config or README content into the report.
 ## Step 1 — Deterministic checks
 
 ```bash
-PREFLIGHT_ONLY=1 bash scripts/<kind>/<kind>.sh <config> 2>&1; echo "EXIT=$?"
+PREFLIGHT_ONLY=1 bash scripts/train/train.sh <config> 2>&1; echo "EXIT=$?"
 ```
 
-This one command resolves the model preset, the harbor agent env and the site
-layer, prints the **run configuration block**, then runs `preflight.sh`. Read
-its output as-is — never re-run a probe separately and never overrule an `OK`.
+This one command sources the config and its templates, resolves every derived
+value, prints the **run configuration block**, then runs `preflight.sh` and exits
+without launching. Read its output as-is — never re-run a probe separately and
+never overrule an `OK`.
+
+**Only the train runner has `PREFLIGHT_ONLY`.** For an eval or infer config, use
+`bash scripts/<kind>/<kind>.sh --dry-run <config>`: it resolves and prints
+everything the same way but does not run `preflight.sh`, so for those two kinds
+the deterministic layer is thinner — say so in the report rather than implying
+the config passed rules that never ran.
 
 | Marker | Status | Blocks launch? |
 |---|:---:|:---:|

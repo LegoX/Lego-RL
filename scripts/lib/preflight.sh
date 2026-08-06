@@ -98,6 +98,34 @@ if [ "$(_lc "${ENGINE:-}")" = "veomni" ]; then
 fi
 
 # --- 5. R3 × engine × verl path ── §4.6 silent low pearson ─────────────────────────
+# 5a. R3 × model family. R3 replays MoE expert routing, so it is meaningless on a
+# dense checkpoint — and not harmlessly so. veomni raises "router replay is not
+# wired for model_type=..." from validate_model_for_replay inside engine init,
+# which happens *after* vLLM has loaded weights and captured cuda graphs; fsdp
+# patches 0 router gates and silently trains without replay while the rollout
+# still passes --enable-return-routed-experts to vLLM. Block the first, warn on
+# the second, and warn when a MoE run is leaving R3 on the table.
+if [ -n "${MODEL_PATH:-}" ] && command -v model_is_moe >/dev/null 2>&1; then
+    # Called directly, not via $(model_moe_verdict) — a command substitution would
+    # run in a subshell and MODEL_MOE_REASON would not survive it.
+    if model_is_moe "$MODEL_PATH"; then
+        _pf_moe=moe
+    elif case "${MODEL_MOE_REASON:-}" in "model_type="*) true ;; *) false ;; esac; then
+        _pf_moe=dense
+    else
+        _pf_moe=unknown
+    fi
+    _pf_r3_on=0
+    [[ "$(_lc "${ENABLE_R3:-true}")" =~ ^(1|true)$ ]] && _pf_r3_on=1
+    case "$_pf_moe:$_pf_r3_on" in
+        moe:1)     _pf_ok "R3 on × MoE model ✓ (${MODEL_MOE_REASON:-})" ;;
+        dense:0)   _pf_ok "R3 off × dense model ✓ (${MODEL_MOE_REASON:-})" ;;
+        dense:1)   _pf_fatal "ENABLE_R3=on but $MODEL_PATH is DENSE (${MODEL_MOE_REASON:-}). veomni will raise 'router replay is not wired for model_type=...' inside engine init (~10-20min in, after vLLM warmup); fsdp will patch 0 gates and silently skip replay → set ENABLE_R3=False" ;;
+        moe:0)     _pf_warn "MoE model but ENABLE_R3=off (${MODEL_MOE_REASON:-}) — training will not replay rollout routing (coverage ~24% instead of 100%). Intentional? Otherwise set ENABLE_R3=True" ;;
+        unknown:*) _pf_warn "cannot tell whether $MODEL_PATH is MoE (${MODEL_MOE_REASON:-}) — ENABLE_R3=${ENABLE_R3:-unset} was not verified against the checkpoint; set it explicitly" ;;
+    esac
+fi
+
 if [[ "$(_lc "${ENABLE_R3:-true}")" =~ ^(1|true)$ ]]; then
     [ "${USE_NEW_VERL:-1}" = "1" ] && _pf_ok "R3 on + USE_NEW_VERL=1 ✓" \
         || _pf_fatal "ENABLE_R3=on but USE_NEW_VERL≠1 → veomni router_replay not in old verl, R3 will FATAL"

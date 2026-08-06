@@ -60,13 +60,27 @@ With `ENGINE=veomni`, both `FUSED_KERNELS` and `ACTIVATION_OFFLOAD` must be `Fal
 Either one on makes the backward pass after an FSDP2 reshard crash with
 `setStorage ... storage of size 0` (an FSDP1-era monkey patch).
 
-### 5. R3 × engine × verl tree
+### 5. R3 × model family × engine × verl tree
 
-If `ENABLE_R3` is on:
+First, `ENABLE_R3` is checked against the checkpoint itself — `MODEL_PATH/config.json`
+is read and the model is classified MoE or dense (`model_type` ending in `_moe`, or an
+expert-count key). R3 replays *expert routing*, so on a dense model:
 
-- `USE_NEW_VERL=1` is required — routing replay does not exist in the installed verl,
-  and R3 will hard-fail;
-- `NEW_VERL_DIR` must exist on disk;
+- **veomni** raises `router replay is not wired for model_type=...` from inside engine
+  init — which happens after vLLM has loaded weights and captured cuda graphs, so you
+  lose 10–20 minutes before seeing it. This is a **FATAL**.
+- **FSDP** patches zero router gates and trains without replay while the rollout still
+  asks vLLM for routed experts — no error at all.
+
+You normally never hit this, because the default is derived from the same detection
+(`verl/common.env`); the check exists for configs that set `ENABLE_R3` by hand. The
+reverse — a MoE model with R3 off — is a **WARN**: it runs, but routing coverage drops
+from 100% back to ~24%.
+
+Then, if `ENABLE_R3` is on:
+
+- the installed verl must actually carry routing replay (the runner probes the
+  imported tree for `verl/utils/veomni/router_replay.py`);
 - on **FSDP**, R3 only supports `SP_SIZE=1` (the FSDP path does not handle SP
   resharding of `routed_experts`). Either disable R3 or set `SP_SIZE=1`.
 

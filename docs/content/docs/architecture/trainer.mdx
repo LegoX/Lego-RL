@@ -33,7 +33,7 @@ The actor can run on three backends:
 | Backend | Best for |
 | --- | --- |
 | **FSDP** | dense models; the validated default and fully-async path |
-| **VeOmni** | large MoE policies (e.g. Qwen3-30B-A3B); enable with `USE_NEW_VERL=1` |
+| **VeOmni** | large MoE policies (e.g. Qwen3-30B-A3B); set `MODEL_ENGINE=veomni` |
 | **Megatron** | the largest models, via tensor/pipeline parallelism |
 
 ## Modes & features
@@ -52,7 +52,7 @@ The actor can run on three backends:
 ```bash
 # in the run config
 TRAIN_MODE=async              # sync | async
-ENABLE_R3=True                # MoE only; requires USE_NEW_VERL=1
+ENABLE_R3=True                # MoE only; leave unset to derive it from the checkpoint
 staleness_threshold=1         # async: max param-versions a rollout may lag
 partial_rollout=True          # async: resume generations cut by a weight sync
 ```

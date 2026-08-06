@@ -94,8 +94,9 @@ Healthy is ≥ 0.99, and a drop is the first symptom of a broken path — see
 
 **R3 (routing replay)** covers the sparse-model case: the experts the router picked at
 generation are recorded and replayed during the training forward pass, so both sides
-route each token identically. Enabled with `ENABLE_R3=1` (requires `USE_NEW_VERL=1`);
-cf. [Ma et al., 2025](https://arxiv.org/abs/2510.11370).
+route each token identically. `ENABLE_R3` defaults to whether `MODEL_PATH` is a MoE
+checkpoint, so a dense model turns it off on its own; set it explicitly only to
+override that. cf. [Ma et al., 2025](https://arxiv.org/abs/2510.11370).
 
 ## Importance correction
 
