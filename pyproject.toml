@@ -41,6 +41,14 @@ train = [
   "transformers>=4.56,<5",
   "vllm==0.19.0",
   "verl",
+  # Hard requirement of the default modeling backend: verl's
+  # workers/engine/veomni/transformer_impl.py imports veomni at module load and
+  # MODELING_BACKEND defaults to veomni. Its stale `datasets<=2.21.0` pin is lifted by
+  # the datasets override below -- installing this extra without that override in
+  # effect will fail to resolve. See overrides.txt.
+  "veomni==0.1.11",
+  "blobfile>=3.0.0",
+  "timm",
   "wandb",
   "packaging>=20.0",
   "tensorboard",
@@ -58,6 +66,17 @@ dev = [
   "pytest-asyncio>=1.2.0",
   "ruff>=0.15.4",
 ]
+
+[tool.uv]
+# Lifts veomni's stale datasets upper bound so `[train]` resolves. See overrides.txt
+# for the rationale; keep the two in sync.
+#
+# Caveat: uv only picks this up when it discovers this pyproject.toml as its config
+# file, i.e. when the working directory is the repo root. scripts/setup_env.sh does
+# not rely on that -- it exports UV_OVERRIDE=<repo>/overrides.txt so the override
+# applies no matter where the script is invoked from. This block is here so that a
+# plain `uv sync` / `uv pip install -e .[train]` run from the repo root also works.
+override-dependencies = ["datasets>=4.8.4,<5"]
 
 [tool.setuptools]
 include-package-data = true

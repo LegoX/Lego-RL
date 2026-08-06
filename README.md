@@ -81,9 +81,11 @@ bash scripts/setup_env.sh
 ```
 
 Creates a venv at `<repo>/.venv` (Python 3.12.3), clones `harbor` and `verl` as siblings of this
-repo, installs them plus `vllm==0.19.0`, `flash_attn`, `cupy-cuda12x` and this repo editable, and
-pins `transformers==5.4.0`. Idempotent — re-running only redoes missing steps. Every path, URL, ref
-and version is overridable:
+repo, installs them plus `veomni==0.1.11`, `vllm==0.19.0`, `flash_attn`, `cupy-cuda12x` and this
+repo editable, and pins `transformers==5.4.0`. Before exiting it verifies the result — veomni's
+training-path modules must import, and `verl` / `harbor` must resolve to the checkouts it just
+installed — so it aborts rather than leaving you a venv that looks fine but runs the wrong code.
+Idempotent — re-running only redoes missing steps. Every path, URL, ref and version is overridable:
 
 ```bash
 WORKSPACE_ROOT=/data/src  VENV_PATH=/opt/envs/swe-lego  CUDA_HOME=/usr/local/cuda-12.8 \
@@ -93,23 +95,36 @@ bash scripts/setup_env.sh
 
 The pinned upstreams (see the *User-overridable configuration* block at the top of the script):
 
-| Component | Source | Ref |
-|---|---|---|
-| **Harbor** | [SWE-Lego/harbor](https://github.com/SWE-Lego/harbor.git) | branch `ydu_dev` (harbor `0.3.1`) |
-| **verl** | [Elvin-Yiming-Du/verl](https://github.com/Elvin-Yiming-Du/verl.git) | branch `ydu/swe_agent_opd_dev` (verl `0.8.0`) |
+| Component | Source | Ref | Cloned to |
+|---|---|---|---|
+| **Harbor** | [SWE-Lego/harbor](https://github.com/SWE-Lego/harbor.git) | branch `ydu_dev` (harbor `0.3.1`) | `<repo>/../harbor` |
+| **verl** | [Elvin-Yiming-Du/verl](https://github.com/Elvin-Yiming-Du/verl.git) | branch `ydu/merge-yt-20260729` (verl `0.8.0`) | `<repo>/../verl-swe_agent_opd_dev` |
+
+The verl directory name is **not** cosmetic: `scripts/lib/common_env.sh` prepends that same path to
+`PYTHONPATH` at run time, so training must find the tree that was installed. Both sides derive it
+from the repo location, so a checkout anywhere works — but override only one of them and you get a
+venv that installed one verl while training runs another. `setup_env.sh` warns when the two disagree.
+
+> [!NOTE]
+> `veomni` is a hard dependency of the default modeling backend (`MODELING_BACKEND=veomni`): verl
+> imports it at module load, so a venv without it dies on startup. Its published metadata pins
+> `datasets<=2.21.0`, which contradicts verl and vllm; `overrides.txt` lifts that bound and the
+> installer applies it via `UV_OVERRIDE`. Installing by hand instead? Pass `--overrides overrides.txt`
+> or the resolve will fail. `SKIP_VEOMNI=1` opts out if you manage the dependency yourself.
 
 > [!IMPORTANT]
-> **The pinned verl fork is not public yet**, so `setup_env.sh` will fail for anyone without
-> access. It carries the VeOmni router-replay, R3 and fully-async fixes this repo depends on;
-> upstream verl `0.8.0` runs the synchronous path but not those features. Meanwhile:
+> The pinned verl fork **is** public and carries the VeOmni router-replay, R3 and fully-async fixes
+> this repo depends on; upstream verl `0.8.0` runs the synchronous path but not those features. To
+> pin upstream instead:
 >
 > ```bash
 > VERL_REPO_URL=https://github.com/verl-project/verl.git VERL_REF=v0.8.0 bash scripts/setup_env.sh
 > ```
 >
-> Harbor's `ydu_dev` (not `main` = `0.1.45`) carries the per-phase network-policy framework, the
-> OpenHands-SDK 1.33 runtime, the OpenSWE adapter and the git-history restore hook. `HARBOR_REF=main`
-> gets vanilla upstream.
+> **Harbor's `ydu_dev` is not public yet**, so that clone will fail for anyone without access. It
+> carries the per-phase network-policy framework, the OpenHands-SDK 1.33 runtime, the OpenSWE adapter
+> and the git-history restore hook on top of `main` (`0.1.45`); `HARBOR_REF=main` gets vanilla
+> upstream and works for everyone.
 
 ### 2. Describe your cluster
 

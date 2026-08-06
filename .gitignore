@@ -167,3 +167,11 @@ scripts/lib/.secrets.sh
 *.bak
 *.bak-*
 webui/dist.bak-*/
+
+# One-off operational scripts and stray run artifacts left at the repo root.
+# Resume/rerun helpers are pinned to one machine, one checkpoint dir and one
+# EXP_NAME, so they are worthless to anyone else and go stale immediately —
+# the reusable half belongs in scripts/train/configs/*.env instead.
+/resume*.sh
+/ablation*_[0-9]*
+/*.out

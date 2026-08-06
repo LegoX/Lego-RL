@@ -29,7 +29,12 @@ export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
 # new-verl selection: veomni router_replay / R3 / async fixes live only in this worktree. Default ON.
 USE_NEW_VERL="${USE_NEW_VERL:-1}"
 if [ "$USE_NEW_VERL" = "1" ]; then
-    NEW_VERL_DIR="${NEW_VERL_DIR:-/path/to/verl-swe_agent_opd_dev}"
+    # Derived from REPO_ROOT so a fresh checkout anywhere works: this must resolve to
+    # the same tree scripts/setup_env.sh installs with -e (its VERL_DIR default is
+    # $WORKSPACE_ROOT/verl-swe_agent_opd_dev, WORKSPACE_ROOT=$(dirname REPO_ROOT)).
+    # Override only if you deliberately keep the two apart -- setup_env.sh warns when
+    # this names a different tree than the one it installed.
+    NEW_VERL_DIR="${NEW_VERL_DIR:-$(dirname "$REPO_ROOT")/verl-swe_agent_opd_dev}"
     export PYTHONPATH="$NEW_VERL_DIR:$PYTHONPATH"
 fi
 

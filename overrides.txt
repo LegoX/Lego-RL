@@ -1,0 +1,13 @@
+# uv override file -- passed to every `uv pip install` in scripts/setup_env.sh via
+# UV_OVERRIDE, and mirrored in pyproject.toml's [tool.uv] override-dependencies.
+#
+# An override REPLACES every declared constraint on the named package, including
+# upper bounds a dependency got wrong. Use it only for stale metadata, never to
+# paper over a real incompatibility.
+#
+# datasets: veomni==0.1.11 declares `datasets>=2.20.0,<=2.21.0`. That upper bound is
+# stale -- veomni's training code paths run fine against datasets 4.x, which is what
+# verl and vllm require. Without this override the resolver either refuses to solve
+# or downgrades datasets to 2.21 and breaks verl. The range below is the version we
+# actually run and validate against.
+datasets>=4.8.4,<5
