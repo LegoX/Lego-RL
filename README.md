@@ -69,8 +69,9 @@ Lego-RL is **production-ready** with:
 
 ## Getting Started
 
-Everything — installation, configuration, the full loop, the failure playbook — is at
-**[lego-rl.pages.dev/docs](https://lego-rl.pages.dev/docs)**.
+> [!TIP]
+> Everything — installation, configuration, the full loop, the failure playbook — is at
+> **[lego-rl.pages.dev/docs](https://lego-rl.pages.dev/docs)**.
 
 Install and launch the [demo run](https://lego-rl.pages.dev/docs/demo), a real training run at
 1/16 scale (`8 prompts × 4 responses = 32 trials/step`):
