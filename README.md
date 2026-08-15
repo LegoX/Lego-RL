@@ -69,56 +69,32 @@ Lego-RL is **production-ready** with:
 
 ## Getting Started
 
-<a href="https://lego-rl.pages.dev/docs"><b>Documentation</b></a>
+Everything — installation, configuration, the full loop, the failure playbook — is at
+**[lego-rl.pages.dev/docs](https://lego-rl.pages.dev/docs)**.
 
-Every workload — training, evaluation, batch inference — is the same five steps:
+Install and launch the [demo run](https://lego-rl.pages.dev/docs/demo), a real training run at
+1/16 scale (`8 prompts × 4 responses = 32 trials/step`):
 
 ```bash
-git clone https://github.com/SWE-Lego/Lego-RL.git && cd Lego-RL
+git clone https://github.com/LegoX/Lego-RL.git && cd Lego-RL
+bash scripts/setup_env.sh                                          # pinned upstreams + self-contained venv
 
-bash scripts/setup_env.sh                                       # 1. build the venv        (once per machine)
-cp scripts/lib/site.example.env scripts/lib/site.env            # 2. describe the cluster  (once per cluster)
-cp scripts/train/_template.env scripts/train/configs/mine.env   # 3. copy a template, fill the CHANGEME lines
-
-PREFLIGHT_ONLY=1 bash scripts/train/train.sh train/configs/mine.env   # 4. validate — launches nothing
-                 bash scripts/train/train.sh train/configs/mine.env   # 5. launch
+cp scripts/train/examples/demo.env scripts/train/configs/demo.env
+$EDITOR scripts/train/configs/demo.env                             # fill the CHANGEME values:
+                                                                   #   checkpoint, train/val index, kubeconfig
+PREFLIGHT_ONLY=1 bash scripts/train/train.sh scripts/train/configs/demo.env   # validate
+bash scripts/train/train.sh scripts/train/configs/demo.env                   # launch
 ```
 
-Replace `train` with `eval` (score a checkpoint) or `infer` (batch trajectory generation).
-You need 8× A100/H100-class GPUs on the training node, a sandbox backend (a reachable Kubernetes
-cluster, or a Docker daemon), [uv](https://docs.astral.sh/uv/), a policy checkpoint, and task images
-your cluster can pull.
+Needs 8× A100/H100-class GPUs, [uv](https://docs.astral.sh/uv/), a policy checkpoint, two task
+indexes, and a reachable Kubernetes cluster (`BACKEND=docker` drives one machine's daemon instead).
+The validate step launches nothing. In Claude Code the same run is `/rl:run scripts/train/configs/demo.env`.
 
 > [!IMPORTANT]
-> `setup_env.sh` clones the pinned upstreams: verl [`Elvin-Yiming-Du/verl`](https://github.com/Elvin-Yiming-Du/verl)
-> @ `ydu/merge-yt-20260729` (verl `0.8.0`) — public, and carrying the VeOmni router-replay, R3 and
-> fully-async fixes this repo depends on — and Harbor [`SWE-Lego/harbor`](https://github.com/SWE-Lego/harbor)
-> @ `ydu_dev` (harbor `0.3.1`). **Harbor's `ydu_dev` is not public yet**, so that clone fails without
-> access; `HARBOR_REF=main` gets vanilla upstream (`0.1.45`) and works for everyone, minus the
-> per-phase network-policy framework, the OpenHands-SDK 1.33 runtime, the OpenSWE adapter and the
-> git-history restore hook. Every URL, ref and path is overridable, and no manual patch application
-> is required.
-
-**Quickstart:**
-
-- [Installation](https://lego-rl.pages.dev/docs/getting-started/installation)
-- [Quickstart](https://lego-rl.pages.dev/docs/getting-started/quickstart)
-- [Your first training run](https://lego-rl.pages.dev/docs/getting-started/first-training-run)
-- [Compatibility matrix](https://lego-rl.pages.dev/docs/reference/compatibility) — agents, backends, models
-
-**Running a full loop step-by-step:**
-
-- [Prepare a task set](https://lego-rl.pages.dev/docs/data)
-- [Validate the run](https://lego-rl.pages.dev/docs/run-validation)
-- [Train](https://lego-rl.pages.dev/docs/training-run/training) · [Scale out](https://lego-rl.pages.dev/docs/training-run/scaling) · [Evaluate](https://lego-rl.pages.dev/docs/training-run/eval)
-- [Dashboard and artifacts](https://lego-rl.pages.dev/docs/dashboard)
-
-**Concepts and reference:**
-
-- [Block design](https://lego-rl.pages.dev/docs/architecture) — agent loop workers, in-process proxy, rollouter, trainer, environment
-- [Core concepts](https://lego-rl.pages.dev/docs/core-concepts) · [Configuration reference](https://lego-rl.pages.dev/docs/reference/configuration) · [`scripts/README.md`](scripts/README.md) for the runner axes
-- [Failure playbook](https://lego-rl.pages.dev/docs/troubleshooting) · [Q&A](https://lego-rl.pages.dev/docs/qa)
-- [Engineering notes](https://lego-rl.pages.dev/docs/engineering-notes) — deep dives from real runs
+> `setup_env.sh` clones Harbor [`SWE-Lego/harbor`](https://github.com/SWE-Lego/harbor) @ `ydu_dev`
+> (harbor `0.3.1`), which **is not public yet**, so that clone fails without access. `HARBOR_REF=main`
+> gets vanilla upstream (`0.1.45`) and works for everyone, minus the per-phase network-policy
+> framework, the OpenHands-SDK 1.33 runtime, the OpenSWE adapter and the git-history restore hook.
 
 ## License
 
