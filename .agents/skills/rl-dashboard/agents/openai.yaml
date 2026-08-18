@@ -1,0 +1,4 @@
+interface:
+  display_name: "RL Dashboard"
+  short_description: "Start or diagnose the Lego-RL webui"
+  default_prompt: "Use $rl-dashboard to bring up the Lego-RL dashboard and report the URL."

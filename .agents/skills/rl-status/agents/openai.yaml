@@ -1,0 +1,4 @@
+interface:
+  display_name: "RL Status"
+  short_description: "Diagnose live Lego-RL run health"
+  default_prompt: "Use $rl-status to diagnose the current Lego-RL run and summarize its health."

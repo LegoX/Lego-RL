@@ -1,6 +1,6 @@
 ---
 name: lego-rl-config
-description: Compose, edit, refactor, and validate Lego-RL train/eval/infer .env configs and reusable scripts/templates modules. Use when Codex is asked to generate an experiment config, migrate legacy wrappers into configs, edit template modules, dry-run a train/eval/infer workload, or explain the runner/template/site-env contract for this repository.
+description: Compose, edit, refactor, and validate Lego-RL train/eval/infer .env configs and reusable scripts/templates modules. Use when Codex is asked to generate an experiment config, migrate legacy wrappers into configs, edit template modules, dry-run a train/eval/infer workload for config validation, or explain the runner/template/site-env contract. For Claude-style operational commands use the one-to-one Codex counterparts $rl-check, $rl-run, $rl-status, $rl-dashboard, and $rl-k8s-sandbox-install.
 ---
 
 # Lego-RL Config
@@ -13,6 +13,17 @@ This skill follows the Claude `/rl:*` plugin's layering rule:
 
 > Scripts own deterministic behavior. Skills own orchestration, judgement, and
 > the final report.
+
+## Related Operational Skills
+
+Use this skill for config and template work. Use the one-to-one Codex
+counterparts for Claude plugin operations:
+
+- `$rl-check` for `/rl:check`
+- `$rl-run` for `/rl:run`
+- `$rl-status` for `/rl:status`
+- `$rl-dashboard` for `/rl:dashboard`
+- `$rl-k8s-sandbox-install` for `/rl:k8s-sandbox-install`
 
 ## Start Here
 
