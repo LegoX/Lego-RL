@@ -16,7 +16,7 @@
 </div>
 
 Lego-RL is an open-source framework for reinforcement learning of **coding agents in their own
-harnesses**. It connects agents such as **OpenHands**, **Claude Code**, **OpenCode** and **Terminus**
+harnesses**. It connects agents such as **OpenHands**, **Claude Code** and **OpenCode**
 to scalable policy-gradient training (PPO / GRPO / GSPO) while preserving their original control flow
 and their exact rollout trajectories.
 
@@ -44,18 +44,11 @@ Lego-RL is **production-ready** with:
 
 ## News
 
-- [2026/08] The framework is renamed **Lego-RL** (formerly SWE-Lego-RL / LiveRL), with a new documentation site at [lego-rl.pages.dev](https://lego-rl.pages.dev) restructured around the five-stage closed-loop workflow.
-- [2026/08] **Difficulty-filtered task sets**: build a training set from measured per-task solve rates instead of a raw task dump — see [Difficulty Filtering](https://lego-rl.pages.dev/docs/data/difficulty-filtering).
-- [2026/07] **Anti-reward-hacking is default-on**: per-phase iptables egress isolation plus a single-commit git-history rebuild, so the agent cannot fetch or `git log` its way to the gold fix while the verifier still grades correctly ([Reward Hacking](https://lego-rl.pages.dev/docs/reference/reward-hacking)).
-- [2026/07] **Runner + config layout**: one runner per stage (`train` / `infer` / `eval`) driven by a per-run `.env`, with a preflight [run validation](https://lego-rl.pages.dev/docs/run-validation) that catches broken configs before the cluster is touched.
-- [2026/07] **Session-level scheduling** in the in-process proxy: KV-pressure-aware admission and sticky routing keep long multi-turn agent sessions on a warm prefix cache.
-- [2026/07] **nydus image cache** for sandbox cold starts — lazily-loaded images cut the long tail of pod startup on large SWE task images.
-- [2026/06] **R3 expert-routing replay** on both VeOmni and FSDP raises MoE routing coverage 24% → 100%, and a **VeOmni hybrid engine** brings Qwen3.5 (linear-attention MoE) into the loop.
-- [2026/05] **OpenCode** and **Terminus 2** join Claude Code and OpenHands; the **web dashboard** ships with trajectory viewing, run comparison and chart export; **fully-async** (FSDP / Megatron) training lands.
+- [2026/08] **First public release.** Lego-RL trains real coding agents — OpenHands, Claude Code, OpenCode — in their own unmodified harnesses on real repositories: token ids, masks and log-probabilities are captured inside the serving path by an in-process proxy, and the reward is each task's own test suite run in a fresh sandbox. Kubernetes (thousands of task containers per run) or plain Docker, synchronous or fully-async.
 
 ## Key Features
 
-- **Agents**: OpenHands (`openhands-sdk` / `openhands-ai`), Claude Code, OpenCode, Terminus 2 — all driving the *same* model being trained. Any harness speaking the OpenAI or Anthropic API can be added as a [custom adapter](https://lego-rl.pages.dev/docs/architecture/agent-loop-workers#agent-loop-classes).
+- **Agents**: OpenHands (`openhands-sdk` / `openhands-ai`), Claude Code, OpenCode — all driving the *same* model being trained. Any harness speaking the OpenAI or Anthropic API can be added as a [custom adapter](https://lego-rl.pages.dev/docs/architecture/agent-loop-workers#agent-loop-classes).
 - **Algorithms**: PPO, GRPO, GSPO, with token-level / sequence-level importance sampling, adaptive KL, and trajectory filtering by `termination_reason` (broken or over-long trajectories are dropped from the *loss*, not the batch).
 - **Training backends**: FSDP, Megatron-LM and **VeOmni**; synchronous single- and multi-node, or **fully-async** with partial rollout and staleness control.
 - **Rollout**: vLLM behind an [in-process proxy](https://lego-rl.pages.dev/docs/architecture/in-process-proxy) serving both the OpenAI and Anthropic `/v1/messages` surfaces, with exact token/logprob capture, prefix-mismatch recovery for harnesses that rewrite their own history, and a [global load balancer](https://lego-rl.pages.dev/docs/architecture/global-load-balancer) with sticky session routing.
@@ -107,5 +100,5 @@ Built on [verl](https://github.com/verl-project/verl) for RL training and
 [Harbor](https://github.com/SWE-Lego/harbor) for sandboxed task execution and verifier rewards.
 Coding agents: [Claude Code](https://github.com/anthropics/claude-code),
 [OpenHands](https://github.com/All-Hands-AI/OpenHands),
-[OpenCode](https://github.com/sst/opencode), and Terminus.
+and [OpenCode](https://github.com/sst/opencode).
 </content>
