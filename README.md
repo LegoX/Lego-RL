@@ -17,9 +17,8 @@
 </div>
 
 Lego-RL is an open-source framework for training coding agents with online reinforcement learning on
-real software-engineering tasks. It connects **Claude Code**, **OpenHands**, **OpenCode**, and
-**Terminus** to [verl](https://github.com/verl-project/verl) while keeping each agent's native
-control flow.
+real software-engineering tasks. It connects **Claude Code**, **OpenHands**, and **OpenCode** to
+[verl](https://github.com/verl-project/verl) while keeping each agent's native control flow.
 
 Each run follows the same loop: an agent works on a repository task in a fresh
 [Harbor](https://github.com/LegoX/harbor) sandbox, the task's verifier supplies the reward, and verl
@@ -48,14 +47,14 @@ from a fully asynchronous OpenCode training run.
 
 ## News
 
-- [2026/08] **First public release.** Lego-RL brings Claude Code, OpenHands, OpenCode, and Terminus
-  into online RL on real repositories, with native harnesses, executable verifier rewards,
-  synchronous or asynchronous training, and live run monitoring.
+- [2026/08] **First public release.** Lego-RL brings Claude Code, OpenHands, and OpenCode into
+  online RL on real repositories, with native harnesses, executable verifier rewards, synchronous
+  or asynchronous training, and live run monitoring.
 
 ## Key Features
 
-- **Native agents**: Claude Code, OpenHands, OpenCode, and Terminus run through thin adapters. A
-  custom scaffold that speaks the OpenAI or Anthropic API can use the same [agent-loop interface](https://lego-rl.pages.dev/docs/architecture/agent-loop-workers#agent-loop-classes).
+- **Native agents**: Claude Code, OpenHands, and OpenCode run through thin adapters. A custom
+  scaffold that speaks the OpenAI or Anthropic API can use the same [agent-loop interface](https://lego-rl.pages.dev/docs/architecture/agent-loop-workers#agent-loop-classes).
 - **Faithful rollouts**: an [in-process proxy](https://lego-rl.pages.dev/docs/architecture/in-process-proxy)
   records token ids, masks, and log-probabilities at generation time. It also handles history
   rewrites and serves the OpenAI and Anthropic interfaces used by the supported agents.
