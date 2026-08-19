@@ -67,6 +67,37 @@ npm run dev
 
 The dev frontend runs at `http://localhost:3000`.
 
+## Static Export
+
+Publish one run as a self-contained page with no backend — for a public demo,
+or to hand someone a training incident they can inspect without cluster access.
+
+```bash
+# 1. serve the run locally
+python server.py --port 8123 --log-dir ../logs --static-dir dist
+
+# 2. build, then export that run into the same dist/
+npx vite build
+python export_static.py --run <run-id> --out dist
+
+# 3. dist/ now works on any static host
+npx serve dist
+```
+
+`export_static.py` replays the run's read-only GET endpoints against the live
+server and writes each response to `dist/data/<slug>.json`. On load,
+`src/staticMode.ts` finds `data/manifest.json` and routes `/api/...` to those
+files, so all ~15 panel fetch sites are untouched and one build serves both
+modes — with no `data/` directory the shim is a no-op and the app talks to
+`server.py` as usual.
+
+What the bundle does not carry: anything that mutates server state (snapshot
+ingest, AI-analysis generation) returns 405, and `Random Trial` re-requests the
+one trajectory frozen per step. `--max-steps` (default 60) samples evenly across
+a run's rollout-batch folders — a long run has thousands — and
+`--max-trajectories` (default 40) bounds the per-trial payloads, which dominate
+the size. A 130-step run exports to roughly 15 MB.
+
 ## Environment Variables
 
 | Variable | Default | Description |
