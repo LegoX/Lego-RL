@@ -33,7 +33,7 @@ HARBOR_DIR="${HARBOR_DIR:-$WORKSPACE_ROOT/harbor}"
 # exist, preflight aborts.
 VERL_DIR="${VERL_DIR:-$WORKSPACE_ROOT/verl-swe_agent_opd_dev}"
 
-HARBOR_REPO_URL="${HARBOR_REPO_URL:-https://github.com/SWE-Lego/harbor.git}"
+HARBOR_REPO_URL="${HARBOR_REPO_URL:-https://github.com/Elvin-Yiming-Du/harbor.git}"
 HARBOR_REF="${HARBOR_REF:-${HARBOR_COMMIT:-ydu_dev}}"
 
 # This verl fork is public and clones without credentials. It carries the VeOmni

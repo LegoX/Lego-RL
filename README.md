@@ -11,7 +11,7 @@
 [![LegoX](https://img.shields.io/badge/LegoX-legox.net-b3431f)](https://legox.net/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![verl](https://img.shields.io/badge/verl-Elvin--Yiming--Du%2Fverl-orange)](https://github.com/Elvin-Yiming-Du/verl)
-[![Harbor](https://img.shields.io/badge/built%20on-Harbor-8b5cf6)](https://github.com/LegoX/harbor)
+[![Harbor](https://img.shields.io/badge/Harbor-Elvin--Yiming--Du%2Fharbor-8b5cf6)](https://github.com/Elvin-Yiming-Du/harbor)
 
 **[Documentation](https://lego-rl.pages.dev)** · **[Getting Started](https://lego-rl.pages.dev/docs/getting-started)** · **[Why Lego-RL](https://lego-rl.pages.dev/docs/why-lego-rl)** · **[LegoX](https://legox.net/)**
 
@@ -22,7 +22,7 @@ real software-engineering tasks. It connects **Claude Code**, **OpenHands**, and
 [verl](https://github.com/verl-project/verl) while keeping each agent's native control flow.
 
 Each run follows the same loop: an agent works on a repository task in a fresh
-[Harbor](https://github.com/LegoX/harbor) sandbox, the task's verifier supplies the reward, and verl
+[Harbor](https://github.com/Elvin-Yiming-Du/harbor) sandbox, the task's verifier supplies the reward, and verl
 updates the policy from the captured trajectory.
 
 <div align="center">
@@ -91,12 +91,6 @@ Needs 8× A100/H100-class GPUs, [uv](https://docs.astral.sh/uv/), a policy check
 indexes, and a reachable Kubernetes cluster (`BACKEND=docker` drives one machine's daemon instead).
 The validate step launches nothing. In Claude Code the same run is `/rl:run scripts/train/configs/demo.env`.
 
-> [!IMPORTANT]
-> `setup_env.sh` clones Harbor [`LegoX/harbor`](https://github.com/LegoX/harbor) @ `ydu_dev`
-> (harbor `0.3.1`), which **is not public yet**, so that clone fails without access. `HARBOR_REF=main`
-> gets vanilla upstream (`0.1.45`) and works for everyone, minus the per-phase network-policy
-> framework, the OpenHands-SDK 1.33 runtime, the OpenSWE adapter and the git-history restore hook.
-
 ## Community
 
 Questions, run reports and contributions are welcome. Scan to join the WeChat group:
@@ -112,7 +106,7 @@ Questions, run reports and contributions are welcome. Scan to join the WeChat gr
 ## Acknowledgement
 
 Built on [verl](https://github.com/verl-project/verl) for RL training and
-[Harbor](https://github.com/LegoX/harbor) for sandboxed task execution and verifier rewards.
+[Harbor](https://github.com/Elvin-Yiming-Du/harbor) for sandboxed task execution and verifier rewards.
 Coding agents: [Claude Code](https://github.com/anthropics/claude-code),
 [OpenHands](https://github.com/All-Hands-AI/OpenHands),
 and [OpenCode](https://github.com/sst/opencode).
