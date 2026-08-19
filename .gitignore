@@ -163,6 +163,9 @@ scripts/lib/.secrets.sh
 # TypeScript incremental build cache
 *.tsbuildinfo
 
+# Cloudflare Wrangler local build cache (docs / dashboard deploy)
+.wrangler/
+
 # Ad-hoc backups (dist.bak-*, *.bak-<timestamp>, *.bak) — never artifacts to track
 *.bak
 *.bak-*

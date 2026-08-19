@@ -99,7 +99,13 @@ append_common_hydra_args() {
     fi
     add algorithm.use_kl_in_reward "$USE_KL_IN_REWARD"
 
-    add data.gen_batch_size "$GEN_PROMPT_BSZ"
+    # data.gen_batch_size and the top-level rollout.* group exist only in
+    # lego_rl_fully_async_*.yaml. lego_rl_sync.yaml derives from ppo_trainer,
+    # which has neither, so emitting them in sync mode makes Hydra abort with
+    # "Could not override ... No match in the config".
+    if [ "$TRAINING_MODE" = async ]; then
+        add data.gen_batch_size "$GEN_PROMPT_BSZ"
+    fi
     add data.max_prompt_length "$MAX_PROMPT"
     add data.max_response_length "$MAX_RESP"
     add data.prompt_key "$PROMPT_KEY"
@@ -110,9 +116,11 @@ append_common_hydra_args() {
     add data.val_files "$VAL_FILES"
     add_if_set data.val_batch_size VAL_BSZ
 
-    add rollout.n_gpus_per_node "$ROLLOUT_N_GPUS_PER_NODE"
-    add rollout.nnodes "$ROLLOUT_NNODES"
-    add_if_set rollout.total_rollout_steps TOTAL_ROLLOUT_STEPS
+    if [ "$TRAINING_MODE" = async ]; then
+        add rollout.n_gpus_per_node "$ROLLOUT_N_GPUS_PER_NODE"
+        add rollout.nnodes "$ROLLOUT_NNODES"
+        add_if_set rollout.total_rollout_steps TOTAL_ROLLOUT_STEPS
+    fi
 
     add trainer.experiment_name "$exp_name"
     add trainer.logger "$TRAINER_LOGGER"
