@@ -43,6 +43,18 @@ Lego-RL is **production-ready** with:
  <img src="docs/public/framework.png" width="820" alt="Lego-RL architecture">
 </div>
 
+## Live Training Dashboard
+
+Lego-RL includes a self-contained [training dashboard](https://lego-rl.pages.dev/docs/dashboard) for monitoring reward and score, entropy, KL, clip fraction, sequence lengths, MFU, throughput, asynchronous rollout health, and validation throughout an RL run. It can read local training logs directly or load metrics from Weights & Biases, with side-by-side run comparison and per-task solve-rate views.
+
+The trajectory browser connects aggregate metrics back to individual Harbor trials, including the problem statement, agent reasoning, tool calls and observations, token usage, timing, termination status, and verifier reward.
+
+```bash
+bash webui/start_dashboard.sh
+```
+
+See an [example training diagnostic report](webui/demo_reports/harbor-oc-async-2n-20260526-232411.md) generated from a fully asynchronous OpenCode training run.
+
 ## News
 
 - [2026/08] **First public release.** Lego-RL trains real coding agents — OpenHands, Claude Code, OpenCode — in their own unmodified harnesses on real repositories: token ids, masks and log-probabilities are captured inside the serving path by an in-process proxy, and the reward is each task's own test suite run in a fresh sandbox. Kubernetes (thousands of task containers per run) or plain Docker, synchronous or fully-async.
