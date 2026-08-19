@@ -110,4 +110,17 @@ Built on [verl](https://github.com/verl-project/verl) for RL training and
 Coding agents: [Claude Code](https://github.com/anthropics/claude-code),
 [OpenHands](https://github.com/All-Hands-AI/OpenHands),
 and [OpenCode](https://github.com/sst/opencode).
-</content>
+
+## Citation
+
+```bibtex
+@misc{du2026legorlharnessnativereinforcementlearning,
+  title={LEGO-RL: Harness-Native Reinforcement Learning for Coding Agents},
+  author={Yiming Du and Yuxin Jiang and Tao Yuan and Jianbo Dai and Shaowei Wang and Jierun Chen and Chaofan Tao and Xianzhi Yu and Lifeng Shang and Kam-Fai Wong and Xiaohui Li and Haoli Bai},
+  year={2026},
+  eprint={2608.17393},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2608.17393},
+}
+```
