@@ -10,7 +10,7 @@
 [![Docs](https://img.shields.io/badge/docs-lego--rl.pages.dev-2563eb?logo=readthedocs&logoColor=white)](https://lego-rl.pages.dev)
 [![LegoX](https://img.shields.io/badge/LegoX-legox.net-b3431f)](https://legox.net/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![verl](https://img.shields.io/badge/built%20on-verl-orange)](https://github.com/verl-project/verl)
+[![verl](https://img.shields.io/badge/verl-Elvin--Yiming--Du%2Fverl-orange)](https://github.com/Elvin-Yiming-Du/verl)
 [![Harbor](https://img.shields.io/badge/built%20on-Harbor-8b5cf6)](https://github.com/LegoX/harbor)
 
 **[Documentation](https://lego-rl.pages.dev)** · **[Getting Started](https://lego-rl.pages.dev/docs/getting-started)** · **[Why Lego-RL](https://lego-rl.pages.dev/docs/why-lego-rl)** · **[LegoX](https://legox.net/)**

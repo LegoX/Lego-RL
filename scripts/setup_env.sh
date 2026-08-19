@@ -36,9 +36,9 @@ VERL_DIR="${VERL_DIR:-$WORKSPACE_ROOT/verl-swe_agent_opd_dev}"
 HARBOR_REPO_URL="${HARBOR_REPO_URL:-https://github.com/SWE-Lego/harbor.git}"
 HARBOR_REF="${HARBOR_REF:-${HARBOR_COMMIT:-ydu_dev}}"
 
-# ⚠ This verl fork is NOT public yet: the clone below fails without access. It carries the
-# VeOmni router-replay, R3 and fully-async fixes this repo depends on. Until it is published,
-# override both variables — upstream verl 0.8.0 runs the synchronous path but not those features:
+# This verl fork is public and clones without credentials. It carries the VeOmni
+# router-replay, R3 and fully-async fixes this repo depends on; upstream verl 0.8.0
+# runs the synchronous path but none of them:
 #   VERL_REPO_URL=https://github.com/verl-project/verl.git VERL_REF=v0.8.0 bash scripts/setup_env.sh
 VERL_REPO_URL="${VERL_REPO_URL:-https://github.com/Elvin-Yiming-Du/verl.git}"
 # This is the tree training actually loads (NEW_VERL_DIR in scripts/lib/common_env.sh).
