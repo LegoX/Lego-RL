@@ -8,11 +8,12 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2608.17393-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.17393)
 [![Docs](https://img.shields.io/badge/docs-lego--rl.pages.dev-2563eb?logo=readthedocs&logoColor=white)](https://lego-rl.pages.dev)
+[![LegoX](https://img.shields.io/badge/LegoX-legox.net-b3431f)](https://legox.net/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![verl](https://img.shields.io/badge/built%20on-verl-orange)](https://github.com/verl-project/verl)
 [![Harbor](https://img.shields.io/badge/built%20on-Harbor-8b5cf6)](https://github.com/LegoX/harbor)
 
-**[Documentation](https://lego-rl.pages.dev)** · **[Getting Started](https://lego-rl.pages.dev/docs/getting-started)** · **[Why Lego-RL](https://lego-rl.pages.dev/docs/why-lego-rl)**
+**[Documentation](https://lego-rl.pages.dev)** · **[Getting Started](https://lego-rl.pages.dev/docs/getting-started)** · **[Why Lego-RL](https://lego-rl.pages.dev/docs/why-lego-rl)** · **[LegoX](https://legox.net/)**
 
 </div>
 
@@ -30,20 +31,16 @@ updates the policy from the captured trajectory.
 
 ## Live Training Dashboard
 
-Lego-RL includes a self-contained [training dashboard](https://lego-rl.pages.dev/docs/dashboard) for
-following a run as it progresses. It shows reward, score, entropy, KL, sequence lengths, MFU,
-throughput, asynchronous rollout health, validation, and per-task solve rates. The dashboard reads
-local training logs and can also load runs from Weights & Biases.
+<div align="center">
+ <img src="docs/public/dashboard.png" width="900" alt="Lego-RL training dashboard — per-task solve-rate grid">
+</div>
 
-Its trajectory browser links these metrics to individual Harbor trials, including the task,
-reasoning, tool calls, observations, token usage, timing, termination status, and verifier reward.
+Every run is followed live, down to the individual trial —
+see the **[dashboard docs](https://lego-rl.pages.dev/docs/dashboard)**.
 
 ```bash
 bash webui/start_dashboard.sh
 ```
-
-See an [example training diagnostic report](webui/demo_reports/harbor-oc-async-2n-20260526-232411.md)
-from a fully asynchronous OpenCode training run.
 
 ## News
 
@@ -99,6 +96,14 @@ The validate step launches nothing. In Claude Code the same run is `/rl:run scri
 > (harbor `0.3.1`), which **is not public yet**, so that clone fails without access. `HARBOR_REF=main`
 > gets vanilla upstream (`0.1.45`) and works for everyone, minus the per-phase network-policy
 > framework, the OpenHands-SDK 1.33 runtime, the OpenSWE adapter and the git-history restore hook.
+
+## Community
+
+Questions, run reports and contributions are welcome. Scan to join the WeChat group:
+
+<div align="center">
+ <img src="docs/public/wechat-group.jpg" width="220" alt="Lego-RL WeChat group">
+</div>
 
 ## License
 
