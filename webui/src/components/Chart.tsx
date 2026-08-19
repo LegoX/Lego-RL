@@ -16,14 +16,14 @@ import type { MetricPoint } from "../types";
 import { downloadSvgAsPng, downloadCsv } from "../utils/chartExport";
 
 const COLORS = [
-  "#6366f1",
-  "#10b981",
-  "#f59e0b",
-  "#f43f5e",
-  "#8b5cf6",
-  "#06b6d4",
-  "#ec4899",
-  "#84cc16",
+  "#c96a45",
+  "#4a9440",
+  "#e0a01a",
+  "#d03b3b",
+  "#7a6ddb",
+  "#199e70",
+  "#b8506e",
+  "#8aa02a",
 ];
 
 interface ChartPanelProps {
@@ -311,7 +311,7 @@ export default function ChartPanel({
           <Tooltip content={<CustomTooltip />} />
           {available.length > 1 && (
             <Legend
-              wrapperStyle={{ fontSize: 11, color: "#94a3b8" }}
+              wrapperStyle={{ fontSize: 11, color: "#a9a297" }}
               iconType="plainline"
             />
           )}
@@ -385,7 +385,7 @@ export function MinMaxChart({
   meanKey,
   maxKey,
   minKey,
-  color = "#6366f1",
+  color = "#c96a45",
   height = 260,
 }: MultiStatChartProps) {
   const [yMode, setYMode] = useState<YAxisMode>("auto");
@@ -498,7 +498,7 @@ export function MinMaxChart({
             />
           )}
           <Legend
-            wrapperStyle={{ fontSize: 11, color: "#94a3b8" }}
+            wrapperStyle={{ fontSize: 11, color: "#a9a297" }}
             iconType="plainline"
           />
         </ComposedChart>

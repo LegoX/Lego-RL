@@ -44,7 +44,7 @@ export default function SequencePanel({ data }: Props) {
             title="Output per TURN (verbosity drift) — response_length/mean ÷ num_turns/mean"
             data={derived}
             keys={[PER_TURN, "num_turns/mean"]}
-            colors={["#f59e0b", "#06b6d4"]}
+            colors={["#e0a01a", "#199e70"]}
             showArea
           />
           <p className="text-[11px] text-slate-500 mt-1.5 leading-relaxed">
@@ -65,7 +65,7 @@ export default function SequencePanel({ data }: Props) {
           meanKey="response_length/mean"
           maxKey="response_length/max"
           minKey="response_length/min"
-          color="#6366f1"
+          color="#c96a45"
         />
         <MinMaxChart
           title="Prompt Length"
@@ -73,20 +73,20 @@ export default function SequencePanel({ data }: Props) {
           meanKey="prompt_length/mean"
           maxKey="prompt_length/max"
           minKey="prompt_length/min"
-          color="#06b6d4"
+          color="#199e70"
         />
         <ChartPanel
           title="Clip Ratio (Truncation Rate)"
           data={data}
           keys={["response_length/clip_ratio", "prompt_length/clip_ratio"]}
-          colors={["#f43f5e", "#f59e0b"]}
+          colors={["#d03b3b", "#e0a01a"]}
           yAxisLabel="ratio"
         />
         <ChartPanel
           title="Aborted Responses"
           data={data}
           keys={["response/aborted_ratio"]}
-          colors={["#ef4444"]}
+          colors={["#c73434"]}
           yAxisLabel="ratio"
           showArea
         />
@@ -96,7 +96,7 @@ export default function SequencePanel({ data }: Props) {
           meanKey="response_length_non_aborted/mean"
           maxKey="response_length_non_aborted/max"
           minKey="response_length_non_aborted/min"
-          color="#8b5cf6"
+          color="#7a6ddb"
         />
         <ChartPanel
           title="Sequence Balance (global_seqlen)"
@@ -106,7 +106,7 @@ export default function SequencePanel({ data }: Props) {
             "global_seqlen/balanced_min",
             "global_seqlen/balanced_max",
           ]}
-          colors={["#10b981", "#6ee7b7", "#059669"]}
+          colors={["#4a9440", "#9ccb8e", "#3f8f2f"]}
         />
       </div>
     </div>

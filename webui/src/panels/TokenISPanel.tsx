@@ -49,7 +49,7 @@ const LIVE_GROUPS: {
     title: "Rollout↔Actor prob agreement (pearson)",
     desc: "Correlation between training-policy and rollout-policy token probs. →1 = they match (healthy). Same as the snapshot per-token pearson, per step.",
     keys: ["training/rollout_actor_probs_pearson_corr"],
-    colors: ["#10b981"],
+    colors: ["#4a9440"],
   },
   {
     title: "Rollout vs training prob diff",
@@ -59,19 +59,19 @@ const LIVE_GROUPS: {
       "training/rollout_probs_diff_std",
       "training/rollout_probs_diff_max",
     ],
-    colors: ["#6366f1", "#818cf8", "#a5b4fc"],
+    colors: ["#c96a45", "#dd8a63", "#efa07c"],
   },
   {
     title: "Rollout-correction KL",
     desc: "KL divergence between rollout and training policy. →0 = on-policy. Rising = staleness/mismatch.",
     keys: ["rollout_corr/kl", "rollout_corr/k3_kl"],
-    colors: ["#f43f5e", "#fb7185"],
+    colors: ["#d03b3b", "#e07070"],
   },
   {
     title: "Chi² (ESS proxy)",
     desc: "Chi-square divergence; effective sample size ≈ N/(1+chi²). High = IS weights skewed, gradient starved.",
     keys: ["rollout_corr/chi2_token", "rollout_corr/chi2_seq"],
-    colors: ["#06b6d4", "#0891b2"],
+    colors: ["#199e70", "#147f5c"],
   },
   {
     title: "Log-perplexity diff (percentiles)",
@@ -81,25 +81,25 @@ const LIVE_GROUPS: {
       "rollout_corr/log_ppl_diff_p90",
       "rollout_corr/log_ppl_diff_p99",
     ],
-    colors: ["#8b5cf6", "#c4b5fd", "#7c3aed"],
+    colors: ["#7a6ddb", "#b3aae8", "#5a4bc0"],
   },
   {
     title: "Fraction of badly-mismatched tokens",
     desc: "Share of tokens whose log-ppl diff exceeds 1 / 2 nats. Watch these grow when training destabilizes.",
     keys: ["rollout_corr/log_ppl_diff_gt1_frac", "rollout_corr/log_ppl_diff_gt2_frac"],
-    colors: ["#f59e0b", "#ef4444"],
+    colors: ["#e0a01a", "#c73434"],
   },
   {
     title: "Rollout vs training perplexity",
     desc: "Absolute perplexity of each engine on the same tokens; a persistent gap = engine/precision mismatch.",
     keys: ["rollout_corr/rollout_log_ppl", "rollout_corr/training_log_ppl"],
-    colors: ["#22d3ee", "#fbbf24"],
+    colors: ["#3fb98c", "#fab219"],
   },
   {
     title: "PPO KL & clip fraction",
     desc: "Policy-update KL and how often the PPO ratio is clipped. Large = aggressive/off-policy updates.",
     keys: ["actor/ppo_kl", "actor/pg_clipfrac"],
-    colors: ["#ec4899", "#f59e0b"],
+    colors: ["#b8506e", "#e0a01a"],
   },
 ];
 
@@ -150,7 +150,7 @@ function Histogram({ hist }: { hist: TokenStats["global"]["hist"] }) {
               className="flex-1"
               style={{
                 height: `${Math.max(h, c > 0 ? 1.5 : 0)}%`,
-                background: isOverflow ? "#f43f5e" : near0 ? "#10b981" : "#6366f1",
+                background: isOverflow ? "#d03b3b" : near0 ? "#4a9440" : "#c96a45",
               }}
               title={`log-ratio ≈ ${center.toFixed(2)}${isOverflow ? " (overflow)" : ""}\n${c.toLocaleString()} tokens`}
             />
@@ -184,12 +184,12 @@ function Trace({ series }: { series: number[] }) {
     .join(" ");
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 120 }}>
-      <line x1="0" y1={H / 2} x2={W} y2={H / 2} stroke="#475569" strokeWidth="0.5" />
-      <polyline points={pts} fill="none" stroke="#6366f1" strokeWidth="1" />
-      <text x="2" y="10" fill="#64748b" fontSize="9">
+      <line x1="0" y1={H / 2} x2={W} y2={H / 2} stroke="#514740" strokeWidth="0.5" />
+      <polyline points={pts} fill="none" stroke="#c96a45" strokeWidth="1" />
+      <text x="2" y="10" fill="#8a847a" fontSize="9">
         +{max.toFixed(2)}
       </text>
-      <text x="2" y={H - 3} fill="#64748b" fontSize="9">
+      <text x="2" y={H - 3} fill="#8a847a" fontSize="9">
         −{max.toFixed(2)}
       </text>
     </svg>

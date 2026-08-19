@@ -122,15 +122,21 @@ function RunSelector({
 
 type Theme = "dark" | "light";
 
+// Deliberately not the old "harbor-theme" key. Every previous visitor has "dark"
+// written there (the effect below persists on first paint, so nobody has an
+// unset value), which would silently pin them to the old default forever. A new
+// key resets everyone to light once, and still remembers their choice after.
+const THEME_KEY = "lego-rl-theme";
+
 function useTheme() {
   const [theme, setTheme] = useState<Theme>(() => {
-    const saved = localStorage.getItem("harbor-theme");
-    return saved === "light" ? "light" : "dark";
+    const saved = localStorage.getItem(THEME_KEY);
+    return saved === "dark" ? "dark" : "light";
   });
 
   useEffect(() => {
     document.body.setAttribute("data-theme", theme);
-    localStorage.setItem("harbor-theme", theme);
+    localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
   const toggle = useCallback(() => {

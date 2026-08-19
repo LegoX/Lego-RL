@@ -34,28 +34,28 @@ export default function ValidationPanel({ data, runId, onOpenTrajectory }: Props
           metricKey={VAL_LOG_KEY}
           data={data}
           format="percent"
-          color="#10b981"
+          color="#4a9440"
         />
         <MetricCard
           label="Val Turns (mean)"
           metricKey="val-aux/num_turns/mean"
           data={data}
           format="number"
-          color="#06b6d4"
+          color="#199e70"
         />
         <MetricCard
           label="Val Turns (min)"
           metricKey="val-aux/num_turns/min"
           data={data}
           format="int"
-          color="#8b5cf6"
+          color="#7a6ddb"
         />
         <MetricCard
           label="Val Turns (max)"
           metricKey="val-aux/num_turns/max"
           data={data}
           format="int"
-          color="#f59e0b"
+          color="#e0a01a"
         />
       </div>
 
@@ -64,7 +64,7 @@ export default function ValidationPanel({ data, runId, onOpenTrajectory }: Props
           title="Validation Reward"
           data={data}
           keys={[VAL_LOG_KEY]}
-          colors={["#10b981"]}
+          colors={["#4a9440"]}
           showArea
         />
         <ChartPanel
@@ -75,13 +75,13 @@ export default function ValidationPanel({ data, runId, onOpenTrajectory }: Props
             "val-aux/num_turns/max",
             "val-aux/num_turns/min",
           ]}
-          colors={["#06b6d4", "#7dd3fc", "#0e7490"]}
+          colors={["#199e70", "#f5c9b4", "#10684b"]}
         />
         <ChartPanel
           title="Validation Time"
           data={data}
           keys={["rollouter/validate_time"]}
-          colors={["#f43f5e"]}
+          colors={["#d03b3b"]}
           yAxisLabel="seconds"
         />
       </div>

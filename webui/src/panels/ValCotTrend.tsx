@@ -188,17 +188,17 @@ export default function ValCotTrend({ runId }: Props) {
             <svg viewBox={`0 0 ${W} ${H}`} className="w-full min-w-[520px]">
               {ticks.map((v) => (
                 <g key={v}>
-                  <line x1={PL} y1={y(v)} x2={W - PR} y2={y(v)} stroke="#1e293b" strokeWidth={1} />
-                  <text x={PL - 6} y={y(v)} fontSize={9} fill="#64748b" textAnchor="end" dominantBaseline="middle">
+                  <line x1={PL} y1={y(v)} x2={W - PR} y2={y(v)} stroke="#302a24" strokeWidth={1} />
+                  <text x={PL - 6} y={y(v)} fontSize={9} fill="#8a847a" textAnchor="end" dominantBaseline="middle">
                     {(v * 100).toFixed(0)}%
                   </text>
                 </g>
               ))}
               {pts.length > 1 && (
-                <polyline points={line("cot_ratio_weighted")} fill="none" stroke="#64748b" strokeWidth={1.5} strokeDasharray="5 4" />
+                <polyline points={line("cot_ratio_weighted")} fill="none" stroke="#8a847a" strokeWidth={1.5} strokeDasharray="5 4" />
               )}
               {pts.length > 1 && (
-                <polyline points={line("cot_ratio")} fill="none" stroke="#a78bfa" strokeWidth={2.5} />
+                <polyline points={line("cot_ratio")} fill="none" stroke="#9085e9" strokeWidth={2.5} />
               )}
               {pts.map((p, i) => (
                 <g key={p.step}>
@@ -206,8 +206,8 @@ export default function ValCotTrend({ runId }: Props) {
                     cx={x(i)}
                     cy={y(p.cot_ratio as number)}
                     r={p.coverage < 0.5 ? 5 : 4}
-                    fill={p.coverage < 0.5 ? "#f59e0b" : "#a78bfa"}
-                    stroke="#0f172a"
+                    fill={p.coverage < 0.5 ? "#e0a01a" : "#9085e9"}
+                    stroke="#1a1714"
                     strokeWidth={1.5}
                   >
                     <title>
@@ -216,15 +216,15 @@ export default function ValCotTrend({ runId }: Props) {
                       {`${p.n}/${data.cohort_size} tasks${p.coverage < 0.5 ? " (low coverage — indicative only)" : ""}`}
                     </title>
                   </circle>
-                  <text x={x(i)} y={y(p.cot_ratio as number) - 10} fontSize={9} fill="#c4b5fd" textAnchor="middle">
+                  <text x={x(i)} y={y(p.cot_ratio as number) - 10} fontSize={9} fill="#b3aae8" textAnchor="middle">
                     {(p.cot_ratio! * 100).toFixed(0)}
                   </text>
-                  <text x={x(i)} y={H - PB + 14} fontSize={9} fill="#64748b" textAnchor="middle">
+                  <text x={x(i)} y={H - PB + 14} fontSize={9} fill="#8a847a" textAnchor="middle">
                     {label(p)}
                   </text>
                 </g>
               ))}
-              <text x={PL} y={H - 4} fontSize={9} fill="#475569">
+              <text x={PL} y={H - 4} fontSize={9} fill="#514740">
                 trainer step
               </text>
             </svg>

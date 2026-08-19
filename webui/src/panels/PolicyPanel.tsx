@@ -19,39 +19,39 @@ export default function PolicyPanel({ data }: Props) {
           title="Policy Gradient Loss"
           data={data}
           keys={["actor/pg_loss", "actor/loss"]}
-          colors={["#f59e0b", "#f97316"]}
+          colors={["#e0a01a", "#e07a3c"]}
           showArea
         />
         <ChartPanel
           title="Entropy"
           data={data}
           keys={["actor/entropy"]}
-          colors={["#ec4899"]}
+          colors={["#b8506e"]}
           showArea
         />
         <ChartPanel
           title="KL Divergence"
           data={data}
           keys={["actor/ppo_kl", "actor/kl_loss"]}
-          colors={["#f43f5e", "#fb7185"]}
+          colors={["#d03b3b", "#e07070"]}
         />
         <ChartPanel
           title="Clip Fraction"
           data={data}
           keys={["actor/pg_clipfrac", "actor/pg_clipfrac_lower"]}
-          colors={["#f59e0b", "#fbbf24"]}
+          colors={["#e0a01a", "#fab219"]}
         />
         <ChartPanel
           title="Gradient Norm"
           data={data}
           keys={["actor/grad_norm"]}
-          colors={["#84cc16"]}
+          colors={["#8aa02a"]}
         />
         <ChartPanel
           title="Learning Rate"
           data={data}
           keys={["actor/lr"]}
-          colors={["#6366f1"]}
+          colors={["#c96a45"]}
         />
       </div>
     </div>

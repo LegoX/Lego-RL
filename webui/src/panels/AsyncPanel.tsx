@@ -25,13 +25,13 @@ export default function AsyncPanel({ data }: Props) {
             "fully_async/count/stale_trajectory_processed",
             "fully_async/count/dropped_stale_samples",
           ]}
-          colors={["#10b981", "#f59e0b", "#fb7185", "#f43f5e"]}
+          colors={["#4a9440", "#e0a01a", "#e07070", "#d03b3b"]}
         />
         <ChartPanel
           title="Param Version"
           data={data}
           keys={["fully_async/count/current_param_version"]}
-          colors={["#6366f1"]}
+          colors={["#c96a45"]}
           showArea
         />
         <ChartPanel
@@ -42,7 +42,7 @@ export default function AsyncPanel({ data }: Props) {
             "fully_async/monitor/queue/mq_queue_size",
             "fully_async/monitor/queue/pending_queue_size",
           ]}
-          colors={["#06b6d4", "#0891b2", "#f59e0b"]}
+          colors={["#199e70", "#147f5c", "#e0a01a"]}
         />
         <ChartPanel
           title="Processing Time (s)"
@@ -56,12 +56,12 @@ export default function AsyncPanel({ data }: Props) {
             "fully_async/processing_time/min",
           ]}
           colors={[
-            "#8b5cf6",
-            "#a78bfa",
-            "#c4b5fd",
-            "#7c3aed",
-            "#ddd6fe",
-            "#6d28d9",
+            "#7a6ddb",
+            "#9085e9",
+            "#b3aae8",
+            "#5a4bc0",
+            "#cfc8f0",
+            "#4a3aa7",
           ]}
         />
         <ChartPanel
@@ -71,7 +71,7 @@ export default function AsyncPanel({ data }: Props) {
             "fully_async/rollouter/idle_ratio",
             "fully_async/trainer/idle_ratio",
           ]}
-          colors={["#f43f5e", "#06b6d4"]}
+          colors={["#d03b3b", "#199e70"]}
         />
         <ChartPanel
           title="Rollouter & Wait Time (s)"
@@ -81,7 +81,7 @@ export default function AsyncPanel({ data }: Props) {
             "fully_async/rollouter/version_time",
             "fully_async/total_wait_time",
           ]}
-          colors={["#10b981", "#84cc16", "#f59e0b"]}
+          colors={["#4a9440", "#8aa02a", "#e0a01a"]}
         />
         <ChartPanel
           title="Partial Rollouts"
@@ -91,7 +91,7 @@ export default function AsyncPanel({ data }: Props) {
             "fully_async/partial/total_partial_num",
             "fully_async/partial/max_partial_span",
           ]}
-          colors={["#8b5cf6", "#06b6d4", "#f59e0b"]}
+          colors={["#7a6ddb", "#199e70", "#e0a01a"]}
         />
         <ChartPanel
           title="Static Config"
@@ -103,7 +103,7 @@ export default function AsyncPanel({ data }: Props) {
             "fully_async/static/max_queue_size",
             "fully_async/static/staleness_threshold",
           ]}
-          colors={["#6366f1", "#818cf8", "#10b981", "#06b6d4", "#f43f5e"]}
+          colors={["#c96a45", "#dd8a63", "#4a9440", "#199e70", "#d03b3b"]}
         />
       </div>
     </div>

@@ -34,14 +34,14 @@ export default function FilterPanel({ data }: Props) {
           title="Dropped (invalid) ratio — fraction of batch excluded from loss"
           data={data}
           keys={["trajectory_filter/invalid_ratio"]}
-          colors={["#f43f5e"]}
+          colors={["#d03b3b"]}
           showArea
         />
         <ChartPanel
           title="Dropped (invalid) count"
           data={data}
           keys={["trajectory_filter/invalid_count"]}
-          colors={["#fb7185"]}
+          colors={["#e07070"]}
           showArea
         />
         <ChartPanel
@@ -51,7 +51,7 @@ export default function FilterPanel({ data }: Props) {
             "trajectory_filter/reason/timeout",
             "trajectory_filter/reason/env_setup_failed",
           ]}
-          colors={["#f59e0b", "#f43f5e"]}
+          colors={["#e0a01a", "#d03b3b"]}
         />
         <ChartPanel
           title="Kept reasons (count) — contribute to training"
@@ -61,7 +61,7 @@ export default function FilterPanel({ data }: Props) {
             "trajectory_filter/reason/overlong",
             "trajectory_filter/reason/max_turns_reached",
           ]}
-          colors={["#10b981", "#8b5cf6", "#06b6d4"]}
+          colors={["#4a9440", "#7a6ddb", "#199e70"]}
         />
       </div>
     </div>

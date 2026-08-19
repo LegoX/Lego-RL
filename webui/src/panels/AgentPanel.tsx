@@ -84,12 +84,12 @@ export default function AgentPanel({ data }: Props) {
     [data],
   );
   const SLOWEST_COLORS: Record<string, string> = {
-    "timing_s/agent_loop/slowest/harbor_total": "#6366f1",
-    "timing_s/agent_loop/slowest/harbor_agent_execute": "#10b981",
-    "timing_s/agent_loop/slowest/harbor_agent_model_inference": "#f59e0b",
-    "timing_s/agent_loop/slowest/harbor_agent_tool_call": "#ec4899",
-    "timing_s/agent_loop/slowest/harbor_env_setup": "#06b6d4",
-    "timing_s/agent_loop/slowest/harbor_verifier": "#f43f5e",
+    "timing_s/agent_loop/slowest/harbor_total": "#c96a45",
+    "timing_s/agent_loop/slowest/harbor_agent_execute": "#4a9440",
+    "timing_s/agent_loop/slowest/harbor_agent_model_inference": "#e0a01a",
+    "timing_s/agent_loop/slowest/harbor_agent_tool_call": "#b8506e",
+    "timing_s/agent_loop/slowest/harbor_env_setup": "#199e70",
+    "timing_s/agent_loop/slowest/harbor_verifier": "#d03b3b",
   };
 
   return (
@@ -106,7 +106,7 @@ export default function AgentPanel({ data }: Props) {
           meanKey="timing_s/agent_loop/harbor_total/mean"
           maxKey="timing_s/agent_loop/harbor_total/max"
           minKey="timing_s/agent_loop/harbor_total/min"
-          color="#6366f1"
+          color="#c96a45"
         />
         <MinMaxChart
           title="Agent Execute (s) — inference + in-pod tools, fused"
@@ -114,7 +114,7 @@ export default function AgentPanel({ data }: Props) {
           meanKey="timing_s/agent_loop/harbor_agent_execute/mean"
           maxKey="timing_s/agent_loop/harbor_agent_execute/max"
           minKey="timing_s/agent_loop/harbor_agent_execute/min"
-          color="#10b981"
+          color="#4a9440"
         />
         {show("Model Inference (s)") && (
           <MinMaxChart
@@ -123,7 +123,7 @@ export default function AgentPanel({ data }: Props) {
             meanKey="timing_s/agent_loop/harbor_agent_model_inference/mean"
             maxKey="timing_s/agent_loop/harbor_agent_model_inference/max"
             minKey="timing_s/agent_loop/harbor_agent_model_inference/min"
-            color="#f59e0b"
+            color="#e0a01a"
           />
         )}
         {show("Tool Calls (s)") && (
@@ -133,7 +133,7 @@ export default function AgentPanel({ data }: Props) {
             meanKey="timing_s/agent_loop/harbor_agent_tool_call/mean"
             maxKey="timing_s/agent_loop/harbor_agent_tool_call/max"
             minKey="timing_s/agent_loop/harbor_agent_tool_call/min"
-            color="#ec4899"
+            color="#b8506e"
           />
         )}
         <MinMaxChart
@@ -142,7 +142,7 @@ export default function AgentPanel({ data }: Props) {
           meanKey="timing_s/agent_loop/harbor_env_setup/mean"
           maxKey="timing_s/agent_loop/harbor_env_setup/max"
           minKey="timing_s/agent_loop/harbor_env_setup/min"
-          color="#06b6d4"
+          color="#199e70"
         />
         <MinMaxChart
           title="Agent Setup (s)"
@@ -150,7 +150,7 @@ export default function AgentPanel({ data }: Props) {
           meanKey="timing_s/agent_loop/harbor_agent_setup/mean"
           maxKey="timing_s/agent_loop/harbor_agent_setup/max"
           minKey="timing_s/agent_loop/harbor_agent_setup/min"
-          color="#8b5cf6"
+          color="#7a6ddb"
         />
         <MinMaxChart
           title="Verifier (s)"
@@ -158,7 +158,7 @@ export default function AgentPanel({ data }: Props) {
           meanKey="timing_s/agent_loop/harbor_verifier/mean"
           maxKey="timing_s/agent_loop/harbor_verifier/max"
           minKey="timing_s/agent_loop/harbor_verifier/min"
-          color="#f43f5e"
+          color="#d03b3b"
         />
         {show("Compute Score (s)") && (
           <MinMaxChart
@@ -167,7 +167,7 @@ export default function AgentPanel({ data }: Props) {
             meanKey="timing_s/agent_loop/compute_score/mean"
             maxKey="timing_s/agent_loop/compute_score/max"
             minKey="timing_s/agent_loop/compute_score/min"
-            color="#84cc16"
+            color="#8aa02a"
           />
         )}
         <MinMaxChart
@@ -176,7 +176,7 @@ export default function AgentPanel({ data }: Props) {
           meanKey="timing_s/agent_loop/generate_sequences/mean"
           maxKey="timing_s/agent_loop/generate_sequences/max"
           minKey="timing_s/agent_loop/generate_sequences/min"
-          color="#06b6d4"
+          color="#199e70"
         />
         <MinMaxChart
           title="Num Turns"
@@ -184,7 +184,7 @@ export default function AgentPanel({ data }: Props) {
           meanKey="num_turns/mean"
           maxKey="num_turns/max"
           minKey="num_turns/min"
-          color="#f59e0b"
+          color="#e0a01a"
         />
         {/* The real per-trial call count. The old "Tool Calls Count" charted
             timing_s/.../tool_calls, which is a TIMER in seconds and is dead on
@@ -195,7 +195,7 @@ export default function AgentPanel({ data }: Props) {
           meanKey="timing_s/agent_loop/proxy_num_calls/mean"
           maxKey="timing_s/agent_loop/proxy_num_calls/max"
           minKey="timing_s/agent_loop/proxy_num_calls/min"
-          color="#10b981"
+          color="#4a9440"
         />
         {/* Gap between consecutive LLM calls = one round of in-pod tool
             execution + reasoning. The closest verl-side view of tool time when
@@ -205,7 +205,7 @@ export default function AgentPanel({ data }: Props) {
             title="Tool Gap per Round (s) — in-pod tool + reasoning between LLM calls"
             data={data}
             keys={GAP_KEYS}
-            colors={["#10b981", "#f59e0b", "#f43f5e"]}
+            colors={["#4a9440", "#e0a01a", "#d03b3b"]}
           />
         )}
         {show("Tool Calls — verl builtin loop (s)") && (
@@ -215,7 +215,7 @@ export default function AgentPanel({ data }: Props) {
             meanKey="timing_s/agent_loop/tool_calls/mean"
             maxKey="timing_s/agent_loop/tool_calls/max"
             minKey="timing_s/agent_loop/tool_calls/min"
-            color="#6366f1"
+            color="#c96a45"
           />
         )}
         <ChartPanel
@@ -226,7 +226,7 @@ export default function AgentPanel({ data }: Props) {
             "timing_s/agent_loop/proxy_total_completion_tokens/max",
             "timing_s/agent_loop/proxy_total_completion_tokens/min",
           ]}
-          colors={["#8b5cf6", "#c4b5fd", "#7c3aed"]}
+          colors={["#7a6ddb", "#b3aae8", "#5a4bc0"]}
         />
         <ChartPanel
           title="Proxy Tokens (prompt)"
@@ -236,7 +236,7 @@ export default function AgentPanel({ data }: Props) {
             "timing_s/agent_loop/proxy_total_prompt_tokens/max",
             "timing_s/agent_loop/proxy_total_prompt_tokens/min",
           ]}
-          colors={["#06b6d4", "#67e8f9", "#0891b2"]}
+          colors={["#199e70", "#7fd0ae", "#147f5c"]}
         />
         <ChartPanel
           title="Preempted & Aborted"
@@ -246,7 +246,7 @@ export default function AgentPanel({ data }: Props) {
             "timing_s/agent_loop/proxy_num_aborts/mean",
             "timing_s/agent_loop/proxy_num_preempted/mean",
           ]}
-          colors={["#f43f5e", "#f59e0b", "#ec4899"]}
+          colors={["#d03b3b", "#e0a01a", "#b8506e"]}
         />
         {slowestKeys.length > 0 && (
           <ChartPanel

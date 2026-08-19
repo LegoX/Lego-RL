@@ -27,14 +27,14 @@ interface FMData {
 
 // display order, color, and bilingual label per category
 const CAT_META: Record<string, { color: string; en: string; zh: string }> = {
-  success: { color: "#10b981", en: "Solved", zh: "成功" },
-  self_verif: { color: "#f59e0b", en: "Self-verif fail", zh: "自我验证失败" },
-  wrong_fix: { color: "#ef4444", en: "Wrong fix", zh: "错误修复方案" },
-  gold_edited_failed: { color: "#fb923c", en: "Right file, failed", zh: "改对文件但失败" },
-  file_loc_fail: { color: "#8b5cf6", en: "File-loc fail", zh: "文件定位失败" },
-  no_impl: { color: "#38bdf8", en: "No implementation", zh: "只分析未动手" },
-  dead_loop: { color: "#ec4899", en: "Dead loop", zh: "死循环" },
-  infra: { color: "#64748b", en: "Infra noise", zh: "基建噪声" },
+  success: { color: "#4a9440", en: "Solved", zh: "成功" },
+  self_verif: { color: "#e0a01a", en: "Self-verif fail", zh: "自我验证失败" },
+  wrong_fix: { color: "#c73434", en: "Wrong fix", zh: "错误修复方案" },
+  gold_edited_failed: { color: "#ef9d6a", en: "Right file, failed", zh: "改对文件但失败" },
+  file_loc_fail: { color: "#7a6ddb", en: "File-loc fail", zh: "文件定位失败" },
+  no_impl: { color: "#efa07c", en: "No implementation", zh: "只分析未动手" },
+  dead_loop: { color: "#b8506e", en: "Dead loop", zh: "死循环" },
+  infra: { color: "#8a847a", en: "Infra noise", zh: "基建噪声" },
 };
 const ORDER = [
   "success",
@@ -184,7 +184,7 @@ export default function ValFailureModes({ runId, onOpenTrajectory }: Props) {
                   key={c}
                   title={`${catLabel(c)}: ${n} (${pct(n, total)})`}
                   onClick={() => setSel(sel === c ? null : c)}
-                  style={{ width: `${(100 * n) / Math.max(total, 1)}%`, background: CAT_META[c]?.color ?? "#475569" }}
+                  style={{ width: `${(100 * n) / Math.max(total, 1)}%`, background: CAT_META[c]?.color ?? "#514740" }}
                   className="cursor-pointer hover:opacity-80 transition-opacity"
                 />
               );
@@ -212,7 +212,7 @@ export default function ValFailureModes({ runId, onOpenTrajectory }: Props) {
                     className={`cursor-pointer border-t border-slate-800/40 ${active ? "bg-slate-800/60" : "hover:bg-slate-900/60"}`}
                   >
                     <td className="py-1.5 flex items-center gap-2">
-                      <span className="inline-block w-3 h-3 rounded-sm" style={{ background: CAT_META[c]?.color ?? "#475569" }} />
+                      <span className="inline-block w-3 h-3 rounded-sm" style={{ background: CAT_META[c]?.color ?? "#514740" }} />
                       <span className="text-slate-200">{catLabel(c)}</span>
                     </td>
                     <td className="py-1.5 text-right text-slate-200">{n}</td>
