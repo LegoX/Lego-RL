@@ -1,0 +1,4 @@
+interface:
+  display_name: "RL Run"
+  short_description: "Launch Lego-RL runs with confirmation"
+  default_prompt: "Use $rl-run to preflight and launch a Lego-RL config after explicit confirmation."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "RL K8s Sandbox Install"
+  short_description: "Install Lego-RL sandbox Kubernetes"
+  default_prompt: "Use $rl-k8s-sandbox-install to probe machines and prepare a Lego-RL Kubernetes sandbox."

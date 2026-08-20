@@ -1,0 +1,4 @@
+interface:
+  display_name: "RL Check"
+  short_description: "Preflight a Lego-RL run config"
+  default_prompt: "Use $rl-check to preflight a Lego-RL config and report whether it is safe to launch."
