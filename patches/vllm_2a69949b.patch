@@ -1,0 +1,213 @@
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+index b061b3d38..9b10e3f93 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+@@ -142,7 +142,7 @@ class RoutedExpertsCapturer:
+ 
+         # Initialize shared memory
+         shape = (max_num_kv_tokens, num_layers, num_experts_per_tok)
+-        buffer_size = int(np.prod(shape)) * np.dtype(np.int32).itemsize
++        buffer_size = int(np.prod(shape)) * np.dtype(np.uint8).itemsize  # R3 uint8
+         instance_id = vllm_config.instance_id
+         self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
+         shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+@@ -150,7 +150,7 @@ class RoutedExpertsCapturer:
+         self._shm = _create_or_attach_shared_memory(
+             shm_name, buffer_size, self._lock_file
+         )
+-        self._host_buffer_view = np.ndarray(shape, dtype=np.int32, buffer=self._shm.buf)
++        self._host_buffer_view = np.ndarray(shape, dtype=np.uint8, buffer=self._shm.buf)  # R3 uint8
+         self._host_buffer_view.fill(0)
+ 
+         logger.debug(
+@@ -214,7 +214,19 @@ class RoutedExpertsCapturer:
+         data = self._device_buffer[:num_tokens, :, :].cpu().numpy()
+ 
+         with _file_lock(self._lock_file):
+-            self._host_buffer_view[indices, :, :] = data
++            # R3 guard: hybrid-KV models underestimate max_num_kv_tokens, so real KV
++            # slot_mapping indices can exceed the host buffer. Skip out-of-bounds slots
++            # (graceful degrade) rather than crashing the EngineCore with IndexError.
++            idx = indices
++            if hasattr(idx, "cpu"):
++                idx = idx.cpu().numpy()
++            idx = np.asarray(idx)
++            size = self._host_buffer_view.shape[0]
++            if idx.size and int(idx.max()) >= size:
++                valid = idx < size
++                self._host_buffer_view[idx[valid], :, :] = data[valid]
++            else:
++                self._host_buffer_view[idx, :, :] = data
+ 
+     def cleanup(self) -> None:
+         """Explicitly clean up shared memory resources."""
+@@ -301,7 +313,7 @@ class RoutedExpertsReader:
+                 self._shm = shared_memory.SharedMemory(name=shm_name)
+ 
+             self._host_buffer_view = np.ndarray(
+-                shape, dtype=np.int32, buffer=self._shm.buf
++                shape, dtype=np.uint8, buffer=self._shm.buf  # R3 uint8
+             )
+ 
+     def get_routed_experts(self, indices: np.ndarray) -> np.ndarray:
+@@ -320,6 +332,21 @@ class RoutedExpertsReader:
+             raise RuntimeError("Lock file not initialized.")
+ 
+         with _file_lock(self._lock_file, mode="rb+"):
++            # R3 guard: mirror save_captured_experts — out-of-bounds slots were never
++            # written, so return zero routing for them instead of an IndexError.
++            idx = indices
++            if hasattr(idx, "cpu"):
++                idx = idx.cpu().numpy()
++            idx = np.asarray(idx)
++            size = self._host_buffer_view.shape[0]
++            if idx.size and int(idx.max()) >= size:
++                out = np.zeros(
++                    (len(idx), *self._host_buffer_view.shape[1:]),
++                    dtype=self._host_buffer_view.dtype,
++                )
++                valid = idx < size
++                out[valid] = self._host_buffer_view[idx[valid], :, :]
++                return out
+             return self._host_buffer_view[indices, :, :].copy()
+ 
+     def cleanup(self) -> None:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index fe524ccac..ea0989079 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -280,9 +280,15 @@ class Scheduler(SchedulerInterface):
+                 ]
+             )
+             num_groups = len(kv_cache_config.kv_cache_groups)
++            # R3 fix: x R3_BUFFER_FACTOR to cover the real KV slot range (hybrid models
++            # under-size ~4x). MUST match gpu_model_runner's identical computation.
++            import os
++
+             self.max_num_kv_tokens = (
+-                kv_cache_config.num_blocks // num_groups
+-            ) * min_block_size
++                (kv_cache_config.num_blocks // num_groups)
++                * min_block_size
++                * int(os.environ.get("R3_BUFFER_FACTOR", "5"))
++            )
+             dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+             pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+             if pcp_size * dcp_size > 1:
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 7ff324f12..2cf580741 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -899,6 +899,14 @@ class AsyncLLM(EngineClient):
+             reset_running_requests, reset_connector
+         )
+ 
++    async def kv_cache_usage_probe(self) -> dict:
++        return await self.engine_core.call_utility_async("kv_cache_usage_probe")
++
++    async def prefix_cache_probe(self, prompt_token_ids: list[int]) -> dict:
++        return await self.engine_core.call_utility_async(
++            "prefix_cache_probe", prompt_token_ids
++        )
++
+     async def reset_encoder_cache(self) -> None:
+         await self.engine_core.reset_encoder_cache_async()
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 0fa59579e..143a54379 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -578,6 +578,71 @@ class EngineCore:
+             reset_running_requests, reset_connector
+         )
+ 
++    def kv_cache_usage_probe(self) -> dict[str, Any]:
++        """Return current local KV cache occupancy without scheduling a request."""
++        kv_cache_manager = self.scheduler.kv_cache_manager
++        return {
++            "enabled": True,
++            "kv_cache_usage": kv_cache_manager.usage,
++            "num_gpu_blocks": kv_cache_manager.block_pool.num_gpu_blocks,
++        }
++
++    def prefix_cache_probe(self, prompt_token_ids: list[int]) -> dict[str, Any]:
++        """Probe local prefix-cache residency for a prompt without side effects.
++
++        This mirrors the lookup part of ``KVCacheManager.get_computed_blocks()``
++        but intentionally bypasses that helper so ``prefix_cache_stats`` is not
++        updated. The temporary Request is never added to the scheduler.
++        """
++        from vllm import SamplingParams
++
++        kv_cache_manager = self.scheduler.kv_cache_manager
++        prompt_tokens = len(prompt_token_ids)
++
++        if self.request_block_hasher is None:
++            return {
++                "enabled": False,
++                "prompt_tokens": prompt_tokens,
++                "hit_tokens": 0,
++                "hit_ratio": 0.0,
++                "num_block_hashes": 0,
++                "kv_cache_usage": kv_cache_manager.usage,
++            }
++
++        req = Request(
++            request_id="__prefix_cache_probe__",
++            prompt_token_ids=list(prompt_token_ids),
++            sampling_params=SamplingParams(max_tokens=1),
++            pooling_params=None,
++            block_hasher=self.request_block_hasher,
++        )
++
++        if (
++            not kv_cache_manager.enable_caching
++            or req.skip_reading_prefix_cache
++            or prompt_tokens <= 1
++        ):
++            hit_tokens = 0
++        else:
++            # Match scheduler semantics: even if the full prompt is cached, the
++            # last token is recomputed to produce logits.
++            max_cache_hit_length = req.num_tokens - 1
++            _, hit_tokens = (
++                kv_cache_manager.coordinator.find_longest_cache_hit(
++                    req.block_hashes,
++                    max_cache_hit_length,
++                )
++            )
++
++        return {
++            "enabled": True,
++            "prompt_tokens": prompt_tokens,
++            "hit_tokens": hit_tokens,
++            "hit_ratio": hit_tokens / max(1, prompt_tokens),
++            "num_block_hashes": len(req.block_hashes),
++            "kv_cache_usage": kv_cache_manager.usage,
++        }
++
+     def reset_encoder_cache(self) -> None:
+         """Reset the encoder cache to invalidate all cached encoder outputs.
+ 
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 2e62206da..ab157828c 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -6839,9 +6839,15 @@ class GPUModelRunner(
+             ]
+         )
+         num_groups = len(self.kv_cache_config.kv_cache_groups)
++        # R3 fix: x R3_BUFFER_FACTOR to cover the real KV slot range (hybrid models
++        # under-size ~4x). MUST match scheduler.py's identical computation.
++        import os
++
+         self.max_num_kv_tokens = (
+-            self.kv_cache_config.num_blocks // num_groups
+-        ) * min_block_size
++            (self.kv_cache_config.num_blocks // num_groups)
++            * min_block_size
++            * int(os.environ.get("R3_BUFFER_FACTOR", "5"))
++        )
+         dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+         pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+         if pcp_size * dcp_size > 1:

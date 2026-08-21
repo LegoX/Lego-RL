@@ -24,7 +24,7 @@ Every value belongs to exactly one layer:
 
 | Layer | File | Scope | Changes |
 | --- | --- | --- | --- |
-| **Site** | `scripts/lib/site.env` | this *cluster*: registry, nydus mirror, hostPath mounts, kubeconfig, docker daemon, `MODEL_ROOT`, `NEW_VERL_DIR` | once, when you move clusters |
+| **Site** | `scripts/lib/site.env` | this *cluster*: registry, nydus mirror, hostPath mounts, kubeconfig, docker daemon, `MODEL_ROOT` | once, when you move clusters |
 | **Template** | `scripts/{train,eval,infer}/templates/*.env` | a *structural* combination (mode × backend × scaffold × model) | never — you copy it |
 | **Config** | `scripts/{train,eval,infer}/configs/*.env` | one *experiment*: names, data, topology, cadence | every run |
 
@@ -46,7 +46,7 @@ Copy `lib/site.example.env` when onboarding a new cluster.
 | **T1 required** | every run | `PROJECT_NAME` `EXP_TAG` `TRAIN_INDEX`/`VAL_INDEX` topology | the `CHANGEME` lines |
 | **T2 often tuned** | frequently | `SAVE_FREQ` `TOTAL_EPOCHS` `TRAIN_BSZ` `N_RESP` `MAX_RESP` `VAL_BEFORE_TRAIN` `N_CONCURRENT` | config, add a line |
 | **T3 advanced** | rarely, and know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `KL_LOSS_COEF` | config, overrides a default |
-| **T4 site** | once per cluster | registry / nydus / mounts / kubeconfig / `MODEL_ROOT` / `NEW_VERL_DIR` / `DOCKER_HOST` | `lib/site.env` |
+| **T4 site** | once per cluster | registry / nydus / mounts / kubeconfig / `MODEL_ROOT` / `DOCKER_HOST` | `lib/site.env` |
 | **T5 hidden** | basically never | ~80 harbor + hyperparameter defaults (loop config, offload, tail-kill, pod timeouts…) | `lib/*` + the runner |
 
 Templates carry T0–T1 plus a few T2 examples. Setting a T2/T3 knob is one `KEY=VALUE`
@@ -152,7 +152,6 @@ you expect — see [Venv](/docs/getting-started#1-venv).
 ```bash
 K8S_KUBECONFIG=/path/to/kubeconfig.yaml        # which K8s cluster
 MODEL_ROOT=/models                             # convenience root for MODEL_PATH
-NEW_VERL_DIR=/repos/verl-swe_agent_opd_dev     # required with USE_NEW_VERL=1
 HARBOR_OPENSWE_IMAGE_REGISTRY=reg:5001/openswe # prebuilt task images
 HARBOR_NYDUS_MIRROR=...                        # mirror official val images
 DOCKER_HOST=tcp://10.0.0.2:2376                # remote docker daemon
@@ -164,7 +163,6 @@ acceleration off.
 | Variable | Purpose | Empty means |
 | --- | --- | --- |
 | `MODEL_ROOT` | convenience root a config can interpolate: `MODEL_PATH=$MODEL_ROOT/<name>` | nothing — always set `MODEL_PATH` in full |
-| `NEW_VERL_DIR` | the `verl-swe_agent_opd_dev` worktree carrying the veomni / R3 / async fixes | required whenever `USE_NEW_VERL=1` |
 | `K8S_KUBECONFIG` | k8s backend cluster | falls back to `$HOME/.kube/config` |
 | `HARBOR_OPENSWE_IMAGE_REGISTRY` | prebuilt per-instance task images | in-pod inline build (slow, needs egress) |
 | `HARBOR_NYDUS_MIRROR` | rewrites official `docker.io/swebench/...` val images to a local mirror | val images must be pullable from Docker Hub |

@@ -171,16 +171,15 @@ print_final_environment() {
 # the new names onto the old ones here, in one place, and keep preflight as the
 # single source of truth for what a bad config looks like.
 #
-# USE_NEW_VERL has no equivalent any more: the new runner uses whatever verl the venv
-# installed instead of prepending NEW_VERL_DIR to PYTHONPATH. Probe the actual tree
-# for the router-replay module instead of asserting a flag that no longer exists.
+# The runner uses whatever verl the venv installed. Probe the actual imported tree
+# for the router-replay module instead of relying on a path override.
 run_preflight() {
-    local verl_origin verl_root use_new_verl=0
+    local verl_origin verl_root verl_has_router_replay=0
 
     verl_origin="$("$PYTHON_BIN" -c 'import importlib.util as u; s=u.find_spec("verl"); print(s.origin or "")' 2>/dev/null || true)"
     if [ -n "$verl_origin" ]; then
         verl_root="$(dirname "$verl_origin")"
-        [ -f "$verl_root/utils/veomni/router_replay.py" ] && use_new_verl=1
+        [ -f "$verl_root/utils/veomni/router_replay.py" ] && verl_has_router_replay=1
     fi
 
     PREFLIGHT_EMBEDDED=1 PF_KIND=train \
@@ -190,7 +189,7 @@ run_preflight() {
     NNODES="${NNODES:-}" N_NODES_TRAIN="${N_NODES_TRAIN:-}" N_NODES_ROLLOUT="${N_NODES_ROLLOUT:-}" \
     NGPUS_PER_NODE="${NGPUS_PER_NODE:-}" SP_SIZE="${SP_SIZE:-}" \
     MAX_PROMPT="${MAX_PROMPT:-}" MAX_RESP="${MAX_RESP:-}" \
-    USE_NEW_VERL="$use_new_verl" NEW_VERL_DIR="${NEW_VERL_DIR:-}" ENABLE_R3="${ENABLE_R3:-}" \
+    VERL_HAS_ROUTER_REPLAY="$verl_has_router_replay" ENABLE_R3="${ENABLE_R3:-}" \
     FUSED_KERNELS="${FUSED_KERNELS:-}" ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-}" \
     LR_SCHEDULER="${LR_SCHEDULER:-}" ROLLOUT_IS="${ROLLOUT_IS:-}" \
     VAL_TIMEOUT="${HARBOR_VAL_AGENT_MAX_TIMEOUT_SEC:-}" \
@@ -255,4 +254,3 @@ print_run_configuration() {
     printf '══════════════════════════════════════════════════════════════════════\n\n'
     unset -f kv
 }
-

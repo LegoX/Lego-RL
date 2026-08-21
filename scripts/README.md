@@ -23,7 +23,7 @@ run                              bash scripts/<kind>/<kind>.sh <kind>/configs/my
 ```
 scripts/
 ├── lib/                         # shared building blocks (every runner sources these)
-│   ├── common_env.sh            #   process env + venv + python + verl selection (sources site.env)
+│   ├── common_env.sh            #   legacy process env + venv + python setup
 │   ├── site.env                 #   * THIS cluster's infra: registry/mounts/kubeconfig/accel/MODEL_ROOT
 │   ├── site.example.env         #   * copy to site.env when moving to a different cluster
 │   ├── harbor_env.sh            #   harbor agent (§8) + backend (§7), branches on SCAFFOLD × BACKEND
@@ -78,7 +78,7 @@ SCAFFOLD automatically; preflight double-checks it.
 | **T1 required** | every run | `PROJECT_NAME` `EXP_TAG` `TRAIN_INDEX`/`VAL_INDEX` (or `DATASET_PATH`, or `RESULTS_DIR`+`OUTPUT_INDEX`) `NNODES`+topology | the CHANGEME lines in the config |
 | **T2 often tuned** | frequently | `SAVE_FREQ` `TOTAL_EPOCHS` `TRAIN_BSZ` `N_RESP` `MAX_RESP` `VAL_BEFORE_TRAIN` `N_CONCURRENT` `EVAL_TEMPERATURE` | config, add as needed |
 | **T3 advanced** | rarely, know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `VAL_TIMEOUT` `KL_LOSS_COEF` `CLIP_*` | config, override the default |
-| **T4 site** | once per cluster | registry/nydus/mounts/kubeconfig/`MODEL_ROOT`/`NEW_VERL_DIR`/`DOCKER_HOST` | **`lib/site.env`** |
+| **T4 site** | once per cluster | registry/nydus/mounts/kubeconfig/`MODEL_ROOT`/`DOCKER_HOST` | **`lib/site.env`** |
 | **T5 hidden defaults** | basically never | ~80 harbor_env / hyperparameter defaults (loop name, offload, entropy chunking, tail-kill, pod timeouts…) | `lib/*` + runner |
 
 Templates carry only T0–T1 (plus a few T2 examples). To tune a T2/T3 knob, add one

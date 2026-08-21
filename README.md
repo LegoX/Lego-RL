@@ -85,10 +85,11 @@ indexes, and a reachable Kubernetes cluster (`BACKEND=docker` drives one machine
 The validate step launches nothing. In Claude Code the same run is `/rl:run scripts/train/configs/demo.env`.
 
 > [!IMPORTANT]
-> `setup_env.sh` clones Harbor [`SWE-Lego/harbor`](https://github.com/SWE-Lego/harbor) @ `ydu_dev`
-> (harbor `0.3.1`), which **is not public yet**, so that clone fails without access. `HARBOR_REF=main`
-> gets vanilla upstream (`0.1.45`) and works for everyone, minus the per-phase network-policy
-> framework, the OpenHands-SDK 1.33 runtime, the OpenSWE adapter and the git-history restore hook.
+> `setup_env.sh` clones Harbor [`SWE-Lego/harbor`](https://github.com/SWE-Lego/harbor) @ `main`
+> by default, which works with the public repo. If you have access to the private `ydu_dev`
+> Harbor branch (`0.3.1`), run with `HARBOR_REF=ydu_dev` to enable the per-phase
+> network-policy framework, the OpenHands-SDK 1.33 runtime, the OpenSWE adapter and
+> the git-history restore hook.
 
 ## License
 

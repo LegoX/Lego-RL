@@ -75,17 +75,16 @@ it is for *plumbing validation*, not for reading learning quality.
 
 ## VeOmni backend (MoE)
 
-MoE policies need the verl fork `setup_env.sh` installs — the
-`verl-swe_agent_opd_dev` checkout. Only that tree has the VeOmni `engine_workers`
+MoE policies need the patched verl tree `setup_env.sh` installs under `third_party/verl`.
+Only that tree has the VeOmni `engine_workers`
 **router-replay** (R3) wiring (`actor.veomni.router_replay.mode`) and the
 async-rollouter `routed_experts` concat fixes; upstream verl's VeOmni engine is
 unvalidated for this path. Preflight probes the verl you actually imported for
 `verl/utils/veomni/router_replay.py` and blocks a run that turns R3 on without it.
 Dense models can stay on FSDP.
 
-(The older `USE_NEW_VERL=1` / `NEW_VERL_DIR` mechanism prepended that checkout to
-`PYTHONPATH` at run time. The runner uses whatever verl the venv installed instead;
-`setup_env.sh` warns if the two ever name different trees.)
+(The older runtime path-override mechanism is gone. The runner uses whatever verl
+the venv installed, and preflight probes that imported tree directly.)
 
 It also enables the `trajectory_filter` config (`TRAJ_FILTER_ENABLE=True`,
 `TRAJ_FILTER_DROP_REASONS=timeout,env_setup_failed`), which the old verl lacks.
