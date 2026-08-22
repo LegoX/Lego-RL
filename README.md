@@ -8,6 +8,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2608.17393-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.17393)
 [![Docs](https://img.shields.io/badge/docs-lego--rl.pages.dev-2563eb?logo=readthedocs&logoColor=white)](https://lego-rl.pages.dev)
+[![Hugging Face](https://img.shields.io/badge/HuggingFace-lego--rl-FFD21E?logo=huggingface&logoColor=white)](https://huggingface.co/collections/Lego-X/lego-rl)
 [![LegoX](https://img.shields.io/badge/LegoX-legox.net-b3431f)](https://legox.net/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![verl](https://img.shields.io/badge/verl-Elvin--Yiming--Du%2Fverl-orange)](https://github.com/Elvin-Yiming-Du/verl)
