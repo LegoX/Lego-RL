@@ -46,20 +46,25 @@ under three native harnesses, and evaluated on the held-out *SWE-bench Verified*
 Verifier reward rises under every harness, and every run improves on the benchmark:
 **+6.4** points with OpenHands SDK, **+5.8** with Claude Code, **+9.4** with OpenCode.
 
-| Coding agent | Model | SWE-bench Verified (%) |
-| --- | --- | --- |
-| **OpenHands SDK** | Qwen3.5-35B-A3B | 64.0 |
-| | Qwen3.6-35B-A3B | 67.4 |
-| | KAT-Coder-V2.5-Dev | 67.0 |
-| | **Lego-RL-Qwen3.5-35B-A3B** | **70.4 (+6.4)** |
-| **Claude Code** | Qwen3.5-35B-A3B | 62.4 |
-| | Qwen3.6-35B-A3B | 63.4 |
-| | KAT-Coder-V2.5-Dev | 66.8 |
-| | **Lego-RL-Qwen3.5-35B-A3B** | **68.2 (+5.8)** |
-| **OpenCode** | Qwen3.5-35B-A3B | 57.2 |
-| | Qwen3.6-35B-A3B | 60.6 |
-| | KAT-Coder-V2.5-Dev | 61.2 |
-| | **Lego-RL-Qwen3.5-35B-A3B** | **66.6 (+9.4)** |
+<table align="center">
+<thead>
+<tr><th>Coding agent</th><th>Model</th><th align="center">SWE-bench Verified (%)</th></tr>
+</thead>
+<tbody>
+<tr><td rowspan="4"><b>OpenHands SDK</b></td><td>Qwen3.5-35B-A3B</td><td align="center">64.0</td></tr>
+<tr><td>Qwen3.6-35B-A3B</td><td align="center">67.4</td></tr>
+<tr><td>KAT-Coder-V2.5-Dev</td><td align="center">67.0</td></tr>
+<tr><td><b>Lego-RL-Qwen3.5-35B-A3B</b></td><td align="center"><b>70.4 (+6.4)</b></td></tr>
+<tr><td rowspan="4"><b>Claude Code</b></td><td>Qwen3.5-35B-A3B</td><td align="center">62.4</td></tr>
+<tr><td>Qwen3.6-35B-A3B</td><td align="center">63.4</td></tr>
+<tr><td>KAT-Coder-V2.5-Dev</td><td align="center">66.8</td></tr>
+<tr><td><b>Lego-RL-Qwen3.5-35B-A3B</b></td><td align="center"><b>68.2 (+5.8)</b></td></tr>
+<tr><td rowspan="4"><b>OpenCode</b></td><td>Qwen3.5-35B-A3B</td><td align="center">57.2</td></tr>
+<tr><td>Qwen3.6-35B-A3B</td><td align="center">60.6</td></tr>
+<tr><td>KAT-Coder-V2.5-Dev</td><td align="center">61.2</td></tr>
+<tr><td><b>Lego-RL-Qwen3.5-35B-A3B</b></td><td align="center"><b>66.6 (+9.4)</b></td></tr>
+</tbody>
+</table>
 
 All numbers are measured by us under the same harness version and evaluation protocol
 (temperature 0.7, 200 turns, 200k context budget). RL on the 3.5-generation policy beats both the
