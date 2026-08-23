@@ -68,16 +68,6 @@ The gains are also harness-specific — KAT-Coder gains 3.4 points under Claude 
 authors report, but 0.6 under OpenCode and -0.4 under OpenHands SDK — which is exactly why Lego-RL
 trains inside the harness the agent will actually run in.
 
-**System efficiency.** Long-horizon agentic rollouts dominate the cost of a run (91.3% of trial
-wall-clock is agent execution), so Lego-RL optimizes the path around them:
-
-| Optimization | Stage | Effect |
-| --- | --- | --- |
-| Prebuilt task images | sandbox setup | **33.2×** median speedup |
-| Mounted agent runtime | agent setup | **15.4×** median speedup |
-| Lazy (Nydus) image pull | sandbox setup | **1.7×** median cold start, 23× at the tail; 21.6 GB → 1.59 GB network |
-| Asynchronous rollouts | training step | **2.5×** more steps in the same 7.5 hours (1.9× after correcting for compute rate) |
-
 Full protocol, ablations, and failure analysis are in the [paper](https://arxiv.org/abs/2608.17393).
 
 ## Live Training Dashboard
