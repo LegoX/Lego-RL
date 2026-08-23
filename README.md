@@ -6,17 +6,21 @@
 
 **Online reinforcement learning for coding agents in their native harnesses and real repositories.**
 
-[![arXiv](https://img.shields.io/badge/arXiv-2608.17393-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.17393)
-[![Docs](https://img.shields.io/badge/docs-lego--rl.pages.dev-2563eb?logo=readthedocs&logoColor=white)](https://lego-rl.pages.dev)
-[![Hugging Face](https://img.shields.io/badge/HuggingFace-lego--rl-FFD21E?logo=huggingface&logoColor=white)](https://huggingface.co/collections/Lego-X/lego-rl)
-[![LegoX](https://img.shields.io/badge/LegoX-legox.net-b3431f)](https://legox.net/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![verl](https://img.shields.io/badge/verl-Elvin--Yiming--Du%2Fverl-orange)](https://github.com/Elvin-Yiming-Du/verl)
-[![Harbor](https://img.shields.io/badge/Harbor-Elvin--Yiming--Du%2Fharbor-8b5cf6)](https://github.com/Elvin-Yiming-Du/harbor)
-
-**[Documentation](https://lego-rl.pages.dev)** · **[Getting Started](https://lego-rl.pages.dev/docs/getting-started)** · **[Why Lego-RL](https://lego-rl.pages.dev/docs/why-lego-rl)** · **[LegoX](https://legox.net/)**
+<p align="center">
+  <a href="https://arxiv.org/abs/2608.17393"><img src="img/icon-paper.svg" height="15" alt=""> Paper</a>
+  &nbsp;·&nbsp;
+  <a href="https://lego-rl.pages.dev"><img src="img/icon-docs.svg" height="15" alt=""> Docs</a>
+  &nbsp;·&nbsp;
+  <a href="https://huggingface.co/collections/Lego-X/lego-rl"><img src="img/icon-huggingface.svg" height="15" alt=""> HuggingFace</a>
+  &nbsp;·&nbsp;
+  <a href="https://legox.net/"><img src="img/icon-legox.svg" height="15" alt=""> LegoX</a>
+  &nbsp;·&nbsp;
+  <a href="LICENSE"><img src="img/icon-license.svg" height="15" alt=""> License</a>
+</p>
 
 </div>
+
+---
 
 Lego-RL is an open-source framework for training coding agents with online reinforcement learning on
 real software-engineering tasks. It connects **Claude Code**, **OpenHands**, and **OpenCode** to
@@ -29,6 +33,52 @@ updates the policy from the captured trajectory.
 <div align="center">
  <img src="docs/public/framework.png" width="820" alt="Lego-RL architecture">
 </div>
+
+## Results
+
+`Qwen3.5-35B-A3B` trained for three epochs (126 steps) on a [2,699-task OpenSWE-derived index](https://huggingface.co/datasets/Lego-X/Lego-RL-2699),
+under three native harnesses, and evaluated on the held-out *SWE-bench Verified*:
+
+<div align="center">
+ <img src="docs/public/results_curves.png" width="900" alt="Training reward and SWE-bench Verified solve rate across three harnesses">
+</div>
+
+Verifier reward rises under every harness, and every run improves on the benchmark:
+**+6.4** points with OpenHands SDK, **+5.8** with Claude Code, **+9.4** with OpenCode.
+
+| Coding agent | Model | SWE-bench Verified (%) |
+| --- | --- | --- |
+| **OpenHands SDK** | Qwen3.5-35B-A3B | 64.0 |
+| | Qwen3.6-35B-A3B | 67.4 |
+| | KAT-Coder-V2.5-Dev | 67.0 |
+| | **Lego-RL-Qwen3.5-35B-A3B** | **70.4 (+6.4)** |
+| **Claude Code** | Qwen3.5-35B-A3B | 62.4 |
+| | Qwen3.6-35B-A3B | 63.4 |
+| | KAT-Coder-V2.5-Dev | 66.8 |
+| | **Lego-RL-Qwen3.5-35B-A3B** | **68.2 (+5.8)** |
+| **OpenCode** | Qwen3.5-35B-A3B | 57.2 |
+| | Qwen3.6-35B-A3B | 60.6 |
+| | KAT-Coder-V2.5-Dev | 61.2 |
+| | **Lego-RL-Qwen3.5-35B-A3B** | **66.6 (+9.4)** |
+
+All numbers are measured by us under the same harness version and evaluation protocol
+(temperature 0.7, 200 turns, 200k context budget). RL on the 3.5-generation policy beats both the
+next base generation and KAT-Coder-V2.5-Dev, a model post-trained from it, in all three harnesses.
+The gains are also harness-specific — KAT-Coder gains 3.4 points under Claude Code, the harness its
+authors report, but 0.6 under OpenCode and -0.4 under OpenHands SDK — which is exactly why Lego-RL
+trains inside the harness the agent will actually run in.
+
+**System efficiency.** Long-horizon agentic rollouts dominate the cost of a run (91.3% of trial
+wall-clock is agent execution), so Lego-RL optimizes the path around them:
+
+| Optimization | Stage | Effect |
+| --- | --- | --- |
+| Prebuilt task images | sandbox setup | **33.2×** median speedup |
+| Mounted agent runtime | agent setup | **15.4×** median speedup |
+| Lazy (Nydus) image pull | sandbox setup | **1.7×** median cold start, 23× at the tail; 21.6 GB → 1.59 GB network |
+| Asynchronous rollouts | training step | **2.5×** more steps in the same 7.5 hours (1.9× after correcting for compute rate) |
+
+Full protocol, ablations, and failure analysis are in the [paper](https://arxiv.org/abs/2608.17393).
 
 ## Live Training Dashboard
 
