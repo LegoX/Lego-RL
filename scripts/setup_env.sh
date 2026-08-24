@@ -153,16 +153,42 @@ apply_repo_patch() {
     [ -d "$dir/.git" ] || die "[$name] cannot apply patch; $dir is not a git repo"
 
     log "[$name] applying monkey patch: $patch_file"
-    if git -C "$dir" apply --check "$patch_file"; then
+    if git -C "$dir" apply --check "$patch_file" >/dev/null 2>&1; then
         git -C "$dir" apply "$patch_file"
         log "[$name] patch applied"
-    elif git -C "$dir" apply -R --check "$patch_file"; then
+    elif git -C "$dir" apply -R --check "$patch_file" >/dev/null 2>&1; then
         log "[$name] patch already applied"
+    elif git -C "$dir" diff --quiet -- && clean_patch_created_untracked_files "$name" "$dir" "$patch_file" \
+        && git -C "$dir" apply --check "$patch_file" >/dev/null 2>&1; then
+        git -C "$dir" apply "$patch_file"
+        log "[$name] patch applied"
     else
         warn "[$name] patch does not apply cleanly to $dir"
+        git -C "$dir" apply --check "$patch_file" || true
+        git -C "$dir" apply -R --check "$patch_file" || true
         git -C "$dir" apply --stat "$patch_file" || true
         die "[$name] patch failed; check ${name^^}_REF and ${name^^}_PATCH"
     fi
+}
+
+clean_patch_created_untracked_files() {
+    local name="$1" dir="$2" patch_file="$3"
+    local path removed=0
+
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if ! git -C "$dir" ls-files --error-unmatch -- "$path" >/dev/null 2>&1 \
+            && [ -e "$dir/$path" ]; then
+            rm -f -- "$dir/$path"
+            removed=$((removed + 1))
+        fi
+    done < <(git -C "$dir" apply --summary "$patch_file" | sed -n -E 's/^ create mode [0-7]+ //p')
+
+    if [ "$removed" -gt 0 ]; then
+        log "[$name] removed $removed stale patch-created file(s)"
+        return 0
+    fi
+    return 1
 }
 
 uv_install_editable() {
