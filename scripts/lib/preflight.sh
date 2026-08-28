@@ -11,8 +11,9 @@
 # cluster". Every rule is a real pitfall we hit (see MEMORY refs in comments); confirmed wrong=block, suspicious=WARN.
 # =============================================================================
 # Available env vars (config should export them; if missing, fall back to checks here):
-#   MODEL_PATH SCAFFOLD TOOL_PARSER AGENT_NAME ENGINE PROFILE
+#   MODEL_PATH SCAFFOLD TOOL_PARSER AGENT_NAME ENGINE PROFILE TRAINING_MODE
 #   NNODES N_NODES_TRAIN N_NODES_ROLLOUT NGPUS_PER_NODE SP_SIZE
+#   TRAINER_N_GPUS_PER_NODE ROLLOUT_N_GPUS_PER_NODE ALLOW_SINGLE_NODE_ASYNC_SPLIT
 #   MAX_PROMPT MAX_RESP VERL_HAS_ROUTER_REPLAY ENABLE_R3
 #   FUSED_KERNELS ACTIVATION_OFFLOAD LR_SCHEDULER VAL_TIMEOUT ROLLOUT_IS
 #   IMAGE_REGISTRY INLINE_BUILD NYDUS_MIRROR K8S_KUBECONFIG
@@ -69,12 +70,31 @@ fi
 # --- 2. topology consistency: NNODES == train + rollout ── most easily missed ─────────────────────
 if [ -n "${NNODES:-}" ] && [ -n "${N_NODES_TRAIN:-}" ] && [ -n "${N_NODES_ROLLOUT:-}" ]; then
     _sum=$((N_NODES_TRAIN + N_NODES_ROLLOUT))
-    if [ "$NNODES" -eq "$_sum" ]; then _pf_ok "topology consistent: NNODES=$NNODES = train $N_NODES_TRAIN + rollout $N_NODES_ROLLOUT"
-    else _pf_fatal "topology inconsistent: NNODES=$NNODES ≠ train($N_NODES_TRAIN)+rollout($N_NODES_ROLLOUT)=$_sum. ray cluster node count must equal the sum of logical roles, otherwise placement hangs/fails"; fi
+    if [ "$NNODES" -eq "$_sum" ]; then
+        _pf_ok "topology consistent: NNODES=$NNODES = train $N_NODES_TRAIN + rollout $N_NODES_ROLLOUT"
+    elif [ "${ALLOW_SINGLE_NODE_ASYNC_SPLIT:-1}" = "1" ] \
+        && [ "${TRAINING_MODE:-}" = "async" ] \
+        && [ "$NNODES" -eq 1 ] \
+        && [ "$N_NODES_TRAIN" -eq 1 ] \
+        && [ "$N_NODES_ROLLOUT" -eq 1 ]; then
+        _trainer_gpn="${TRAINER_N_GPUS_PER_NODE:-${NGPUS_PER_NODE:-8}}"
+        _rollout_gpn="${ROLLOUT_N_GPUS_PER_NODE:-${NGPUS_PER_NODE:-8}}"
+        _split_gpus=$((_trainer_gpn + _rollout_gpn))
+        _node_gpus="${NGPUS_PER_NODE:-8}"
+        if [ "$_split_gpus" -le "$_node_gpus" ]; then
+            _pf_ok "single-node async split allowed: NNODES=1 with train=${_trainer_gpn} GPU + rollout=${_rollout_gpn} GPU (capacity ${_split_gpus}/${_node_gpus})"
+        else
+            _pf_fatal "single-node async split requests ${_split_gpus} GPUs (train=${_trainer_gpn} + rollout=${_rollout_gpn}) but NGPUS_PER_NODE=${_node_gpus}; reduce per-role GPU counts or use separate nodes"
+        fi
+    else
+        _pf_fatal "topology inconsistent: NNODES=$NNODES ≠ train($N_NODES_TRAIN)+rollout($N_NODES_ROLLOUT)=$_sum. ray cluster node count must equal the sum of logical roles, otherwise placement hangs/fails"
+    fi
 fi
 
 # --- 3. SP × dp device-mesh + VRAM ── §4.3 OOM/assertion high risk ──────────────────────
-_gpn="${NGPUS_PER_NODE:-8}"
+# Device mesh is built from the trainer pool, not the node's total physical
+# capacity.  In a single-node async split the latter also includes rollout GPUs.
+_gpn="${TRAINER_N_GPUS_PER_NODE:-${NGPUS_PER_NODE:-8}}"
 if [ -n "${N_NODES_TRAIN:-}" ] && [ -n "${SP_SIZE:-}" ]; then
     _train_world=$((N_NODES_TRAIN * _gpn))
     if [ $((_train_world % SP_SIZE)) -ne 0 ]; then

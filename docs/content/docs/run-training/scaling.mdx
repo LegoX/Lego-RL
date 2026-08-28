@@ -52,7 +52,9 @@ bash scripts/train/train.sh train/configs/my_async_run.env
 `fsdp_size=16`) + **1 rollout node** (8-GPU vLLM), fitting the ≈131k window (40k
 prompt + 91k response) via more trainer GPUs plus CPU optimizer offload; 4-node
 layouts add rollout capacity the same way. Preflight is fatal if `NNODES` doesn't
-equal the sum. A few knobs govern the async behavior:
+equal the sum, except for the supported single-node 1+1 GPU split when
+`ALLOW_SINGLE_NODE_ASYNC_SPLIT=1` (the default) and the two per-role GPU requests
+fit on the node. A few knobs govern the async behavior:
 
 | Knob | Role |
 | --- | --- |

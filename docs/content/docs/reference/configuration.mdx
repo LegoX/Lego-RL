@@ -96,7 +96,7 @@ failure rate on step 0 (see
 | --- | --- |
 | `PROJECT_NAME` / `EXP_TAG` | wandb project + experiment name; also the `checkpoints/` and `harbor_trials/` path |
 | `TRAIN_INDEX` / `VAL_INDEX` | [Task indexes](/docs/data-preparation#task-index) — thin parquet rows pointing at Harbor task dirs |
-| `NNODES` / `N_NODES_TRAIN` / `N_NODES_ROLLOUT` | topology. `NNODES` must equal the sum; preflight is fatal otherwise, because a mismatched Ray cluster hangs in placement |
+| `NNODES` / `N_NODES_TRAIN` / `N_NODES_ROLLOUT` | topology. Normally `NNODES` equals the sum; with `ALLOW_SINGLE_NODE_ASYNC_SPLIT=1` (default), async may use one node with a 1+1 trainer/rollout split when per-role GPU requests fit the node |
 | `POD_NAME_PREFIX` | label prefix for this run's sandbox pods (used by cleanup) |
 
 **eval** replaces the data inputs with `DATASET_PATH` (a directory of harbor task dirs)
