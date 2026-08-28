@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
     cat >&2 <<'USAGE'
 Usage:
-  scripts/train/train.sh [--dry-run|--preflight-only] path_to_config
+  scripts/train/train.sh [--dry-run|--preflight-only|--structure-only] path_to_config
 
 The config is sourced first, then its TEMPLATE_MODULES are sourced from
 scripts/templates in order. Config values should be explicit experiment choices;
@@ -13,15 +13,22 @@ templates provide module defaults and derived values.
   --preflight-only   resolve the config, run scripts/lib/preflight.sh, exit.
                      Equivalent to PREFLIGHT_ONLY=1. Launches nothing.
   --dry-run          the above, plus the fully expanded launch command.
+  --structure-only   preflight, minus every check that needs the checkpoint, the
+                     task indexes or the kubeconfig to exist on this machine.
+                     Proves the install and the config are wired up before any
+                     data is in place. Equivalent to PF_STRUCTURE_ONLY=1.
 USAGE
 }
 
 DRY_RUN=0
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+PF_STRUCTURE_ONLY="${PF_STRUCTURE_ONLY:-0}"
+[ "$PF_STRUCTURE_ONLY" = "1" ] && PREFLIGHT_ONLY=1
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run)        DRY_RUN=1; shift ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
+        --structure-only) PREFLIGHT_ONLY=1; PF_STRUCTURE_ONLY=1; shift ;;
         *) break ;;
     esac
 done
@@ -39,7 +46,7 @@ if [[ "$CONFIG_PATH" != /* ]]; then
 fi
 [ -f "$CONFIG_PATH" ] || { echo "[FATAL] config not found: $CONFIG_PATH" >&2; exit 1; }
 
-export REPO_ROOT TEMPLATE_ROOT TRAIN_LIB_DIR CONFIG_PATH DRY_RUN PREFLIGHT_ONLY
+export REPO_ROOT TEMPLATE_ROOT TRAIN_LIB_DIR CONFIG_PATH DRY_RUN PREFLIGHT_ONLY PF_STRUCTURE_ONLY
 
 # shellcheck disable=SC1091
 source "$TRAIN_LIB_DIR/runtime.sh"
@@ -60,7 +67,11 @@ print_run_configuration
 # otherwise surfaces minutes into a run, or not at all.
 run_preflight
 if [ "$PREFLIGHT_ONLY" = "1" ]; then
-    echo "[preflight-only] checks passed; not launching (PREFLIGHT_ONLY=1)."
+    if [ "$PF_STRUCTURE_ONLY" = "1" ]; then
+        echo "[structure-only] config and install look sound; not launching."
+    else
+        echo "[preflight-only] checks passed; not launching (PREFLIGHT_ONLY=1)."
+    fi
     exit 0
 fi
 

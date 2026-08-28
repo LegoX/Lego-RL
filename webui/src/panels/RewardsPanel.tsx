@@ -41,7 +41,7 @@ export default function RewardsPanel({ data }: Props) {
             meanKey="critic/score/mean"
             maxKey="critic/score/max"
             minKey="critic/score/min"
-            color="#10b981"
+            color="#4a9440"
           />
         ) : (
           <>
@@ -51,7 +51,7 @@ export default function RewardsPanel({ data }: Props) {
               meanKey="critic/score/mean"
               maxKey="critic/score/max"
               minKey="critic/score/min"
-              color="#10b981"
+              color="#4a9440"
             />
             <MinMaxChart
               title="Rewards"
@@ -59,7 +59,7 @@ export default function RewardsPanel({ data }: Props) {
               meanKey="critic/rewards/mean"
               maxKey="critic/rewards/max"
               minKey="critic/rewards/min"
-              color="#06b6d4"
+              color="#199e70"
             />
           </>
         )}
@@ -69,7 +69,7 @@ export default function RewardsPanel({ data }: Props) {
           meanKey="critic/advantages/mean"
           maxKey="critic/advantages/max"
           minKey="critic/advantages/min"
-          color="#8b5cf6"
+          color="#7a6ddb"
         />
         <MinMaxChart
           title="Returns"
@@ -77,14 +77,14 @@ export default function RewardsPanel({ data }: Props) {
           meanKey="critic/returns/mean"
           maxKey="critic/returns/max"
           minKey="critic/returns/min"
-          color="#f59e0b"
+          color="#e0a01a"
         />
         {!scoreEqualsReward && (
           <ChartPanel
             title="Score & Reward Trend"
             data={data}
             keys={["critic/score/mean", "critic/rewards/mean"]}
-            colors={["#10b981", "#06b6d4"]}
+            colors={["#4a9440", "#199e70"]}
             showArea
           />
         )}
@@ -96,7 +96,7 @@ export default function RewardsPanel({ data }: Props) {
             "critic/advantages/max",
             "critic/advantages/min",
           ]}
-          colors={["#8b5cf6", "#c4b5fd", "#7c3aed"]}
+          colors={["#7a6ddb", "#b3aae8", "#5a4bc0"]}
         />
       </div>
     </div>

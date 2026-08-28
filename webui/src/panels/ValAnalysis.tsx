@@ -47,7 +47,7 @@ function shortRepo(r: string): string {
   return i >= 0 ? r.slice(i + 2) : r;
 }
 function hslRamp(v: number | null): string {
-  if (v === null) return "#1e293b";
+  if (v === null) return "#302a24";
   return `hsl(${v * 130}, 72%, 50%)`; // 0 red -> green
 }
 // Label a val event by the trainer step it belongs to; fall back to the raw
@@ -88,7 +88,7 @@ function Radar({
   return (
     <svg viewBox="0 0 340 340" className="w-full max-w-[420px]">
       {[0.25, 0.5, 0.75, 1].map((g) => (
-        <polygon key={g} points={repos.map((_r, i) => pt(i, g).join(",")).join(" ")} fill="none" stroke="#334155" strokeWidth={0.5} />
+        <polygon key={g} points={repos.map((_r, i) => pt(i, g).join(",")).join(" ")} fill="none" stroke="#3d352d" strokeWidth={0.5} />
       ))}
       {repos.map((r, i) => {
         const [x, y] = pt(i, 1);
@@ -100,27 +100,27 @@ function Radar({
           v == null ? "—" : `${Math.round(v * 100)}%`;
         return (
           <g key={r}>
-            <line x1={C} y1={C} x2={x} y2={y} stroke="#334155" strokeWidth={0.5} />
-            <text x={lx} y={ly - 4} fontSize={8.5} fill="#94a3b8" textAnchor={anchor} dominantBaseline="middle">
+            <line x1={C} y1={C} x2={x} y2={y} stroke="#3d352d" strokeWidth={0.5} />
+            <text x={lx} y={ly - 4} fontSize={8.5} fill="#a9a297" textAnchor={anchor} dominantBaseline="middle">
               {shortRepo(r)}
             </text>
             {/* numeric readout at each vertex: first → best solve rate */}
             <text x={lx} y={ly + 6} fontSize={8} textAnchor={anchor} dominantBaseline="middle">
-              <tspan fill="#94a3b8">{pct(fv)}</tspan>
-              <tspan fill="#64748b">→</tspan>
-              <tspan fill="#10b981" fontWeight="600">{pct(bv)}</tspan>
+              <tspan fill="#a9a297">{pct(fv)}</tspan>
+              <tspan fill="#8a847a">→</tspan>
+              <tspan fill="#4a9440" fontWeight="600">{pct(bv)}</tspan>
             </text>
           </g>
         );
       })}
-      <polygon points={poly(first)} fill="rgba(148,163,184,0.12)" stroke="#94a3b8" strokeWidth={1.5} strokeDasharray="4 3" />
-      <polygon points={poly(best)} fill="rgba(16,185,129,0.18)" stroke="#10b981" strokeWidth={2} />
+      <polygon points={poly(first)} fill="rgba(169,162,151,0.12)" stroke="#a9a297" strokeWidth={1.5} strokeDasharray="4 3" />
+      <polygon points={poly(best)} fill="rgba(74,148,64,0.18)" stroke="#4a9440" strokeWidth={2} />
       {/* value dots on the best polygon so each rate is anchored to its vertex */}
       {repos.map((r, i) => {
         const bv = best[r];
         if (bv == null) return null;
         const [px, py] = pt(i, bv);
-        return <circle key={r} cx={px} cy={py} r={2} fill="#10b981" />;
+        return <circle key={r} cx={px} cy={py} r={2} fill="#4a9440" />;
       })}
     </svg>
   );

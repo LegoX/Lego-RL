@@ -4,14 +4,14 @@ import ChartPanel from "../components/Chart";
 import type { MetricPoint } from "../types";
 
 const CHART_COLORS = [
-  "#6366f1",
-  "#10b981",
-  "#f59e0b",
-  "#f43f5e",
-  "#8b5cf6",
-  "#06b6d4",
-  "#ec4899",
-  "#84cc16",
+  "#c96a45",
+  "#4a9440",
+  "#e0a01a",
+  "#d03b3b",
+  "#7a6ddb",
+  "#199e70",
+  "#b8506e",
+  "#8aa02a",
 ];
 
 interface Props {

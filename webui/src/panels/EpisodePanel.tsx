@@ -98,7 +98,7 @@ export default function EpisodePanel({ data }: Props) {
           meanKey="num_turns/mean"
           maxKey="num_turns/max"
           minKey="num_turns/min"
-          color="#f59e0b"
+          color="#e0a01a"
         />
         <MinMaxChart
           title="Response Length (tokens)"
@@ -106,7 +106,7 @@ export default function EpisodePanel({ data }: Props) {
           meanKey="response_length/mean"
           maxKey="response_length/max"
           minKey="response_length/min"
-          color="#06b6d4"
+          color="#199e70"
         />
         <MinMaxChart
           title="Episode Duration (s)"
@@ -114,7 +114,7 @@ export default function EpisodePanel({ data }: Props) {
           meanKey="timing_s/agent_loop/harbor_total/mean"
           maxKey="timing_s/agent_loop/harbor_total/max"
           minKey="timing_s/agent_loop/harbor_total/min"
-          color="#6366f1"
+          color="#c96a45"
         />
         <ChartPanel
           title="Completion Tokens / response"
@@ -123,7 +123,7 @@ export default function EpisodePanel({ data }: Props) {
             "timing_s/agent_loop/proxy_total_completion_tokens/mean",
             "timing_s/agent_loop/proxy_total_completion_tokens/max",
           ]}
-          colors={["#8b5cf6", "#c4b5fd"]}
+          colors={["#7a6ddb", "#b3aae8"]}
         />
         <ChartPanel
           title="Abnormal Exits (ratio / count)"
@@ -133,7 +133,7 @@ export default function EpisodePanel({ data }: Props) {
             "trajectory_filter/reason/env_setup_failed",
             "trajectory_filter/reason/timeout",
           ]}
-          colors={["#f43f5e", "#fb7185", "#f59e0b"]}
+          colors={["#d03b3b", "#e07070", "#e0a01a"]}
         />
         <ChartPanel
           title="Truncation (length-clip / overlong / max-turns)"
@@ -144,7 +144,7 @@ export default function EpisodePanel({ data }: Props) {
             "trajectory_filter/reason/overlong",
             "trajectory_filter/reason/max_turns_reached",
           ]}
-          colors={["#f59e0b", "#fbbf24", "#8b5cf6", "#ec4899"]}
+          colors={["#e0a01a", "#fab219", "#7a6ddb", "#b8506e"]}
         />
       </div>
     </div>

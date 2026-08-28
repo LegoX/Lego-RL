@@ -3,45 +3,143 @@
 @tailwind utilities;
 
 @layer base {
-  /* Dark theme. Toned down from stock Tailwind slate: the top end was close to
-     pure white on a near-black ground, which reads as glare on a board people
-     keep open for hours. Highlights come down a few percent and the background
-     comes up slightly — same hierarchy, lower contrast. Mid tones (500-800) are
-     untouched: they carry borders and dividers, and moving them blurs structure. */
-  :root {
-    --c-slate-50: 234 238 245;
-    --c-slate-100: 220 226 236;
-    --c-slate-200: 200 209 223;
-    --c-slate-300: 178 189 205;
-    --c-slate-400: 140 154 175;
-    --c-slate-500: 100 116 139;
-    --c-slate-600: 71 85 105;
-    --c-slate-700: 51 65 85;
-    --c-slate-800: 30 41 59;
-    --c-slate-900: 18 26 45;
-    --c-slate-950: 9 14 31;
+  /* Palette matched to the LegoFlow site (legoflow-tracer.pages.dev): warm
+     paper-and-ink neutrals instead of cool blue-greys, terracotta as the single
+     accent. Every ramp below is driven from these variables, so the components
+     keep writing `text-slate-500` / `text-indigo-400` and pick up the brand
+     colours without touching a single class name.
 
-    --chart-grid: #1e293b;
-    --chart-axis: #475569;
-    --chart-tick: #64748b;
+     Theme layout mirrors the site: light lives on :root and is what you get with
+     no attribute set, dark is opt-in via [data-theme="dark"]. (This board used to
+     be the other way round.)
+
+     Convention inherited from the original board, kept intact: a lower number is
+     brighter in dark mode and darker in light mode. Both themes are defined for
+     every ramp — previously only the neutrals flipped, which left accents washed
+     out on the light background.
+
+     Surface roles, same in both themes and same as the site:
+       slate-950 = page ground   (--bg)
+       slate-900 = card          (--panel)
+       slate-800 = hairline border and soft chip fill (--line / --panel-softer)
+       slate-700 = stronger border */
+  :root {
+    color-scheme: light;
+
+    /* Neutrals — LegoFlow light: bg #fafaf7, panel #fff, softer #f1efe9,
+       line #e6e3da, text #111111, dim #4a453e, muted #6b6b66, faint #8c8c85. */
+    --c-slate-50: 17 17 17;
+    --c-slate-100: 31 28 24;
+    --c-slate-200: 51 48 42;
+    --c-slate-300: 74 69 62;
+    --c-slate-400: 107 107 102;
+    --c-slate-500: 140 140 133;
+    --c-slate-600: 189 182 166;
+    --c-slate-700: 216 211 198;
+    --c-slate-800: 232 229 219;
+    --c-slate-900: 255 255 255;
+    --c-slate-950: 250 250 247;
+
+    --c-indigo-200: 125 46 20;
+    --c-indigo-300: 151 56 26;
+    --c-indigo-400: 168 63 29;
+    --c-indigo-500: 179 67 31;
+    --c-indigo-600: 201 106 69;
+
+    --c-emerald-300: 44 106 32;
+    --c-emerald-400: 53 122 39;
+    --c-emerald-500: 63 143 47;
+    --c-emerald-600: 74 148 64;
+
+    --c-rose-300: 156 42 42;
+    --c-rose-400: 184 48 48;
+    --c-rose-500: 208 59 59;
+    --c-rose-600: 222 92 92;
+
+    --c-amber-300: 138 90 16;
+    --c-amber-400: 168 111 14;
+    --c-amber-500: 200 134 13;
+    --c-amber-600: 224 160 26;
+
+    --c-violet-300: 58 45 130;
+    --c-violet-400: 74 58 167;
+    --c-violet-500: 90 75 192;
+    --c-violet-600: 122 109 219;
+
+    /* teal and cyan share the site's single blue-green (#199e70) */
+    --c-teal-200: 14 92 67;
+    --c-teal-300: 16 104 75;
+    --c-teal-400: 20 127 92;
+    --c-teal-500: 25 158 112;
+    --c-teal-600: 63 185 140;
+
+    /* the site remaps --blue onto the accent; kept a shade apart from indigo so
+       charts that use both still separate */
+    --c-blue-400: 168 63 29;
+    --c-blue-500: 179 67 31;
+
+    --chart-grid: #e6e3da;
+    --chart-axis: #cfc9bc;
+    --chart-tick: #8c8c85;
   }
 
-  [data-theme="light"] {
-    --c-slate-50: 2 6 23;
-    --c-slate-100: 15 23 42;
-    --c-slate-200: 30 41 59;
-    --c-slate-300: 51 65 85;
-    --c-slate-400: 100 116 139;
-    --c-slate-500: 148 163 184;
-    --c-slate-600: 179 189 204;
-    --c-slate-700: 203 213 225;
-    --c-slate-800: 226 232 240;
-    --c-slate-900: 241 245 249;
-    --c-slate-950: 255 255 255;
+  [data-theme="dark"] {
+    color-scheme: dark;
 
-    --chart-grid: #e2e8f0;
-    --chart-axis: #94a3b8;
-    --chart-tick: #64748b;
+    /* Neutrals — LegoFlow dark: bg #14110e, panel #1a1714, line #302a24,
+       text #f0ede7, muted #a9a297, faint #8a847a. */
+    --c-slate-50: 240 237 231;
+    --c-slate-100: 232 227 218;
+    --c-slate-200: 221 215 205;
+    --c-slate-300: 201 194 182;
+    --c-slate-400: 169 162 151;
+    --c-slate-500: 138 132 122;
+    --c-slate-600: 81 71 64;
+    --c-slate-700: 61 53 45;
+    --c-slate-800: 48 42 36;
+    --c-slate-900: 26 23 20;
+    --c-slate-950: 20 17 14;
+
+    /* Accent lifts to the peach end the way the site's dark theme does, so it
+       stays legible on the brown ground. */
+    --c-indigo-200: 248 221 206;
+    --c-indigo-300: 245 201 180;
+    --c-indigo-400: 239 160 124;
+    --c-indigo-500: 221 138 99;
+    --c-indigo-600: 201 106 69;
+
+    --c-emerald-300: 156 203 142;
+    --c-emerald-400: 119 181 102;
+    --c-emerald-500: 74 148 64;
+    --c-emerald-600: 63 143 47;
+
+    --c-rose-300: 235 160 160;
+    --c-rose-400: 224 112 112;
+    --c-rose-500: 208 59 59;
+    --c-rose-600: 184 48 48;
+
+    --c-amber-300: 253 215 122;
+    --c-amber-400: 250 178 25;
+    --c-amber-500: 224 160 26;
+    --c-amber-600: 200 134 13;
+
+    --c-violet-300: 179 170 232;
+    --c-violet-400: 144 133 233;
+    --c-violet-500: 122 109 219;
+    --c-violet-600: 99 87 196;
+
+    --c-teal-200: 168 224 200;
+    --c-teal-300: 127 208 174;
+    --c-teal-400: 63 185 140;
+    --c-teal-500: 25 158 112;
+    --c-teal-600: 20 127 92;
+
+    --c-blue-400: 239 160 124;
+    --c-blue-500: 221 138 99;
+
+    --chart-grid: #302a24;
+    --chart-axis: #514740;
+    --chart-tick: #8a847a;
   }
 
   ::-webkit-scrollbar {

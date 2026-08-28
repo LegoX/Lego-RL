@@ -20,9 +20,9 @@ interface Props {
 }
 
 const RUN_COLORS = [
-  "#6366f1", "#10b981", "#f59e0b", "#f43f5e",
-  "#8b5cf6", "#06b6d4", "#ec4899", "#84cc16",
-  "#fb923c", "#a78bfa", "#2dd4bf", "#fbbf24",
+  "#c96a45", "#4a9440", "#e0a01a", "#d03b3b",
+  "#7a6ddb", "#199e70", "#b8506e", "#8aa02a",
+  "#ef9d6a", "#9085e9", "#3fb98c", "#fab219",
 ];
 
 const DEFAULT_METRICS = [
@@ -157,15 +157,15 @@ function CompareChart({
             />
             <Tooltip
               contentStyle={{
-                background: "#1e293b",
-                border: "1px solid #334155",
+                background: "#302a24",
+                border: "1px solid #3d352d",
                 borderRadius: 8,
                 fontSize: 12,
               }}
               formatter={(v: number) => formatValue(v)}
             />
             <Legend
-              wrapperStyle={{ fontSize: 11, color: "#94a3b8" }}
+              wrapperStyle={{ fontSize: 11, color: "#a9a297" }}
               iconType="plainline"
             />
             {lineLabels.map((label, i) => (

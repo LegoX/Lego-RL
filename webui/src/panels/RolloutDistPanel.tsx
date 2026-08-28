@@ -32,12 +32,12 @@ interface Props {
 // reason string leaks through.
 // ---------------------------------------------------------------------------
 const REASONS = [
-  { key: "agent_completed", color: "#10b981", group: "kept" as const },
-  { key: "overlong", color: "#8b5cf6", group: "kept" as const },
-  { key: "max_turns_reached", color: "#06b6d4", group: "kept" as const },
-  { key: "timeout", color: "#f59e0b", group: "dropped" as const },
-  { key: "env_setup_failed", color: "#f43f5e", group: "dropped" as const },
-  { key: "unknown", color: "#64748b", group: "other" as const },
+  { key: "agent_completed", color: "#4a9440", group: "kept" as const },
+  { key: "overlong", color: "#7a6ddb", group: "kept" as const },
+  { key: "max_turns_reached", color: "#199e70", group: "kept" as const },
+  { key: "timeout", color: "#e0a01a", group: "dropped" as const },
+  { key: "env_setup_failed", color: "#d03b3b", group: "dropped" as const },
+  { key: "unknown", color: "#8a847a", group: "other" as const },
 ] as const;
 
 const REASON_KEY = (k: string) => `trajectory_filter/reason/${k}`;
@@ -177,15 +177,15 @@ function TerminationBreakdown({ data }: { data: MetricPoint[] }) {
       <div className="rounded-xl bg-slate-900/80 border border-slate-800/60 p-4">
         <ResponsiveContainer width="100%" height={300}>
           <AreaChart data={rows} margin={{ top: 8, right: 16, bottom: 4, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+            <CartesianGrid strokeDasharray="3 3" stroke="#302a24" />
             <XAxis
               dataKey="step"
-              tick={{ fill: "#64748b", fontSize: 11 }}
-              stroke="#334155"
+              tick={{ fill: "#8a847a", fontSize: 11 }}
+              stroke="#3d352d"
             />
             <YAxis
-              tick={{ fill: "#64748b", fontSize: 11 }}
-              stroke="#334155"
+              tick={{ fill: "#8a847a", fontSize: 11 }}
+              stroke="#3d352d"
               domain={mode === "frac" ? [0, 1] : [0, "auto"]}
               tickFormatter={(v: number) =>
                 mode === "frac" ? `${Math.round(v * 100)}%` : `${v}`
@@ -193,12 +193,12 @@ function TerminationBreakdown({ data }: { data: MetricPoint[] }) {
             />
             <Tooltip
               contentStyle={{
-                background: "#0f172a",
-                border: "1px solid #1e293b",
+                background: "#1a1714",
+                border: "1px solid #302a24",
                 borderRadius: 8,
                 fontSize: 12,
               }}
-              labelStyle={{ color: "#cbd5e1" }}
+              labelStyle={{ color: "#ddd7cd" }}
               formatter={(v: number, name: string) => [
                 mode === "frac" ? `${(v * 100).toFixed(1)}%` : v.toLocaleString(),
                 name,

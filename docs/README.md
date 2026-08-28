@@ -1,13 +1,27 @@
 # Lego-RL docs
 
 User-facing documentation for [Lego-RL](../README.md), built as a
-[fumadocs](https://fumadocs.dev/) (Next.js) site and deployed to Cloudflare
-Pages as a static export.
-
-Live site: **<https://lego-rl.pages.dev>**
+[fumadocs](https://fumadocs.dev/) (Next.js) site, exported statically and
+deployed to Cloudflare Pages.
 
 The prose lives in `content/docs/`; everything else is the minimal app shell
 needed to render and deploy it.
+
+> [!IMPORTANT]
+> **This tree is not what <https://lego-rl.pages.dev> currently serves.** The
+> live site is published from a separate internal copy of these docs, whose page
+> structure has since moved on (`getting-started` split into
+> `installation` / `configuration` / `demo`, `data-preparation` expanded into
+> `data/`, `run-training/` renamed to `training-run/`, plus pages that do not
+> exist here). Old routes still resolve there through that copy's `_redirects`,
+> which is why links into the live site from this repo keep working.
+>
+> The practical consequence: **editing `content/docs/` here does not change the
+> published site.** `deploy_cloudflare_pages.sh` below does work and would
+> publish this tree — which is exactly why you should not run it casually, as it
+> would overwrite the live site with this older structure. Until the two are
+> reconciled, treat this directory as the open-source snapshot of the docs and
+> send documentation changes through the maintainers.
 
 ## Requirements
 

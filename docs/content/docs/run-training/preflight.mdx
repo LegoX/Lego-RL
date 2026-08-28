@@ -8,25 +8,46 @@ config only — no cluster calls, no side effects — and **exits non-zero on th
 class of fatal misconfiguration**, so a wrong knob costs you five seconds instead of
 five hours.
 
-Both switches below are environment variables prefixed to the normal launch
-command — the runner does its config resolution and checks, prints the report,
-and exits instead of launching:
+The switches below make the runner resolve the config, run the checks, print the
+report, and exit instead of launching. Each is a flag on `train.sh`, or the
+equivalent environment variable prefixed to the normal launch command:
 
 ```bash
-# PREFLIGHT_ONLY=1 — validate only, then stop
+# validate only, then stop
+bash scripts/train/train.sh --preflight-only train/configs/my_run.env
 PREFLIGHT_ONLY=1 bash scripts/train/train.sh train/configs/my_run.env
 
-# DRY_RUN=1 — validate + print the fully expanded launch command, then stop
+# validate + print the fully expanded launch command, then stop
+bash scripts/train/train.sh --dry-run train/configs/my_run.env
 DRY_RUN=1 bash scripts/train/train.sh train/configs/my_run.env
+
+# validate the config alone, without needing the data on this machine
+bash scripts/train/train.sh --structure-only train/configs/my_run.env
+PF_STRUCTURE_ONLY=1 bash scripts/train/train.sh train/configs/my_run.env
 ```
 
-Output is one line per check: `✓` pass, `⚠ WARN` (proceeds), `✗ FATAL` (refuses).
+Output is one line per check: `✓` pass, `⚠ WARN` (proceeds), `✗ FATAL` (refuses),
+`⊘ SKIP` (structure-only).
 
 <Callout title="Never launch past a FATAL" type="warn">
 Preflight has no `--force`. A multi-hour, multi-GPU run that starts with a fatal
 config does not fail fast — it fails *expensively*, usually as an all-zero reward or
 a hang several steps in. Fix the `✗` items, re-run preflight, then launch.
 </Callout>
+
+## Structure-only
+
+`--structure-only` runs every check that reads config values alone and skips the
+ones that need something on this disk — the checkpoint's `config.json`, the task
+index parquets, `NEW_VERL_DIR`, the kubeconfig. Use it to prove a fresh clone is
+wired up correctly before the model and the task set are in place, or to check a
+config on a machine that will never hold either. It implies `--preflight-only`:
+nothing launches.
+
+Everything else still runs, including the four highest-risk classes below —
+`tool_parser`, topology, device mesh and R3 consistency are all config arithmetic.
+What structure-only cannot tell you is whether `ENABLE_R3` matches the checkpoint,
+since that verdict is read off the model's `config.json`.
 
 ## Assertion classes
 

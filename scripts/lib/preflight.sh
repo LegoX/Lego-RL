@@ -29,9 +29,14 @@ fi
 
 _PF_ERR=0
 _PF_WARN=0
+# Structure-only mode: run every check that reads config values alone, and skip the
+# ones that need the checkpoint, the indexes or the kubeconfig to be on this disk.
+# Lets a fresh clone prove the software path is wired up before any data exists.
+_PF_STRUCT="${PF_STRUCTURE_ONLY:-0}"
 _pf_fatal() { printf '  \033[31m✗ FATAL\033[0m  %s\n' "$*" >&2; _PF_ERR=$((_PF_ERR+1)); }
 _pf_warn()  { printf '  \033[33m⚠ WARN \033[0m  %s\n' "$*" >&2; _PF_WARN=$((_PF_WARN+1)); }
 _pf_ok()    { printf '  \033[32m✓ OK   \033[0m  %s\n' "$*"; }
+_pf_skip()  { printf '  \033[36m⊘ SKIP \033[0m  %s\n' "$*"; }
 _lc() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 _pf_probe_verl_has_router_replay() {
     local py="${PYTHON_BIN:-python3}" origin root
@@ -132,7 +137,9 @@ fi
 # patches 0 router gates and silently trains without replay while the rollout
 # still passes --enable-return-routed-experts to vLLM. Block the first, warn on
 # the second, and warn when a MoE run is leaving R3 on the table.
-if [ -n "${MODEL_PATH:-}" ] && command -v model_is_moe >/dev/null 2>&1; then
+if [ "$_PF_STRUCT" = "1" ]; then
+    _pf_skip "R3 × MoE check: needs the checkpoint's config.json on disk"
+elif [ -n "${MODEL_PATH:-}" ] && command -v model_is_moe >/dev/null 2>&1; then
     # Called directly, not via $(model_moe_verdict) — a command substitution would
     # run in a subshell and MODEL_MOE_REASON would not survive it.
     if model_is_moe "$MODEL_PATH"; then
@@ -207,8 +214,10 @@ if [ "$(_lc "${BACKEND:-k8s}")" = k8s ]; then
     else
         _pf_fatal "IMAGE_REGISTRY empty and INLINE_BUILD=false → no image source, pod won't start → env_setup_failed all crash"
     fi
-    if [ -n "${K8S_KUBECONFIG:-}" ] && [ ! -f "${K8S_KUBECONFIG}" ]; then
-        _pf_fatal "K8S_KUBECONFIG file does not exist: ${K8S_KUBECONFIG} (cluster path should be set in lib/site.env)"
+    if [ "$_PF_STRUCT" = "1" ]; then
+        _pf_skip "K8S_KUBECONFIG existence: needs the cluster's kubeconfig on disk"
+    elif [ -n "${K8S_KUBECONFIG:-}" ] && [ ! -f "${K8S_KUBECONFIG}" ]; then
+        _pf_fatal "K8S_KUBECONFIG file does not exist: ${K8S_KUBECONFIG} (cluster path should be set in scripts/lib/site.env)"
     fi
     [ -z "${NYDUS_MIRROR:-}" ] && _pf_warn "NYDUS_MIRROR empty: if val uses official swebench images (swebench/sweb.eval.*) and pod has no Docker Hub egress → val reward=0 (related val-zero-swebench-image-unpullable-221)"
 else
@@ -245,6 +254,10 @@ case "${PF_KIND:-train}" in
     infer) _pf_path_vars="MODEL_PATH TRAIN_INDEX INSTANCES_FILE" ;;
     *)     _pf_path_vars="MODEL_PATH TRAIN_INDEX VAL_INDEX" ;;
 esac
+if [ "$_PF_STRUCT" = "1" ]; then
+    _pf_skip "path existence ($_pf_path_vars): structure-only run"
+    _pf_path_vars=""
+fi
 for _k in $_pf_path_vars; do
     eval "_v=\"\${$_k:-}\""
     if [ -z "$_v" ]; then
@@ -259,6 +272,10 @@ if [ "$_PF_ERR" -gt 0 ]; then
     printf '\033[31m[preflight] %d FATAL, %d WARN — refusing to start. Fix the ✗ items above.\033[0m\n' "$_PF_ERR" "$_PF_WARN" >&2
     return 1 2>/dev/null || exit 1
 else
-    printf '\033[32m[preflight] all fatal checks passed (%d WARN).\033[0m\n' "$_PF_WARN"
+    if [ "$_PF_STRUCT" = "1" ]; then
+        printf '\033[32m[preflight] structure-only: all config checks passed (%d WARN). Filesystem checks skipped.\033[0m\n' "$_PF_WARN"
+    else
+        printf '\033[32m[preflight] all fatal checks passed (%d WARN).\033[0m\n' "$_PF_WARN"
+    fi
     return 0 2>/dev/null || exit 0
 fi

@@ -17,78 +17,78 @@ export default function OverviewPanel({ data, runId }: Props) {
           metricKey="training/global_step"
           data={data}
           format="int"
-          color="#6366f1"
+          color="#c96a45"
         />
         <MetricCard
           label="Epoch"
           metricKey="training/epoch"
           data={data}
           format="int"
-          color="#8b5cf6"
+          color="#7a6ddb"
         />
         <MetricCard
           label="Reward (mean)"
           metricKey="critic/rewards/mean"
           data={data}
-          color="#10b981"
+          color="#4a9440"
         />
         <MetricCard
           label="Score (mean)"
           metricKey="critic/score/mean"
           data={data}
-          color="#06b6d4"
+          color="#199e70"
         />
         <MetricCard
           label="Actor Loss"
           metricKey="actor/pg_loss"
           data={data}
-          color="#f59e0b"
+          color="#e0a01a"
         />
         <MetricCard
           label="Entropy"
           metricKey="actor/entropy"
           data={data}
-          color="#ec4899"
+          color="#b8506e"
         />
         <MetricCard
           label="PPO KL"
           metricKey="actor/ppo_kl"
           data={data}
-          color="#f43f5e"
+          color="#d03b3b"
         />
         <MetricCard
           label="Clip Frac"
           metricKey="actor/pg_clipfrac"
           data={data}
           format="percent"
-          color="#f59e0b"
+          color="#e0a01a"
         />
         <MetricCard
           label="Grad Norm"
           metricKey="actor/grad_norm"
           data={data}
-          color="#84cc16"
+          color="#8aa02a"
         />
         <MetricCard
           label="Response Len"
           metricKey="response_length/mean"
           data={data}
           format="int"
-          color="#6366f1"
+          color="#c96a45"
         />
         <MetricCard
           label="Throughput"
           metricKey="perf/throughput"
           data={data}
           format="number"
-          color="#10b981"
+          color="#4a9440"
         />
         <MetricCard
           label="Step Time"
           metricKey="perf/time_per_step"
           data={data}
           format="duration"
-          color="#f59e0b"
+          color="#e0a01a"
         />
       </div>
       <ConfigSection runId={runId ?? null} />

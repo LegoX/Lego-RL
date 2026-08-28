@@ -24,7 +24,7 @@ export default function StabilityPanel({ data }: Props) {
             "rollout_corr/k3_kl",
             "rollout_corr/training_ppl",
           ]}
-          colors={["#f43f5e", "#fb7185", "#f59e0b"]}
+          colors={["#d03b3b", "#e07070", "#e0a01a"]}
         />
         <ChartPanel
           title="Log-Perplexity Diff"
@@ -34,13 +34,13 @@ export default function StabilityPanel({ data }: Props) {
             "rollout_corr/log_ppl_diff_max",
             "rollout_corr/log_ppl_diff_min",
           ]}
-          colors={["#8b5cf6", "#c4b5fd", "#7c3aed"]}
+          colors={["#7a6ddb", "#b3aae8", "#5a4bc0"]}
         />
         <ChartPanel
           title="Chi-Squared Test"
           data={data}
           keys={["rollout_corr/chi2_token", "rollout_corr/chi2_seq"]}
-          colors={["#06b6d4", "#0891b2"]}
+          colors={["#199e70", "#147f5c"]}
         />
         <ChartPanel
           title="Importance Sampling Weights"
@@ -51,7 +51,7 @@ export default function StabilityPanel({ data }: Props) {
             "rollout_is_min",
             "rollout_is_std",
           ]}
-          colors={["#6366f1", "#818cf8", "#4f46e5", "#a5b4fc"]}
+          colors={["#c96a45", "#dd8a63", "#a83f1d", "#efa07c"]}
         />
         <ChartPanel
           title="IS Per-Sequence Stats"
@@ -61,7 +61,7 @@ export default function StabilityPanel({ data }: Props) {
             "rollout_is_seq_max",
             "rollout_is_seq_min",
           ]}
-          colors={["#10b981", "#6ee7b7", "#059669"]}
+          colors={["#4a9440", "#9ccb8e", "#3f8f2f"]}
         />
         <ChartPanel
           title="IS Diagnostics"
@@ -72,7 +72,7 @@ export default function StabilityPanel({ data }: Props) {
             "rollout_is_ratio_fraction_low",
             "rollout_is_eff_sample_size",
           ]}
-          colors={["#f43f5e", "#f59e0b", "#84cc16", "#06b6d4"]}
+          colors={["#d03b3b", "#e0a01a", "#8aa02a", "#199e70"]}
         />
         <ChartPanel
           title="Rollout Probs Diff"
@@ -82,7 +82,7 @@ export default function StabilityPanel({ data }: Props) {
             "training/rollout_probs_diff_max",
             "training/rollout_probs_diff_std",
           ]}
-          colors={["#8b5cf6", "#c4b5fd", "#a78bfa"]}
+          colors={["#7a6ddb", "#b3aae8", "#9085e9"]}
         />
         <ChartPanel
           title="Variance Proxy"
@@ -92,7 +92,7 @@ export default function StabilityPanel({ data }: Props) {
             "variance_proxy/proxy2_total_power",
             "variance_proxy/proxy3_pure_noise",
           ]}
-          colors={["#10b981", "#f59e0b", "#f43f5e"]}
+          colors={["#4a9440", "#e0a01a", "#d03b3b"]}
         />
       </div>
     </div>

@@ -120,7 +120,7 @@ function rgb(r: number, g: number, b: number) {
   return `rgb(${r},${g},${b})`;
 }
 function solveColor(v: number | null): string {
-  if (v === null) return "#1e293b";
+  if (v === null) return "#302a24";
   if (v < 0.5) {
     const t = v / 0.5;
     return rgb(lerp(244, 245, t), lerp(63, 158, t), lerp(94, 11, t));
@@ -129,7 +129,7 @@ function solveColor(v: number | null): string {
   return rgb(lerp(245, 16, t), lerp(158, 185, t), lerp(11, 129, t));
 }
 function deltaColor(v: number | null): string {
-  if (v === null) return "#1e293b";
+  if (v === null) return "#302a24";
   const c = Math.max(-1, Math.min(1, v));
   if (c < 0) return rgb(244, lerp(63, 100, 1 + c), lerp(94, 116, 1 + c));
   return rgb(lerp(100, 16, c), lerp(116, 185, c), lerp(139, 129, c));

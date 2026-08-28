@@ -17,14 +17,14 @@ export default function PerformancePanel({ data }: Props) {
           title="Throughput (tokens/s/GPU)"
           data={data}
           keys={["perf/throughput"]}
-          colors={["#10b981"]}
+          colors={["#4a9440"]}
           showArea
         />
         <ChartPanel
           title="Time per Step"
           data={data}
           keys={["perf/time_per_step"]}
-          colors={["#f59e0b"]}
+          colors={["#e0a01a"]}
           yAxisLabel="seconds"
           showArea
         />
@@ -32,7 +32,7 @@ export default function PerformancePanel({ data }: Props) {
           title="Total Tokens per Step"
           data={data}
           keys={["perf/total_num_tokens"]}
-          colors={["#6366f1"]}
+          colors={["#c96a45"]}
         />
         <ChartPanel
           title="Model FLOPs Utilization (MFU)"
@@ -42,7 +42,7 @@ export default function PerformancePanel({ data }: Props) {
             "perf/mfu/critic",
             "perf/mfu/actor_infer",
           ]}
-          colors={["#6366f1", "#10b981", "#f59e0b"]}
+          colors={["#c96a45", "#4a9440", "#e0a01a"]}
         />
         <ChartPanel
           title="Stage Timing (seconds)"
@@ -56,12 +56,12 @@ export default function PerformancePanel({ data }: Props) {
             "timing_s/update_critic",
           ]}
           colors={[
-            "#6366f1",
-            "#10b981",
-            "#f59e0b",
-            "#f43f5e",
-            "#8b5cf6",
-            "#06b6d4",
+            "#c96a45",
+            "#4a9440",
+            "#e0a01a",
+            "#d03b3b",
+            "#7a6ddb",
+            "#199e70",
           ]}
         />
         <ChartPanel
@@ -72,7 +72,7 @@ export default function PerformancePanel({ data }: Props) {
             "timing_per_token_ms/ref",
             "timing_per_token_ms/update_actor",
           ]}
-          colors={["#6366f1", "#10b981", "#8b5cf6"]}
+          colors={["#c96a45", "#4a9440", "#7a6ddb"]}
         />
       </div>
     </div>
