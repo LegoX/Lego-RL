@@ -142,7 +142,7 @@ The validate step launches nothing. In Claude Code the same run is `/rl:run scri
 Questions, run reports and contributions are welcome. Scan to join the WeChat group:
 
 <div align="center">
- <img src="docs/public/wechat-group.jpg" width="220" alt="Lego-RL WeChat group">
+ <img src="docs/public/wechat_group.jpg" width="220" alt="Lego-RL WeChat group">
 </div>
 
 ## License
