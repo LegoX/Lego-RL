@@ -11,9 +11,10 @@
 # cluster". Every rule is a real pitfall we hit (see MEMORY refs in comments); confirmed wrong=block, suspicious=WARN.
 # =============================================================================
 # Available env vars (config should export them; if missing, fall back to checks here):
-#   MODEL_PATH SCAFFOLD TOOL_PARSER AGENT_NAME ENGINE PROFILE
+#   MODEL_PATH SCAFFOLD TOOL_PARSER AGENT_NAME ENGINE PROFILE TRAINING_MODE
 #   NNODES N_NODES_TRAIN N_NODES_ROLLOUT NGPUS_PER_NODE SP_SIZE
-#   MAX_PROMPT MAX_RESP USE_NEW_VERL ENABLE_R3 NEW_VERL_DIR
+#   TRAINER_N_GPUS_PER_NODE ROLLOUT_N_GPUS_PER_NODE ALLOW_SINGLE_NODE_ASYNC_SPLIT
+#   MAX_PROMPT MAX_RESP VERL_HAS_ROUTER_REPLAY ENABLE_R3
 #   FUSED_KERNELS ACTIVATION_OFFLOAD LR_SCHEDULER VAL_TIMEOUT ROLLOUT_IS
 #   IMAGE_REGISTRY INLINE_BUILD NYDUS_MIRROR K8S_KUBECONFIG
 #   TRAIN_INDEX VAL_INDEX
@@ -37,6 +38,13 @@ _pf_warn()  { printf '  \033[33m⚠ WARN \033[0m  %s\n' "$*" >&2; _PF_WARN=$((_P
 _pf_ok()    { printf '  \033[32m✓ OK   \033[0m  %s\n' "$*"; }
 _pf_skip()  { printf '  \033[36m⊘ SKIP \033[0m  %s\n' "$*"; }
 _lc() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+_pf_probe_verl_has_router_replay() {
+    local py="${PYTHON_BIN:-python3}" origin root
+    origin="$("$py" -c 'import importlib.util as u; s=u.find_spec("verl"); print(s.origin or "")' 2>/dev/null || true)"
+    [ -n "$origin" ] || return 1
+    root="$(dirname "$origin")"
+    [ -f "$root/utils/veomni/router_replay.py" ]
+}
 
 echo "───────────────────────── preflight config check ─────────────────────────"
 
@@ -67,12 +75,31 @@ fi
 # --- 2. topology consistency: NNODES == train + rollout ── most easily missed ─────────────────────
 if [ -n "${NNODES:-}" ] && [ -n "${N_NODES_TRAIN:-}" ] && [ -n "${N_NODES_ROLLOUT:-}" ]; then
     _sum=$((N_NODES_TRAIN + N_NODES_ROLLOUT))
-    if [ "$NNODES" -eq "$_sum" ]; then _pf_ok "topology consistent: NNODES=$NNODES = train $N_NODES_TRAIN + rollout $N_NODES_ROLLOUT"
-    else _pf_fatal "topology inconsistent: NNODES=$NNODES ≠ train($N_NODES_TRAIN)+rollout($N_NODES_ROLLOUT)=$_sum. ray cluster node count must equal the sum of logical roles, otherwise placement hangs/fails"; fi
+    if [ "$NNODES" -eq "$_sum" ]; then
+        _pf_ok "topology consistent: NNODES=$NNODES = train $N_NODES_TRAIN + rollout $N_NODES_ROLLOUT"
+    elif [ "${ALLOW_SINGLE_NODE_ASYNC_SPLIT:-1}" = "1" ] \
+        && [ "${TRAINING_MODE:-}" = "async" ] \
+        && [ "$NNODES" -eq 1 ] \
+        && [ "$N_NODES_TRAIN" -eq 1 ] \
+        && [ "$N_NODES_ROLLOUT" -eq 1 ]; then
+        _trainer_gpn="${TRAINER_N_GPUS_PER_NODE:-${NGPUS_PER_NODE:-8}}"
+        _rollout_gpn="${ROLLOUT_N_GPUS_PER_NODE:-${NGPUS_PER_NODE:-8}}"
+        _split_gpus=$((_trainer_gpn + _rollout_gpn))
+        _node_gpus="${NGPUS_PER_NODE:-8}"
+        if [ "$_split_gpus" -le "$_node_gpus" ]; then
+            _pf_ok "single-node async split allowed: NNODES=1 with train=${_trainer_gpn} GPU + rollout=${_rollout_gpn} GPU (capacity ${_split_gpus}/${_node_gpus})"
+        else
+            _pf_fatal "single-node async split requests ${_split_gpus} GPUs (train=${_trainer_gpn} + rollout=${_rollout_gpn}) but NGPUS_PER_NODE=${_node_gpus}; reduce per-role GPU counts or use separate nodes"
+        fi
+    else
+        _pf_fatal "topology inconsistent: NNODES=$NNODES ≠ train($N_NODES_TRAIN)+rollout($N_NODES_ROLLOUT)=$_sum. ray cluster node count must equal the sum of logical roles, otherwise placement hangs/fails"
+    fi
 fi
 
 # --- 3. SP × dp device-mesh + VRAM ── §4.3 OOM/assertion high risk ──────────────────────
-_gpn="${NGPUS_PER_NODE:-8}"
+# Device mesh is built from the trainer pool, not the node's total physical
+# capacity.  In a single-node async split the latter also includes rollout GPUs.
+_gpn="${TRAINER_N_GPUS_PER_NODE:-${NGPUS_PER_NODE:-8}}"
 if [ -n "${N_NODES_TRAIN:-}" ] && [ -n "${SP_SIZE:-}" ]; then
     _train_world=$((N_NODES_TRAIN * _gpn))
     if [ $((_train_world % SP_SIZE)) -ne 0 ]; then
@@ -102,7 +129,7 @@ if [ "$(_lc "${ENGINE:-}")" = "veomni" ]; then
         || _pf_fatal "veomni requires ACTIVATION_OFFLOAD=False (same as above, FSDP1-era monkey patch crashes)"
 fi
 
-# --- 5. R3 × engine × verl path ── §4.6 silent low pearson ─────────────────────────
+# --- 5. R3 × engine × imported verl ── §4.6 silent low pearson ─────────────────────
 # 5a. R3 × model family. R3 replays MoE expert routing, so it is meaningless on a
 # dense checkpoint — and not harmlessly so. veomni raises "router replay is not
 # wired for model_type=..." from validate_model_for_replay inside engine init,
@@ -134,13 +161,15 @@ elif [ -n "${MODEL_PATH:-}" ] && command -v model_is_moe >/dev/null 2>&1; then
 fi
 
 if [[ "$(_lc "${ENABLE_R3:-true}")" =~ ^(1|true)$ ]]; then
-    [ "${USE_NEW_VERL:-1}" = "1" ] && _pf_ok "R3 on + USE_NEW_VERL=1 ✓" \
-        || _pf_fatal "ENABLE_R3=on but USE_NEW_VERL≠1 → veomni router_replay not in old verl, R3 will FATAL"
-    if [ "$_PF_STRUCT" = "1" ] && [ -n "${NEW_VERL_DIR:-}" ]; then
-        _pf_skip "NEW_VERL_DIR existence"
-    elif [ -n "${NEW_VERL_DIR:-}" ] && [ ! -d "${NEW_VERL_DIR}" ]; then
-        _pf_fatal "NEW_VERL_DIR does not exist: ${NEW_VERL_DIR}"
+    if [ -z "${VERL_HAS_ROUTER_REPLAY+x}" ]; then
+        if _pf_probe_verl_has_router_replay; then
+            VERL_HAS_ROUTER_REPLAY=1
+        else
+            VERL_HAS_ROUTER_REPLAY=0
+        fi
     fi
+    [ "${VERL_HAS_ROUTER_REPLAY:-0}" = "1" ] && _pf_ok "R3 on + imported verl has router_replay ✓" \
+        || _pf_fatal "ENABLE_R3=on but imported verl lacks router_replay.py -> R3 will FATAL"
     # engine-specific R3 key: veomni→veomni.router_replay; fsdp→fsdp_config.router_replay and forces SP=1
     if [ "$(_lc "${ENGINE:-}")" = "veomni" ]; then
         _pf_ok "R3 key uses veomni.router_replay (matches engine) — verify pearson~0.999 at first step"

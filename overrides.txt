@@ -8,6 +8,14 @@
 # datasets: veomni==0.1.11 declares `datasets>=2.20.0,<=2.21.0`. That upper bound is
 # stale -- veomni's training code paths run fine against datasets 4.x, which is what
 # verl and vllm require. Without this override the resolver either refuses to solve
-# or downgrades datasets to 2.21 and breaks verl. The range below is the version we
-# actually run and validate against.
-datasets>=4.8.4,<5
+# or downgrades datasets to 2.21 and breaks verl. The exact pin below is the
+# version we actually run and validate against.
+datasets==4.8.4
+
+# transformers: vllm==0.19.0 metadata still declares transformers<5, but this
+# repo validates the patched vllm tree against transformers 5.4.0.
+transformers==5.4.0
+
+# compressed-tensors: vllm==0.19.0 metadata pins 0.14.0.1, whose own metadata
+# rejects transformers 5. Use 0.18.0, which allows transformers>=4.45.0.
+compressed-tensors==0.18.0

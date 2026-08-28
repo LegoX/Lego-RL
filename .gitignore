@@ -147,6 +147,9 @@ scripts/local/
 # node deps
 node_modules/
 
+# Managed source checkouts created by scripts/setup_env.sh
+/third_party/
+
 # webui generated data / caches (not source)
 webui/snapshots/
 webui/.valcache/

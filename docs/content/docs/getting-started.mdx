@@ -70,10 +70,10 @@ It is idempotent:
 bash scripts/setup_env.sh
 ```
 
-`harbor` is cloned to `<repo>/../harbor` and `verl` to `<repo>/../verl-swe_agent_opd_dev`.
-That verl directory name is not cosmetic: `scripts/lib/common_env.sh` prepends the same
-path to `PYTHONPATH` at run time, so it must be the tree that was installed. Both sides
-derive it from the repo location, so a checkout anywhere works.
+`harbor` and `verl` are cloned under `<repo>/third_party/` by default and installed
+editable into the venv. The installer verifies that importing `harbor`, `verl`, and
+`vllm` resolves to the checkouts it just prepared, so training uses the patched trees
+without any runtime `PYTHONPATH` override.
 
 Key overrides (env vars): `VENV_PATH`, `HARBOR_DIR` / `VERL_DIR` (clone locations),
 `HARBOR_REF` / `VERL_REF` (branches), `PYTHON_VERSION` (default `3.12.3`), and the

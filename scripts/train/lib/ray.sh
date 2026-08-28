@@ -24,7 +24,7 @@ cleanup_ray_and_shm() {
 resolve_ray_addresses() {
     IP_LOCAL=$(hostname -I | awk '{print $1}')
     : "${MASTER_ADDR:=$IP_LOCAL}"
-    IP_HEAD=$(getent hosts "$MASTER_ADDR" | awk '{print $1; exit}')
+    IP_HEAD=$(getent hosts "$MASTER_ADDR" 2>/dev/null | awk '{print $1; exit}' || true)
     if [ -z "$IP_HEAD" ]; then
         IP_HEAD="$MASTER_ADDR"
     fi

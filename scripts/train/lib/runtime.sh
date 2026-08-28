@@ -171,26 +171,30 @@ print_final_environment() {
 # the new names onto the old ones here, in one place, and keep preflight as the
 # single source of truth for what a bad config looks like.
 #
-# USE_NEW_VERL has no equivalent any more: the new runner uses whatever verl the venv
-# installed instead of prepending NEW_VERL_DIR to PYTHONPATH. Probe the actual tree
-# for the router-replay module instead of asserting a flag that no longer exists.
+# The runner uses whatever verl the venv installed. Probe the actual imported tree
+# for the router-replay module instead of relying on a path override.
 run_preflight() {
-    local verl_origin verl_root use_new_verl=0
+    local verl_origin verl_root verl_has_router_replay=0
 
     verl_origin="$("$PYTHON_BIN" -c 'import importlib.util as u; s=u.find_spec("verl"); print(s.origin or "")' 2>/dev/null || true)"
     if [ -n "$verl_origin" ]; then
         verl_root="$(dirname "$verl_origin")"
-        [ -f "$verl_root/utils/veomni/router_replay.py" ] && use_new_verl=1
+        [ -f "$verl_root/utils/veomni/router_replay.py" ] && verl_has_router_replay=1
     fi
 
     PREFLIGHT_EMBEDDED=1 PF_KIND=train \
     ENGINE="$MODEL_ENGINE" \
+    TRAINING_MODE="${TRAINING_MODE:-}" \
     SCAFFOLD="${SCAFFOLD:-}" BACKEND="${BACKEND:-}" PROFILE="${PROFILE:-grpo}" \
     TOOL_PARSER="${TOOL_CALL_PARSER:-}" AGENT_NAME="${HARBOR_AGENT_NAME:-}" \
     NNODES="${NNODES:-}" N_NODES_TRAIN="${N_NODES_TRAIN:-}" N_NODES_ROLLOUT="${N_NODES_ROLLOUT:-}" \
-    NGPUS_PER_NODE="${NGPUS_PER_NODE:-}" SP_SIZE="${SP_SIZE:-}" \
+    NGPUS_PER_NODE="${NGPUS_PER_NODE:-}" \
+    TRAINER_N_GPUS_PER_NODE="${TRAINER_N_GPUS_PER_NODE:-}" \
+    ROLLOUT_N_GPUS_PER_NODE="${ROLLOUT_N_GPUS_PER_NODE:-}" \
+    ALLOW_SINGLE_NODE_ASYNC_SPLIT="${ALLOW_SINGLE_NODE_ASYNC_SPLIT:-1}" \
+    SP_SIZE="${SP_SIZE:-}" \
     MAX_PROMPT="${MAX_PROMPT:-}" MAX_RESP="${MAX_RESP:-}" \
-    USE_NEW_VERL="$use_new_verl" NEW_VERL_DIR="${NEW_VERL_DIR:-}" ENABLE_R3="${ENABLE_R3:-}" \
+    VERL_HAS_ROUTER_REPLAY="$verl_has_router_replay" ENABLE_R3="${ENABLE_R3:-}" \
     FUSED_KERNELS="${FUSED_KERNELS:-}" ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-}" \
     LR_SCHEDULER="${LR_SCHEDULER:-}" ROLLOUT_IS="${ROLLOUT_IS:-}" \
     VAL_TIMEOUT="${HARBOR_VAL_AGENT_MAX_TIMEOUT_SEC:-}" \
@@ -218,9 +222,10 @@ print_launch_summary() {
 # /rl:check can quote it verbatim instead of re-reading the config. Printed before
 # preflight, so a config that fails its checks is still shown in full.
 print_run_configuration() {
-    local kv gpn train_world dp window trials moe
+    local kv gpn rollout_gpn train_world dp window trials moe
     kv() { printf '  %-12s %s\n' "$1" "$2"; }
-    gpn="${NGPUS_PER_NODE:-8}"
+    gpn="${TRAINER_N_GPUS_PER_NODE:-${NGPUS_PER_NODE:-8}}"
+    rollout_gpn="${ROLLOUT_N_GPUS_PER_NODE:-${NGPUS_PER_NODE:-8}}"
     if [ "$TRAINING_MODE" = sync ]; then
         train_world=$(( ${NNODES:-0} * gpn ))
     else
@@ -242,7 +247,7 @@ print_run_configuration() {
     if [ "$TRAINING_MODE" = sync ]; then
         kv topology "${NNODES:-?} nodes × $gpn gpu (colocated)  SP=${SP_SIZE:-?} → dp=$dp  vllm_TP=${GEN_TP:-?}"
     else
-        kv topology "${NNODES:-?} nodes × $gpn gpu = train ${N_NODES_TRAIN:-?} / rollout ${N_NODES_ROLLOUT:-?}  SP=${SP_SIZE:-?} → dp=$dp  vllm_TP=${GEN_TP:-?}"
+        kv topology "${NNODES:-?} nodes × ${NGPUS_PER_NODE:-?} gpu = train ${N_NODES_TRAIN:-?}×${gpn} / rollout ${N_NODES_ROLLOUT:-?}×${rollout_gpn}  SP=${SP_SIZE:-?} → dp=$dp  vllm_TP=${GEN_TP:-?}"
     fi
     kv batch      "${TRAIN_BSZ:-?} prompts × ${N_RESP:-?} resp = $trials trials/step  mini=${TRAIN_MINI_BSZ:-?}  dynamic_bsz=${USE_DYNAMIC_BSZ:-?}"
     kv context    "prompt=${MAX_PROMPT:-?} + resp=${MAX_RESP:-?} = $window"
@@ -255,4 +260,3 @@ print_run_configuration() {
     printf '══════════════════════════════════════════════════════════════════════\n\n'
     unset -f kv
 }
-

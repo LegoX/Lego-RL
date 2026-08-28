@@ -65,9 +65,12 @@ with `response_mask must contain at least one valid token`. See
 
 ### 2. Topology consistency
 
-`NNODES` must equal `N_NODES_TRAIN + N_NODES_ROLLOUT`. The Ray cluster's node count
-must match the sum of the logical roles, or placement hangs forever waiting for a
-node that will never join — with no error.
+Normally, `NNODES` must equal `N_NODES_TRAIN + N_NODES_ROLLOUT`. For the explicitly
+supported single-node split, the default `ALLOW_SINGLE_NODE_ASYNC_SPLIT=1` permits
+`NNODES=1`, `N_NODES_TRAIN=1`, and `N_NODES_ROLLOUT=1` when the trainer and rollout
+GPU requests fit within `NGPUS_PER_NODE`. Set `ALLOW_SINGLE_NODE_ASYNC_SPLIT=0` to
+restore strict node accounting. Other mismatches remain fatal because the Ray
+cluster's node count would not match the logical placement.
 
 ### 3. `SP_SIZE` × device mesh × VRAM
 

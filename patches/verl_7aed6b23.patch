@@ -1,0 +1,2528 @@
+diff --git a/.gitignore b/.gitignore
+index b4d8d2f9..e385d7c3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -130,4 +130,5 @@ ENV/
+ logs
+ log
+ outputs
+-.history
+\ No newline at end of file
++.history
++harbor_trials
+\ No newline at end of file
+diff --git a/tests/models/test_qwen3_5_router_replay_on_cpu.py b/tests/models/test_qwen3_5_router_replay_on_cpu.py
+new file mode 100644
+index 00000000..b848b977
+--- /dev/null
++++ b/tests/models/test_qwen3_5_router_replay_on_cpu.py
+@@ -0,0 +1,263 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tier-1 unit test for the FSDP-path R3 router replay mechanism.
++
++Validates ``verl/models/transformers/qwen3_5_router_replay.py`` in isolation —
++no FSDP wrapping, no distributed init, no full training stack. Builds real
++``transformers`` ``Qwen3_5MoeTopKRouter`` instances on a tiny config, installs
++the replay patch, and drives the ``RouterReplay`` registry directly.
++
++Covers the four properties the handoff
++(``docs/training_env/r3-fsdp-on-v0.8.0-port-handoff-20260610.md`` §3 Tier 1)
++calls out, plus open-item #2 (the reimplementation must match the *installed*
++``transformers`` router byte-for-byte on non-replayed rows):
++
++1. REPLAY_FORWARD forces the top-k *selection* of real (non-placeholder) rows to
++   the injected rollout indices.
++2. All-zero placeholder rows keep the model's own routing.
++3. Gating weights still carry a gradient back to ``router.weight``.
++4. (open-item #2) With replay armed but every row a placeholder, the patched
++   router output is identical to the stock ``Qwen3_5MoeTopKRouter.forward`` —
++   same dtype, same values, same return-tuple order.
++
++Runs on CPU; opportunistically uses CUDA (bf16) when a GPU is visible, which is
++the production path. Standalone runner at the bottom so it works with or without
++pytest: ``python tests/models/test_qwen3_5_router_replay_on_cpu.py``.
++"""
++
++from types import SimpleNamespace
++
++import torch
++
++from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeTopKRouter
++
++from verl.models.transformers.qwen3_5_router_replay import apply_qwen3_5_router_replay_patch
++from verl.utils.router_replay import RouterReplay, RouterReplayAction
++
++# Capture the pristine forward BEFORE any patch is installed (the patch is
++# class-level and permanent), so the equivalence tests can compute a stock
++# reference even after the class has been patched by an earlier test.
++_ORIG_FORWARD = Qwen3_5MoeTopKRouter.forward
++
++# Tiny but representative: top_k > 1 (so a real row's k distinct experts can
++# never be all-zero, which is what distinguishes it from a placeholder row),
++# num_experts large enough that expert 0 is not special.
++N_EXPERTS = 32
++TOP_K = 4
++HIDDEN = 16
++N_TOKENS = 6
++
++DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
++DTYPE = torch.bfloat16
++
++
++def _cfg():
++    return SimpleNamespace(num_experts_per_tok=TOP_K, num_experts=N_EXPERTS, hidden_size=HIDDEN)
++
++
++class _GateStack(torch.nn.Module):
++    """A bare container of N ``Qwen3_5MoeTopKRouter`` gates, standing in for the
++    decoder-layer enumeration order that ``apply_qwen3_5_router_replay_patch``
++    walks via ``model.modules()``."""
++
++    def __init__(self, n_layers, seed=0):
++        super().__init__()
++        gen = torch.Generator().manual_seed(seed)
++        gates = []
++        for _ in range(n_layers):
++            g = Qwen3_5MoeTopKRouter(_cfg())
++            # __init__ zero-inits the gate weight (-> uniform routing, degenerate
++            # ties). Give each gate distinct non-zero weights for meaningful top-k.
++            g.weight.data = torch.randn(N_EXPERTS, HIDDEN, generator=gen)
++            gates.append(g)
++        self.gates = torch.nn.ModuleList(gates)
++
++
++def _reset_registry():
++    """Drop any router instances / actions left by a previous test. The patch
++    itself resets ``router_instances`` on each apply, but clear actions too so a
++    stale REPLAY_FORWARD can never leak across tests."""
++    RouterReplay.clear_global_router_replay_action()
++    RouterReplay.clear_global_indices()
++    RouterReplay.router_instances = []
++
++
++def _make_one_gate(seed=0):
++    _reset_registry()
++    stack = _GateStack(1, seed=seed).to(DEVICE, DTYPE)
++    n = apply_qwen3_5_router_replay_patch(stack)
++    assert n == 1, f"expected 1 gate patched, got {n}"
++    return stack.gates[0]
++
++
++def _input(n_tokens=N_TOKENS, seed=1):
++    gen = torch.Generator().manual_seed(seed)
++    return torch.randn(n_tokens, HIDDEN, generator=gen).to(DEVICE, DTYPE)
++
++
++# ============================================================ open-item #2
++def test_reimpl_matches_stock_on_placeholder_rows():
++    """Replay armed, but EVERY row is an all-zero placeholder -> no selection is
++    overridden, yet the full reimplementation path (softmax -> top-k -> gather ->
++    renorm -> dtype) executes. Its output must equal the stock router exactly:
++    same first-return (float32 softmax probs), same float32 gating weights, same
++    indices. This is the regression guard for the dtype / return-tuple port bug."""
++    gate = _make_one_gate()
++    x = _input()
++
++    # Stock reference via the pristine (unpatched) forward on the same weights.
++    stock_logits, stock_scores, stock_idx = _ORIG_FORWARD(gate, x)
++
++    RouterReplay.set_replay_data([torch.zeros(N_TOKENS, TOP_K, dtype=torch.long, device=DEVICE)])
++    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
++    re_logits, re_scores, re_idx = gate(x)
++
++    assert re_logits.dtype == stock_logits.dtype, (
++        f"first-return dtype {re_logits.dtype} != stock {stock_logits.dtype} "
++        f"(stock returns the float32 softmax probs, not raw logits)"
++    )
++    assert re_scores.dtype == stock_scores.dtype, (
++        f"gating-weight dtype {re_scores.dtype} != stock {stock_scores.dtype} "
++        f"(stock casts to the softmax/float32 dtype)"
++    )
++    assert torch.equal(re_idx, stock_idx), "placeholder rows must keep the model's own top-k selection"
++    assert torch.allclose(re_scores.float(), stock_scores.float(), atol=1e-6, rtol=0), "gating weights diverged"
++    assert torch.allclose(re_logits.float(), stock_logits.float(), atol=1e-6, rtol=0), "router probs diverged"
++
++
++# ============================================================ properties 1 & 2
++def test_replay_overrides_real_rows_keeps_placeholders():
++    """Real (non-zero) rows replay the injected indices verbatim; all-zero rows
++    keep the model's own top-k. Gating weights renormalize to 1 on every row."""
++    gate = _make_one_gate()
++    x = _input()
++    _, _, stock_idx = _ORIG_FORWARD(gate, x)
++
++    target = torch.zeros(N_TOKENS, TOP_K, dtype=torch.long, device=DEVICE)
++    real_rows = [0, 2, 4]
++    placeholder_rows = [1, 3, 5]
++    target[0] = torch.tensor([3, 7, 15, 29], device=DEVICE)
++    target[2] = torch.tensor([1, 9, 17, 31], device=DEVICE)
++    target[4] = torch.tensor([2, 8, 16, 30], device=DEVICE)
++
++    RouterReplay.set_replay_data([target])
++    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
++    _, scores, idx = gate(x)
++
++    for r in real_rows:
++        assert torch.equal(idx[r], target[r]), f"real row {r} did not replay injected indices: {idx[r].tolist()}"
++    for r in placeholder_rows:
++        assert torch.equal(idx[r], stock_idx[r]), f"placeholder row {r} should keep model routing"
++    sums = scores.float().sum(dim=-1)
++    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), f"gating weights not renormalized: {sums.tolist()}"
++
++
++# ============================================================ property 3
++def test_gating_weights_have_gradient():
++    """Selection is forced, but gates are recomputed from current logits via
++    gather -> gradient must still flow into router.weight (router keeps training)."""
++    gate = _make_one_gate()
++    gate.weight.requires_grad_(True)
++    x = _input()
++
++    target = torch.zeros(N_TOKENS, TOP_K, dtype=torch.long, device=DEVICE)
++    target[0] = torch.tensor([3, 7, 15, 29], device=DEVICE)  # one real row, rest placeholders
++    RouterReplay.set_replay_data([target])
++    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
++
++    _, scores, _ = gate(x)
++    scores.float().sum().backward()
++
++    assert gate.weight.grad is not None, "no gradient reached router.weight"
++    assert torch.isfinite(gate.weight.grad).all(), "router.weight grad has non-finite entries"
++    assert gate.weight.grad.abs().sum().item() > 0.0, "router.weight grad is all-zero"
++
++
++# ============================================================ RECORD path
++def test_record_captures_model_indices_without_override():
++    """RECORD stores the model's own top-k and does not alter the selection."""
++    gate = _make_one_gate()
++    x = _input()
++    _, _, stock_idx = _ORIG_FORWARD(gate, x)
++
++    RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
++    _, _, idx = gate(x)
++
++    assert torch.equal(idx, stock_idx), "RECORD must not override the selection"
++    assert torch.equal(gate._router_replay.recorded_topk_idx, stock_idx), "RECORD did not capture model indices"
++
++
++# ============================================================ disabled path
++def test_disabled_path_is_verbatim():
++    """With no action set, the patched forward delegates to the original — the
++    non-R3 / ref-policy / eval path must be byte-identical and overhead-free."""
++    gate = _make_one_gate()
++    x = _input()
++    stock = _ORIG_FORWARD(gate, x)
++    # _router_replay attached but action is None.
++    out = gate(x)
++    for a, b in zip(out, stock):
++        assert a.dtype == b.dtype and torch.equal(a, b), "disabled path diverged from stock router"
++
++
++# ============================================================ layer ordering
++def test_set_replay_data_distributes_per_layer_in_module_order():
++    """``set_replay_data([t0, t1, t2])`` must hand layer i's indices to gate i,
++    in ``model.modules()`` enumeration order (== decoder layer id == vLLM
++    capturer layer axis)."""
++    _reset_registry()
++    stack = _GateStack(3, seed=2).to(DEVICE, DTYPE)
++    n = apply_qwen3_5_router_replay_patch(stack)
++    assert n == 3
++    x = _input()
++
++    # All-real (non-zero) per-layer targets so every row is fully overridden.
++    base = torch.arange(1, N_TOKENS * TOP_K + 1, dtype=torch.long).reshape(N_TOKENS, TOP_K)
++    targets = [((base + 3 * i) % (N_EXPERTS - 1) + 1).to(DEVICE) for i in range(3)]
++
++    RouterReplay.set_replay_data(targets)
++    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
++
++    for i, gate in enumerate(stack.gates):
++        _, _, idx = gate(x)
++        assert torch.equal(idx, targets[i]), f"gate {i} replayed the wrong layer's indices"
++
++
++_TESTS = [
++    test_reimpl_matches_stock_on_placeholder_rows,
++    test_replay_overrides_real_rows_keeps_placeholders,
++    test_gating_weights_have_gradient,
++    test_record_captures_model_indices_without_override,
++    test_disabled_path_is_verbatim,
++    test_set_replay_data_distributes_per_layer_in_module_order,
++]
++
++
++if __name__ == "__main__":
++    import traceback
++
++    print(f"[router-replay tier1] device={DEVICE} dtype={DTYPE} "
++          f"transformers Qwen3_5MoeTopKRouter @ {Qwen3_5MoeTopKRouter.__module__}")
++    failures = 0
++    for t in _TESTS:
++        try:
++            t()
++            print(f"  PASS  {t.__name__}")
++        except Exception:
++            failures += 1
++            print(f"  FAIL  {t.__name__}")
++            traceback.print_exc()
++    print(f"[router-replay tier1] {len(_TESTS) - failures}/{len(_TESTS)} passed")
++    raise SystemExit(1 if failures else 0)
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 268f8d5f..d2e7779b 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -77,7 +77,15 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
+ 
+ 
+ class AgentLoopMetrics(BaseModel):
+-    """Agent loop performance metrics."""
++    """Agent loop performance metrics.
++
++    Standard fields track generic agent loop stages. Subclasses / concrete agent loops
++    may attach arbitrary extra timing fields (e.g. harbor env/agent/verifier phases),
++    which will be preserved by ``model_dump`` and aggregated by
++    :meth:`AgentLoopManager._performance_metrics` as ``agent_loop/{key}/{min,max,mean}``.
++    """
++
++    model_config = ConfigDict(extra="allow")
+ 
+     generate_sequences: float = 0.0
+     tool_calls: float = 0.0
+@@ -552,6 +560,7 @@ class AgentLoopWorker:
+             sample_sampling_params = dict(sampling_params)
+             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
+                 apply_greedy_sampling_params(sample_sampling_params)
++            kwargs["global_steps"] = batch.meta_info.get("global_steps", 0)
+             tasks.append(
+                 asyncio.create_task(
+                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+@@ -1108,13 +1117,28 @@ class AgentLoopManager:
+         Returns:
+             DataProto: Output batch.
+         """
+-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+-        outputs = await asyncio.gather(
+-            *[
+-                worker.generate_sequences.remote(chunk)
+-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+-            ]
+-        )
++        worker_queue = asyncio.Queue()
++        for worker in self.agent_loop_workers:
++            await worker_queue.put(worker)
++        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
++        async def process_task(sample):
++            worker = await worker_queue.get()
++            try:
++                result = await worker.generate_sequences.remote(sample)
++            finally:
++                await worker_queue.put(worker)
++                worker_queue.task_done()
++            return result
++        task = [process_task(sample) for sample in single_samples]
++        outputs = await asyncio.gather(*task)
++
++        # chunkes = prompts.chunk(len(self.agent_loop_workers))
++        # outputs = await asyncio.gather(
++        #     *[
++        #         worker.generate_sequences.remote(chunk)
++        #         for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
++        #     ]
++        # )
+         output = DataProto.concat(outputs)
+ 
+         # calculate performance metrics
+@@ -1156,4 +1180,25 @@ class AgentLoopManager:
+             timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
+             timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+ 
++        # Aggregate any extra timing fields attached by concrete agent loops
++        # (e.g. harbor env/agent/verifier phases). The resulting keys flow into
++        # ``timing_raw`` and surface as ``timing_s/agent_loop/{key}/{min,max,mean}``.
++        standard_keys = {"generate_sequences", "tool_calls", "compute_score", "num_preempted"}
++        extra_keys: set[str] = set()
++        for chunk in metrics:
++            for metric in chunk:
++                extra_keys.update(metric.keys())
++        extra_keys -= standard_keys
++        for key in sorted(extra_keys):
++            values = np.array(
++                [float(metric.get(key) or 0.0) for chunk in metrics for metric in chunk],
++                dtype=np.float64,
++            )
++            if values.size == 0:
++                continue
++            timing[f"agent_loop/{key}/min"] = values.min()
++            timing[f"agent_loop/{key}/max"] = values.max()
++            timing[f"agent_loop/{key}/mean"] = values.mean()
++            timing[f"agent_loop/slowest/{key}"] = values[slowest] if slowest < values.size else values.max()
++
+         return timing
+diff --git a/verl/experimental/fully_async_policy/detach_utils.py b/verl/experimental/fully_async_policy/detach_utils.py
+index f96ad910..7024d196 100644
+--- a/verl/experimental/fully_async_policy/detach_utils.py
++++ b/verl/experimental/fully_async_policy/detach_utils.py
+@@ -63,21 +63,112 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
+         )
+ 
+     # Setting selected agent, that supports partial
+-    if not config.actor_rollout_ref.rollout.multi_turn.enable:
+-        full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
++    if config.actor_rollout_ref.rollout.multi_turn.enable:
++        full_batch.non_tensor_batch["agent_name"] = np.array(["tool_agent"] * len(full_batch), dtype=object)
++    else:
++        # full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
++        pass
+ 
+     # Add global step count to generated data
+     full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
+     return full_batch
+ 
+ 
++# Same semantic keys as ``AgentLoopManager._performance_metrics`` (agent_loop.py).
++_AGENT_LOOP_STANDARD_METRIC_KEYS = frozenset(
++    {"generate_sequences", "tool_calls", "compute_score", "num_preempted"}
++)
++
++
++def _aggregate_agent_loop_timing_meta(final_batch: DataProto) -> dict[str, float]:
++    """Mirror :meth:`AgentLoopManager._performance_metrics` for fully-async assembly.
++
++    Populates ``timing_s/agent_loop/...`` keys so ``FullyAsyncTrainer._collect_metrics_from_samples``
++    forwards them into ``self.metrics`` and loggers (same surface as synchronous rollout).
++    """
++    pt = np.asarray(final_batch.non_tensor_batch["processing_times"], dtype=np.float64)
++    tc = np.asarray(final_batch.non_tensor_batch["tool_calls_times"], dtype=np.float64)
++    n = pt.shape[0]
++    if "compute_score_times" in final_batch.non_tensor_batch:
++        t_cs = np.asarray(final_batch.non_tensor_batch["compute_score_times"], dtype=np.float64)
++    else:
++        t_cs = np.zeros(n, dtype=np.float64)
++    if "num_preempted_vals" in final_batch.non_tensor_batch:
++        npm = np.asarray(final_batch.non_tensor_batch["num_preempted_vals"], dtype=np.float64)
++    else:
++        npm = np.full(n, -1.0, dtype=np.float64)
++
++    slowest = int(np.argmax(pt + tc + t_cs)) if n > 0 else 0
++
++    out: dict[str, float] = {}
++    for name, arr in (
++        ("generate_sequences", pt),
++        ("tool_calls", tc),
++        ("compute_score", t_cs),
++        ("num_preempted", npm),
++    ):
++        if arr.size == 0:
++            continue
++        out[f"timing_s/agent_loop/{name}/min"] = float(arr.min())
++        out[f"timing_s/agent_loop/{name}/max"] = float(arr.max())
++        out[f"timing_s/agent_loop/{name}/mean"] = float(arr.mean())
++        if slowest < arr.size:
++            out[f"timing_s/agent_loop/slowest/{name}"] = float(arr[slowest])
++
++    extra_keys: set[str] = set()
++    for nk in final_batch.non_tensor_batch.keys():
++        if nk.startswith("_al_timing_"):
++            extra_keys.add(nk[len("_al_timing_") :])
++    for key in sorted(extra_keys):
++        vals = np.asarray(final_batch.non_tensor_batch[f"_al_timing_{key}"], dtype=np.float64)
++        if vals.size == 0:
++            continue
++        out[f"timing_s/agent_loop/{key}/min"] = float(vals.min())
++        out[f"timing_s/agent_loop/{key}/max"] = float(vals.max())
++        out[f"timing_s/agent_loop/{key}/mean"] = float(vals.mean())
++        if slowest < vals.size:
++            out[f"timing_s/agent_loop/slowest/{key}"] = float(vals[slowest])
++
++    if (
++        n > 0
++        and "attention_mask" in final_batch.batch
++        and "prompts" in final_batch.batch
++        and slowest < n
++    ):
++        prompt_length = int(final_batch.batch["prompts"].shape[1])
++        attention_mask = final_batch.batch["attention_mask"][slowest]
++        plen = min(prompt_length, int(attention_mask.shape[0]))
++        out["timing_s/agent_loop/slowest/prompt_length"] = float(attention_mask[:plen].sum().item())
++        out["timing_s/agent_loop/slowest/response_length"] = float(attention_mask[plen:].sum().item())
++
++    return out
++
++
+ def addition_process(output: DataProto):
+     """collect metirics"""
+-    metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
+-    processing_times_list = [item["generate_sequences"] for item in metrics]
+-    tool_calls_times_list = [item["tool_calls"] for item in metrics]
+-    output.non_tensor_batch["processing_times"] = processing_times_list
+-    output.non_tensor_batch["tool_calls_times"] = tool_calls_times_list
++    metrics_list = output.meta_info.pop("metrics")  # List[Dict[str, Any]]
++    output.non_tensor_batch["processing_times"] = np.asarray(
++        [item["generate_sequences"] for item in metrics_list], dtype=np.float64
++    )
++    output.non_tensor_batch["tool_calls_times"] = np.asarray(
++        [item["tool_calls"] for item in metrics_list], dtype=np.float64
++    )
++    output.non_tensor_batch["compute_score_times"] = np.asarray(
++        [float(item.get("compute_score") or 0.0) for item in metrics_list], dtype=np.float64
++    )
++    output.non_tensor_batch["num_preempted_vals"] = np.asarray(
++        [float(item.get("num_preempted", -1)) for item in metrics_list], dtype=np.float64
++    )
++
++    extra_keys: set[str] = set()
++    for m in metrics_list:
++        extra_keys.update(m.keys())
++    extra_keys -= _AGENT_LOOP_STANDARD_METRIC_KEYS
++    for key in sorted(extra_keys):
++        output.non_tensor_batch[f"_al_timing_{key}"] = np.asarray(
++            [float(m.get(key) or 0.0) for m in metrics_list], dtype=np.float64
++        )
++
+     return output
+ 
+ 
+@@ -129,7 +220,6 @@ def assemble_batch_from_rollout_samples(
+         final_batch.meta_info["global_token_num"] = torch.sum(final_batch.batch["attention_mask"], dim=-1).tolist()
+ 
+     processing_times = final_batch.non_tensor_batch["processing_times"]
+-    tool_calls = final_batch.non_tensor_batch["tool_calls_times"]
+     # Collect statistics
+     processing_time_stats = {
+         "processing_time/avg": np.mean(processing_times),
+@@ -139,15 +229,16 @@ def assemble_batch_from_rollout_samples(
+         "processing_time/tp99": np.percentile(processing_times, 99),
+         "processing_time/tp95": np.percentile(processing_times, 95),
+     }
+-    tool_calls_stats = {}
+-    if len(tool_calls) > 0:
+-        tool_calls_stats = {
+-            "timing_s/agent_loop/tool_calls/max": np.max(tool_calls),
+-            "timing_s/agent_loop/tool_calls/min": np.min(tool_calls),
+-            "timing_s/agent_loop/tool_calls/mean": np.mean(tool_calls),
+-        }
+     processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
+ 
++    # Align with ``AgentLoopManager._performance_metrics`: Harbor / extra agent-loop timings → log.
++    agent_loop_timing_meta = _aggregate_agent_loop_timing_meta(final_batch)
++    for nk in list(final_batch.non_tensor_batch.keys()):
++        if nk.startswith("_al_timing_"):
++            final_batch.non_tensor_batch.pop(nk, None)
++    for nk in ("compute_score_times", "num_preempted_vals"):
++        final_batch.non_tensor_batch.pop(nk, None)
++
+     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
+     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
+     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
+@@ -167,7 +258,7 @@ def assemble_batch_from_rollout_samples(
+             **processing_time_stats,
+             **rollout_status,
+             **partial_stats,
+-            **tool_calls_stats,
++            **agent_loop_timing_meta,
+         }
+     )
+ 
+diff --git a/verl/experimental/fully_async_policy/fully_async_rollouter.py b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+index 1eb70754..389b9429 100644
+--- a/verl/experimental/fully_async_policy/fully_async_rollouter.py
++++ b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+@@ -15,8 +15,10 @@
+ import asyncio
+ import logging
+ import os
++import threading
+ import time
+ from pprint import pformat
++from queue import Queue
+ from typing import Any, Optional
+ 
+ import numpy as np
+@@ -38,6 +40,7 @@ from verl.trainer.ppo.utils import need_reward_model
+ from verl.utils import normalize_token_ids
+ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+ from verl.utils.profiler import marked_timer
++from verl.utils.ray_utils import auto_await
+ from verl.utils.rollout_trace import rollout_trace_op
+ from verl.utils.tracking import ValidationGenerationsLogger
+ from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
+@@ -367,26 +370,125 @@ class FullyAsyncLLMServerManager(LLMServerManager):
+ 
+ 
+ class FullyAsyncAgentLoopManager(AgentLoopManager):
++    def __init__(
++        self,
++        config: DictConfig,
++        llm_client: LLMServerClient,
++        teacher_client: dict[str, LLMServerClient] = None,
++        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
++    ):
++        super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
++        self._worker_queue: Optional[Queue] = None
++        self._worker_queue_lock = threading.Lock()
++
++    async def _init_worker_queue(self) -> Queue:
++        """Initialize the loop-neutral worker queue lazily."""
++        with self._worker_queue_lock:
++            if self._worker_queue is None:
++                self._worker_queue = Queue()
++                for worker in self.agent_loop_workers:
++                    self._worker_queue.put(worker)
++        return self._worker_queue
++
++    async def _dispatch_to_workers(self, prompts: DataProto) -> list[DataProto]:
++        """Dispatch single-sample shards through the shared worker queue."""
++        queue = await self._init_worker_queue()
++        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
++
++        async def process_task(sample: DataProto) -> DataProto:
++            worker = await asyncio.to_thread(queue.get)
++            try:
++                output_future = worker.generate_sequences.remote(sample)
++                return await asyncio.wrap_future(output_future.future())
++            finally:
++                # Always return worker to queue after task completes or fails.
++                queue.put(worker)
++                queue.task_done()
++
++        return await asyncio.gather(*[process_task(sample) for sample in single_samples])
++
++    async def get_idle_worker_count(self) -> int:
++        """Return the approximate number of idle agent-loop workers."""
++        queue = await self._init_worker_queue()
++        return queue.qsize()
++
++    @auto_await
++    async def generate_sequences(self, prompts: DataProto) -> DataProto:
++        """Run validation rollouts using the same global worker queue as train rollouts."""
++        outputs = await self._dispatch_to_workers(prompts)
++        outputs = self._align_rollout_shard_keys(outputs)
++        output = DataProto.concat(outputs)
++
++        # Keep the same meta_info contract as AgentLoopManager.generate_sequences.
++        metrics = [o.meta_info.pop("metrics") for o in outputs]
++        timing = self._performance_metrics(metrics, output)
++        output.meta_info = {"timing": timing, **outputs[0].meta_info}
++        return output
++
+     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
+         """Split input batch and dispatch to agent loop workers.
+ 
+         Args:
+-            prompts (DataProto): Input batch. Single sample data
++            prompts (DataProto): Input batch.
+         Returns:
+             DataProto: Output batch.
+         """
+-        worker = self._select_best_worker()
+-        output_future = worker.generate_sequences.remote(prompts)
+-        return await asyncio.wrap_future(output_future.future())
+-
+-    def _select_best_worker(self):
+-        """Select the best worker, simple round-robin load balancing"""
+-        if not hasattr(self, "_worker_index"):
+-            self._worker_index = 0
+-
+-        worker = self.agent_loop_workers[self._worker_index]
+-        self._worker_index = (self._worker_index + 1) % len(self.agent_loop_workers)
+-        return worker
++        outputs = await self._dispatch_to_workers(prompts)
++        return self._concat_outputs_same_metrics_layout(outputs)
++
++    async def _select_best_worker(self):
++        """Select an idle worker from queue (deprecated, use queue directly)."""
++        queue = await self._init_worker_queue()
++        return await asyncio.to_thread(queue.get)
++
++    @staticmethod
++    def _align_rollout_shard_keys(outputs: list[DataProto]) -> list[DataProto]:
++        """Make every rollout shard carry the same TensorDict keys before ``torch.cat``.
++
++        Shards differ in keys when a tensor is produced only by some trials — e.g.
++        ``routed_experts`` (R3 MoE routing) is present only when routing was actually
++        captured; empty/failed trials omit it. ``DataProto.concat`` -> ``torch.cat``
++        requires identical key sets, so pad any key present in some shards but not all
++        with zeros. Model-agnostic: the missing tensor's shape/dtype/device are copied
++        from a shard that has it (only the batch dim varies), so no per-model constants
++        (num_layers/topk) are needed and it works regardless of how trials map to workers.
++        """
++        shards = [o for o in outputs if o is not None and getattr(o, "batch", None) is not None]
++        if len(shards) <= 1:
++            return outputs
++        ref = {}
++        for o in shards:
++            for k in o.batch.keys():
++                ref.setdefault(k, o.batch[k])
++        for o in shards:
++            present = set(o.batch.keys())
++            n = o.batch.batch_size[0]
++            for k, t in ref.items():
++                if k not in present:
++                    o.batch[k] = torch.zeros((n, *t.shape[1:]), dtype=t.dtype, device=t.device)
++        return outputs
++
++    def _concat_outputs_same_metrics_layout(self, outputs: list[DataProto]) -> DataProto:
++        """Merge rollout shards like :meth:`DataProto.concat`, then restore ``meta_info["metrics"]``.
++
++        ``DataProto.concat`` turns per-sample metric dicts into columnar ``dict[str, list]``.
++        A single worker processing a whole batch leaves ``metrics`` as ``list[dict]``.
++        Fully-async splits work across workers and concatenates; without this step,
++        downstream code that assumes ``list[dict]`` (same as one-shot batch rollout)
++        would see a different shape.
++        """
++        outputs = self._align_rollout_shard_keys(outputs)
++        merged = DataProto.concat(outputs)
++        m = merged.meta_info.get("metrics")
++        if not isinstance(m, dict) or not m:
++            return merged
++        keys = list(m.keys())
++        lengths = [len(m[k]) for k in keys]
++        if not lengths or min(lengths) != max(lengths):
++            return merged
++        n = lengths[0]
++        merged.meta_info["metrics"] = [{k: m[k][i] for k in keys} for i in range(n)]
++        return merged
+ 
+ 
+ @ray.remote(num_cpus=10, max_concurrency=100)
+@@ -490,6 +592,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         self.max_concurrent_samples = None
+         # queue size
+         self.max_queue_size = None
++        # During validation, pause new rollout task launches by default. If this
++        # threshold is set, rollout may launch only when idle workers stay above it.
++        self.validation_active = False
++        self.validation_rollout_min_idle_workers = config.async_training.get(
++            "validation_rollout_min_idle_workers", None
++        )
++        self.validation_launch_check_interval = config.async_training.get("validation_launch_check_interval", 60)
+ 
+         # Statistics
+         self.total_generated_samples = 0
+@@ -538,7 +647,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
+             )
+ 
+-            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
++            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 32
+             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
+             self.max_queue_size = self.max_required_samples
+ 
+@@ -602,13 +711,31 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         """Stop rollout profiling on all replicas before the next weight sync."""
+         await self.llm_server_manager.stop_profile()
+ 
+-    def do_validate(self):
++    async def do_validate(self):
+         """Run validation and return metrics"""
++        self.global_steps += 1
++        global_steps = self.global_steps
+         timing_raw = {}
+-        with marked_timer("rollouter/validate_time", timing_raw, color="green"):
+-            val_metrics: dict = self._validate()
++        self.validation_active = True
++        try:
++            with marked_timer("rollouter/validate_time", timing_raw, color="green"):
++                val_metrics: dict = await asyncio.to_thread(self._validate, global_steps=global_steps)
++        finally:
++            self.validation_active = False
+         return timing_raw | val_metrics
+ 
++    async def _can_launch_rollout_during_validation(self) -> bool:
++        if not self.validation_active:
++            return True
++        if self.validation_rollout_min_idle_workers is None:
++            return False
++        idle_workers = await self.async_rollout_manager.get_idle_worker_count()
++        return idle_workers > self.validation_rollout_min_idle_workers
++
++    async def _wait_until_rollout_launch_allowed(self):
++        while not await self._can_launch_rollout_during_validation():
++            await asyncio.sleep(self.validation_launch_check_interval)
++
+     async def save_checkpoint(self, local_global_step_folder: str):
+         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
+         # (pending/cancel/result queue and message queue).
+@@ -818,6 +945,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         for epoch, batch_dict in continuous_iterator:
+             # Similar to _prepare_generate_batch: Separate data
+             full_batch = prepare_single_generation_data(batch_dict, self.config)
++            full_batch.meta_info["global_steps"] = self.global_steps
+ 
+             sample_id = f"sample_{epoch}_{self.global_steps}"
+ 
+@@ -891,6 +1019,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+                         resume_future.cancel()
+                         await asyncio.gather(resume_future, return_exceptions=True)
+                 continue
++            await self._wait_until_rollout_launch_allowed()
+             # Get sample from appropriate queue and immediately mark task as done
+             rollout_sample = await self.pending_queue.get()
+             self.pending_queue.task_done()
+@@ -923,6 +1052,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+             # Submit single sample processing
+             if self.paused:
+                 await self._resume_event.wait()
++            await self._wait_until_rollout_launch_allowed()
+             async with self.lock:
+                 task = safe_create_task(
+                     self._process_single_sample_streaming(rollout_sample),
+diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
+index e9571da5..675ee6d8 100644
+--- a/verl/experimental/separation/engine_workers.py
++++ b/verl/experimental/separation/engine_workers.py
+@@ -80,7 +80,15 @@ class DetachActorWorker(ActorRolloutRefWorker):
+         # save/restore. The current fsdp2_sharded_save_to_cpu / fsdp2_sharded_load_from_cpu
+         # assume parameters are on GPU. Callers should ensure the model is loaded back to GPU
+         # before calling save_model_to_cpu / restore_model_from_cpu in offload scenarios.
+-        if strategy in ["fsdp", "fsdp2", "veomni"]:
++        if strategy == "fsdp":
++            # FSDP1 uses FlatParameter (not DTensor)
++            from verl.utils.fsdp_utils import (
++                fsdp1_sharded_load_from_cpu,
++                fsdp1_sharded_save_to_cpu,
++            )
++
++            self._strategy_handlers = (fsdp1_sharded_save_to_cpu, fsdp1_sharded_load_from_cpu)
++        elif strategy in ["fsdp2", "veomni"]:
+             from verl.utils.fsdp_utils import (
+                 fsdp2_sharded_load_from_cpu,
+                 fsdp2_sharded_save_to_cpu,
+@@ -141,7 +149,11 @@ class DetachActorWorker(ActorRolloutRefWorker):
+         if n in self.cpu_saved_models:
+             strategy = self.config.actor.strategy
+ 
+-            if strategy in ["fsdp", "fsdp2", "veomni"]:
++            if strategy == "fsdp":
++                # FSDP1: saved state is a dict[str, torch.Tensor]
++                cpu_sharded_state = self.cpu_saved_models[n]
++                self.restore_handler(self.actor.engine.module, cpu_sharded_state)
++            elif strategy in ["fsdp2", "veomni"]:
+                 cpu_sharded_state, global_spec = self.cpu_saved_models[n]
+                 self.restore_handler(self.actor.engine.module, cpu_sharded_state, global_spec)
+             else:
+diff --git a/verl/experimental/separation/ray_trainer.py b/verl/experimental/separation/ray_trainer.py
+index b1a34a54..a422d27c 100644
+--- a/verl/experimental/separation/ray_trainer.py
++++ b/verl/experimental/separation/ray_trainer.py
+@@ -586,6 +586,15 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
+             else:
+                 batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+ 
++            # Mask environment-corrupted trajectories (env failures, timeouts, context
++            # errors, overlong truncation, turn caps) out of the loss and group stats.
++            from verl.trainer.ppo.trajectory_filter import apply_trajectory_filter, zero_filtered_advantages
++
++            batch, traj_filter_metrics = apply_trajectory_filter(
++                batch, self.config.algorithm.get("trajectory_filter", None)
++            )
++            metrics.update(traj_filter_metrics)
++
+             # Compute rollout correction: IS weights, rejection sampling, and metrics
+             # Only runs in decoupled mode (computes once per batch using stable π_old)
+             # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+@@ -617,6 +626,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
+                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                 config=self.config.algorithm,
+             )
++
++            # Estimator-agnostic safety net: filtered rows contribute zero gradient.
++            batch = zero_filtered_advantages(batch)
+         return batch
+ 
+     def _fit_update_critic(self, batch: DataProto) -> DataProto:
+diff --git a/verl/model_merger/merge_veomni_fsdp_to_hf.py b/verl/model_merger/merge_veomni_fsdp_to_hf.py
+new file mode 100644
+index 00000000..825a636a
+--- /dev/null
++++ b/verl/model_merger/merge_veomni_fsdp_to_hf.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++Merge a veomni-FSDP2 actor checkpoint (model_world_size_N_rank_*.pt, saved with a
++1-D device mesh named 'dp_shard_sp') into a HuggingFace safetensors model.
++
++verl's stock FSDPModelMerger hard-asserts mesh_dim_names in (('fsdp',),('ddp','fsdp')).
++veomni saves the (functionally identical) 1-D fully-sharded mesh under the name
++'dp_shard_sp', so we monkeypatch _calculate_shard_configuration to accept it and
++reuse verl's tested load/merge/save path unchanged.
++
++Usage:
++    python merge_veomni_fsdp_to_hf.py --local_dir <step>/actor --target_dir <out>
++"""
++import argparse
++import os
++import re
++import sys
++
++import torch
++
++from verl.model_merger.base_model_merger import ModelMergerConfig
++from verl.model_merger.fsdp_model_merger import FSDPModelMerger
++
++# 1-D meshes that are pure FSDP sharding under a different label.
++_FSDP_EQUIVALENT_1D = {("fsdp",), ("dp_shard_sp",), ("dp_shard",)}
++
++# ---------------------------------------------------------------------------
++# veomni fused-MoE  ->  HF per-expert  (the bug fix)
++# ---------------------------------------------------------------------------
++# veomni stores Qwen3-MoE experts in a FUSED/grouped v5 layout:
++#     model.layers.{i}.mlp.experts.gate_up_proj   [E, 2*I, H]   (gate=[:I], up=[I:])
++#     model.layers.{i}.mlp.experts.down_proj      [E, H, I]
++#     model.layers.{i}.mlp.gate.weight            [E, H]        (router, HF-named already)
++# HF Qwen3MoeForCausalLM instead wants PER-EXPERT 2-D weights:
++#     model.layers.{i}.mlp.experts.{j}.gate_proj.weight  [I, H]
++#     model.layers.{i}.mlp.experts.{j}.up_proj.weight    [I, H]
++#     model.layers.{i}.mlp.experts.{j}.down_proj.weight  [H, I]
++# verl's stock merger gathers the FSDP shards correctly but writes the fused keys
++# verbatim -> vLLM/HF can't find the per-expert keys -> experts stay random-init
++# -> the served model emits token salad. This is the exact inverse of veomni's
++# load-time converter (qwen3_moe/checkpoint_tensor_converter.py): pure split +
++# unstack, NO transpose. E is read from the tensor itself (dim 0) so it is
++# self-validating and needs no config lookup.
++_FUSED_EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(gate_up_proj|down_proj)$")
++
++
++def _unfuse_moe_experts(state_dict: dict) -> dict:
++    out: dict = {}
++    n_converted = 0
++    for k, v in state_dict.items():
++        m = _FUSED_EXPERT_PATTERN.match(k)
++        if not m:
++            out[k] = v
++            continue
++        prefix, which = m.groups()  # prefix == "model.layers.{i}.mlp"
++        e = v.shape[0]
++        if which == "gate_up_proj":  # [E, 2I, H] -> per-expert gate [I,H] + up [I,H]
++            i = v.shape[1] // 2
++            for j in range(e):
++                out[f"{prefix}.experts.{j}.gate_proj.weight"] = v[j, :i, :].clone()
++                out[f"{prefix}.experts.{j}.up_proj.weight"] = v[j, i:, :].clone()
++        else:  # down_proj: [E, H, I] -> per-expert down [H, I]
++            for j in range(e):
++                out[f"{prefix}.experts.{j}.down_proj.weight"] = v[j].clone()
++        n_converted += 1
++    if n_converted:
++        print(f"[merge_veomni] unfused {n_converted} grouped-expert tensors "
++              f"-> {sum(1 for k in out if '.experts.' in k and k.endswith('.weight'))} per-expert HF keys")
++    return out
++
++
++_orig_load_and_merge = FSDPModelMerger._load_and_merge_state_dicts
++
++
++def _patched_load_and_merge(self, *args, **kwargs):
++    merged = _orig_load_and_merge(self, *args, **kwargs)
++    return _unfuse_moe_experts(merged)
++
++
++FSDPModelMerger._load_and_merge_state_dicts = _patched_load_and_merge
++
++
++def _patched_calculate_shard_configuration(self, mesh, mesh_dim_names):
++    names = tuple(mesh_dim_names)
++    assert names in _FSDP_EQUIVALENT_1D or names == ("ddp", "fsdp"), (
++        f"Unsupported mesh_dim_names {names}"
++    )
++    if "tp" in names:
++        total_shards = mesh.shape[-1] * mesh.shape[-2]
++        mesh_shape = (mesh.shape[-2], mesh.shape[-1])
++    else:
++        total_shards = mesh.shape[-1]
++        mesh_shape = (mesh.shape[-1],)
++    return total_shards, mesh_shape
++
++
++FSDPModelMerger._calculate_shard_configuration = _patched_calculate_shard_configuration
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--local_dir", required=True, help="<global_step_N>/actor dir")
++    ap.add_argument("--target_dir", required=True, help="output HF dir")
++    ap.add_argument("--trust-remote-code", action="store_true")
++    args = ap.parse_args()
++
++    cfg = ModelMergerConfig(
++        operation="merge",
++        backend="fsdp",
++        local_dir=args.local_dir,
++        target_dir=args.target_dir,
++        hf_model_config_path=os.path.join(args.local_dir, "huggingface"),
++        trust_remote_code=args.trust_remote_code,
++        use_cpu_initialization=True,
++    )
++    merger = FSDPModelMerger(cfg)
++    merger.merge_and_save()
++    print(f"[merge_veomni] saved HF model -> {args.target_dir}")
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/verl/models/transformers/qwen3_5_router_replay.py b/verl/models/transformers/qwen3_5_router_replay.py
+new file mode 100644
+index 00000000..673473f3
+--- /dev/null
++++ b/verl/models/transformers/qwen3_5_router_replay.py
+@@ -0,0 +1,189 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""FSDP / HuggingFace MoE router replay for Qwen3.5-MoE.
++
++Upstream ``verl/utils/megatron/router_replay_patch.py`` patches Megatron's
++``TopKRouter``; it cannot serve the FSDP path, which trains the HF transformers
++model directly. This module is the HF analogue: it patches
++``Qwen3_5MoeTopKRouter.forward`` and drives it through the SAME backend-agnostic
++``RouterReplay`` registry (``verl.utils.router_replay``) the Megatron path uses,
++so both share one framework and one ``router_replay.mode`` config.
++
++Difference vs the Megatron router (R2/R3): rollout-stage R3 only records routing
++for the assistant tokens vLLM actually generated; prompt / tool / injected tokens
++carry an all-zero placeholder row. A real top-k over 256 experts never yields all
++zeros, so we replay ONLY non-placeholder rows and keep the model's own routing for
++placeholder rows. (Megatron's R2 records every token, so it has no placeholders.)
++
++The replay GATING WEIGHTS are recomputed from the current ``router_logits`` via
++``gather`` over the replayed indices, so gradients still flow into the gate and the
++router keeps training; only the expert *selection* is forced to rollout's choice.
++"""
++
++import logging
++import os
++
++import torch
++
++from verl.utils.router_replay import RouterReplay, RouterReplayAction
++
++logger = logging.getLogger(__file__)
++logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
++
++_R3_REPLAY_LOGGED = 0
++_R3_DIAG_N = 0
++# Alignment/gating probe ([R3-DIAG]) is off by default; set R3_DIAG=1 to re-enable
++# (it confirmed the rollout off-by-one: shift-1 overlap 0.99 vs 0.08 unshifted).
++_R3_DIAG_ON = os.getenv("R3_DIAG", "0") == "1"
++
++
++def _r3_print_diag(n_tokens, real, replay_idx, model_topk, gating_gathered):
++    """Systematic R3 alignment/gating probe (print: logger isn't captured in ray
++    actors / vLLM EngineCore). At step 1 actor weights == rollout weights, so for
++    the REAL (non-placeholder) rows a CORRECT replay should overlap the model's
++    own top-k heavily (~0.9+). Interpretation:
++      - overlap≈k/256 (random) and no +/-1 shift recovers it -> token misalignment.
++      - a +1 or -1 token-shift recovers a high overlap            -> off-by-one.
++      - overlap high but pearson still low                        -> gating math.
++    gate_rowsum_mean (sum of the forced experts' current probs = the renorm
++    denominator) is large (~0.5+) when the forced experts are genuinely high-prob
++    (aligned) and tiny (~0.03) when near-random (misaligned)."""
++    with torch.no_grad():
++        rm = real.squeeze(-1)  # [n] bool
++        n_real = int(rm.sum())
++        if n_real == 0:
++            print(f"[R3-DIAG] n_tok={n_tokens} real=0 (all placeholder)", flush=True)
++            return
++        k = replay_idx.shape[-1]
++
++        def _overlap(a):  # mean fraction of a's experts present in model_topk, over real rows
++            m = (a.unsqueeze(-1) == model_topk.unsqueeze(-2)).any(-1).float().sum(-1)  # [n]
++            return float((m[rm] / k).mean())
++
++        ov0, ovp1, ovm1 = _overlap(replay_idx), _overlap(torch.roll(replay_idx, 1, dims=0)), _overlap(
++            torch.roll(replay_idx, -1, dims=0)
++        )
++        t1 = float((replay_idx[rm, 0] == model_topk[rm, 0]).float().mean())
++        gw = gating_gathered[rm]
++        print(
++            f"[R3-DIAG] n_tok={n_tokens} real={n_real} placeholder={n_tokens - n_real} "
++            f"overlap(forced,model_topk)={ov0:.3f} shift+1={ovp1:.3f} shift-1={ovm1:.3f} "
++            f"top1match={t1:.3f} gate_rowsum_mean={float(gw.sum(-1).mean()):.4f} "
++            f"gate_max_mean={float(gw.max(-1).values.mean()):.4f}",
++            flush=True,
++        )
++
++
++def _make_r3_router_forward(orig_forward):
++    """Build the replay-aware ``Qwen3_5MoeTopKRouter.forward`` wrapping ``orig_forward``.
++
++    When the router's attached ``RouterReplay`` instance has no action set (non-R3
++    runs, ref policy, eval), this delegates to ``orig_forward`` verbatim — byte
++    identical, zero overhead. Otherwise it reimplements the router (softmax → top-k
++    → renormalize) with the top-k selection overridden for REPLAY_FORWARD or the
++    indices recorded for RECORD.
++
++    NOTE (human review): the replay-path reimplementation must match the installed
++    transformers ``Qwen3_5MoeTopKRouter.forward`` (softmax dtype, return tuple
++    order). Verify against the transformers version pinned for this env.
++    """
++
++    def _r3_router_forward(self, hidden_states):
++        rr = getattr(self, "_router_replay", None)
++        action = rr.router_replay_action if rr is not None else None
++        if action is None:
++            # Disabled path: exactly the original router.
++            return orig_forward(self, hidden_states)
++
++        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
++        router_logits = torch.nn.functional.linear(hidden_states, self.weight)
++        router_probs = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
++        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
++        n_tokens = router_indices.shape[0]
++
++        if action == RouterReplayAction.RECORD:
++            rr.record_indices(router_indices)
++        elif action == RouterReplayAction.REPLAY_FORWARD and rr.target_topk_idx is not None:
++            target = rr.target_topk_idx
++            if target.shape[0] == n_tokens:
++                replay_idx = target.to(router_indices.device).long()  # [n, k]
++                real = (replay_idx != 0).any(dim=-1, keepdim=True)  # placeholder rows -> False
++                _model_topk = router_indices  # model's own top-k (pre-override) for diagnostics
++                router_indices = torch.where(real, replay_idx, _model_topk)
++                router_top_value = router_probs.gather(-1, router_indices)
++                global _R3_REPLAY_LOGGED
++                if _R3_REPLAY_LOGGED < 5:  # proof the training-side replay actually executed
++                    _R3_REPLAY_LOGGED += 1
++                    logger.warning(
++                        "[R3-replay] training-side replay FIRED: tokens=%d replayed_rows=%d",
++                        n_tokens,
++                        int(real.sum()),
++                    )
++                global _R3_DIAG_N
++                if _R3_DIAG_ON and _R3_DIAG_N < 8:
++                    _R3_DIAG_N += 1
++                    try:
++                        _r3_print_diag(n_tokens, real, replay_idx, _model_topk, router_top_value)
++                    except Exception as _e:  # never let the probe break training
++                        print(f"[R3-DIAG] probe error: {_e}", flush=True)
++            else:
++                logger.warning(
++                    "R3 replay token count %d != router tokens %d; skipping replay this forward "
++                    "(check remove-padding alignment / sp_size==1).",
++                    target.shape[0],
++                    n_tokens,
++                )
++
++        router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
++        # Match the stock Qwen3_5MoeTopKRouter.forward, which reassigns
++        # ``router_logits = softmax(router_logits, dtype=float)`` and then returns
++        # that (float32) tensor and casts the scores to ITS dtype. Returning the
++        # raw bf16 logits / bf16 scores here would diverge from the unpatched
++        # router on every non-replayed row (gating weights in bf16 vs float32).
++        router_top_value = router_top_value.to(router_probs.dtype)
++        return router_probs, router_top_value, router_indices
++
++    return _r3_router_forward
++
++
++def apply_qwen3_5_router_replay_patch(model) -> int:
++    """Install R3 router replay on a Qwen3.5-MoE model for the FSDP path.
++
++    1. Idempotently replace ``Qwen3_5MoeTopKRouter.forward`` (class-level) with the
++       replay-aware version; the disabled path keeps the original verbatim.
++    2. Attach a fresh ``RouterReplay`` instance to each gate, in decoder-layer
++       (module enumeration) order, so ``RouterReplay.set_replay_data([per-layer
++       indices])`` distributes layer L's indices to layer L's gate. All 40
++       Qwen3.5-MoE layers are MoE, so enumeration order == layer id == the vLLM
++       capturer's layer axis.
++
++    Returns the number of MoE gates patched (== num MoE layers).
++    """
++    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeTopKRouter
++
++    if not getattr(Qwen3_5MoeTopKRouter, "_r3_patched", False):
++        Qwen3_5MoeTopKRouter.forward = _make_r3_router_forward(Qwen3_5MoeTopKRouter.forward)
++        Qwen3_5MoeTopKRouter._r3_patched = True
++
++    # Reset the global registry so re-applying (e.g. a rebuilt model) doesn't leave
++    # stale instances behind, which would make set_replay_data's length check fail.
++    # Safe on the FSDP path: this process never registers Megatron routers (their
++    # module hard-imports megatron and isn't loaded here).
++    RouterReplay.router_instances = []
++    n = 0
++    for module in model.modules():
++        if module.__class__.__name__ == "Qwen3_5MoeTopKRouter":
++            module._router_replay = RouterReplay()  # __init__ appends to the registry, in layer order
++            n += 1
++    return n
+diff --git a/verl/protocol.py b/verl/protocol.py
+index 59f91d83..a8ad1f95 100644
+--- a/verl/protocol.py
++++ b/verl/protocol.py
+@@ -924,6 +924,24 @@ class DataProto:
+         Returns:
+             DataProto: concatenated DataProto
+         """
++        # Align TensorDict keys across shards before torch.cat: a key present in some
++        # shards but not all (e.g. routed_experts, captured only for trials whose MoE
++        # routing R3 recorded; empty/failed trials omit it) makes torch.cat fail with
++        # "incompatible keys". Pad the missing ones with zeros copied from a shard that
++        # has the key (shape/dtype/device; only the batch dim varies) — model-agnostic.
++        # Lives here (not just at call sites) so every concat path is covered.
++        _shards = [d for d in data if d is not None and getattr(d, "batch", None) is not None]
++        if len(_shards) > 1:
++            _ref = {}
++            for _d in _shards:
++                for _k in _d.batch.keys():
++                    _ref.setdefault(_k, _d.batch[_k])
++            for _d in _shards:
++                _present = set(_d.batch.keys())
++                _n = _d.batch.batch_size[0]
++                for _k, _t in _ref.items():
++                    if _k not in _present:
++                        _d.batch[_k] = torch.zeros((_n, *_t.shape[1:]), dtype=_t.dtype, device=_t.device)
+         batch_lst = []
+         for batch in data:
+             batch_lst.append(batch.batch)
+diff --git a/verl/trainer/config/algorithm.py b/verl/trainer/config/algorithm.py
+index a150ee63..aa867b02 100644
+--- a/verl/trainer/config/algorithm.py
++++ b/verl/trainer/config/algorithm.py
+@@ -17,7 +17,13 @@ from typing import Any, Optional
+ 
+ from verl.base_config import BaseConfig
+ 
+-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
++__all__ = [
++    "AlgoConfig",
++    "FilterGroupsConfig",
++    "KLControlConfig",
++    "RolloutCorrectionConfig",
++    "TrajectoryFilterConfig",
++]
+ 
+ 
+ @dataclass
+@@ -56,6 +62,51 @@ class FilterGroupsConfig(BaseConfig):
+     max_num_gen_batches: int = 0
+ 
+ 
++@dataclass
++class TrajectoryFilterConfig(BaseConfig):
++    """Mask environment-corrupted trajectories out of the policy loss and group statistics.
++
++    Agentic rollouts can fail for reasons unrelated to policy quality (sandbox/env setup
++    failure, agent or verifier wall-clock timeout, context-length overflow, response-length
++    truncation, turn-cap exhaustion). Such trajectories carry a reward that reflects the
++    environment, not the policy; training on them injects noise into the advantage signal
++    (especially with GRPO std-normalization, where a spurious 0 inflates sibling advantages).
++
++    When enabled, flagged trajectories are excluded from BOTH the policy loss (their
++    advantages/returns are zeroed) and the GRPO group statistics (their uid is rewritten
++    to a singleton group), without changing batch shapes. Per-reason counts are logged
++    under ``trajectory_filter/``.
++
++    Flag sources (agent loop ``extra_fields`` propagated into ``non_tensor_batch``):
++    ``is_env_failure``, ``is_timeout``, ``is_context_error``, ``is_overlong``,
++    ``trajectory_token_source == "dummy"``, plus trainer-side fallbacks (response length
++    below ``min_response_tokens``, response filling the whole window, ``__num_turns__``).
++
++    Args:
++        enable (bool): Master switch. Default False (no behavior change).
++        filter_env_failures (bool): Drop env-failure/dummy trajectories (env setup failed,
++            invalid proxy trajectory, response shorter than ``min_response_tokens``).
++        filter_timeouts (bool): Drop trajectories flagged ``is_timeout`` (agent/verifier
++            wall-clock timeout).
++        filter_context_errors (bool): Drop trajectories flagged ``is_context_error``.
++        filter_overlong (bool): DAPO-style overlong masking — drop trajectories flagged
++            ``is_overlong`` or whose response fills the whole response window (truncated).
++        filter_turn_capped (bool): Drop trajectories with ``__num_turns__ >= max_num_turns``.
++        min_response_tokens (int): Responses with fewer valid tokens are treated as env
++            failures. 0 disables the length check.
++        max_num_turns (int): Turn cap used by ``filter_turn_capped``. 0 disables.
++    """
++
++    enable: bool = False
++    filter_env_failures: bool = True
++    filter_timeouts: bool = True
++    filter_context_errors: bool = True
++    filter_overlong: bool = True
++    filter_turn_capped: bool = False
++    min_response_tokens: int = 8
++    max_num_turns: int = 0
++
++
+ @dataclass
+ class RolloutCorrectionConfig(BaseConfig):
+     """Configuration for Rollout Correction (addresses off-policy issues in RL training).
+@@ -179,6 +230,9 @@ class RolloutCorrectionConfig(BaseConfig):
+     rollout_rs_threshold: Optional[str | float] = None
+     bypass_mode: bool = False
+     loss_type: str = "ppo_clip"
++    # Log per-sequence distribution (p50/p90/p99, tail fractions) of off-policy metrics
++    # (training_log_ppl, log_ppl_diff, chi2_seq). Batch means hide catastrophic tails.
++    seq_dist_metrics: bool = True
+ 
+     @classmethod
+     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+@@ -658,6 +712,9 @@ class AlgoConfig(BaseConfig):
+     use_pf_ppo: bool = False
+     pf_ppo: dict[str, Any] = field(default_factory=dict)
+     filter_groups: Optional[FilterGroupsConfig] = None
++    # Trajectory filter: mask environment-corrupted trajectories (env failures, timeouts,
++    # context errors, overlong truncation, turn caps) out of the loss and group statistics.
++    trajectory_filter: Optional[TrajectoryFilterConfig] = None
+     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
+     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
+     rollout_correction: Optional[RolloutCorrectionConfig] = None
+diff --git a/verl/trainer/config/algorithm/rollout_correction.yaml b/verl/trainer/config/algorithm/rollout_correction.yaml
+index 60cc00e9..9ff40af6 100644
+--- a/verl/trainer/config/algorithm/rollout_correction.yaml
++++ b/verl/trainer/config/algorithm/rollout_correction.yaml
+@@ -26,3 +26,7 @@ loss_type: ppo_clip
+ 
+ # Batch normalize IS weights: false = raw weights, true = normalize to mean=1.0
+ rollout_is_batch_normalize: false
++
++# Log per-sequence distribution (p50/p90/p99, tail fractions) of off-policy metrics
++# (training_log_ppl, log_ppl_diff, log_chi2_seq). Batch means hide catastrophic tails.
++seq_dist_metrics: true
+diff --git a/verl/trainer/config/algorithm/trajectory_filter.yaml b/verl/trainer/config/algorithm/trajectory_filter.yaml
+new file mode 100644
+index 00000000..8379a226
+--- /dev/null
++++ b/verl/trainer/config/algorithm/trajectory_filter.yaml
+@@ -0,0 +1,30 @@
++# Trajectory filter: mask environment-corrupted trajectories out of the policy loss
++# and GRPO group statistics. See verl.trainer.config.TrajectoryFilterConfig.
++# Flagged trajectories get zeroed token_level_rewards/advantages and a singleton uid;
++# batch shapes are unchanged. Counts logged under trajectory_filter/.
++
++# Master switch (default off: no behavior change)
++enable: false
++
++# Drop env-failure/dummy trajectories (env setup failed, invalid proxy trajectory,
++# response shorter than min_response_tokens)
++filter_env_failures: true
++
++# Drop trajectories flagged is_timeout (agent/verifier wall-clock timeout)
++filter_timeouts: true
++
++# Drop trajectories flagged is_context_error (context-length overflow)
++filter_context_errors: true
++
++# DAPO-style overlong masking: drop trajectories flagged is_overlong or whose
++# response fills the entire response window (truncated by max_response_length)
++filter_overlong: true
++
++# Drop trajectories that exhausted the turn cap (__num_turns__ >= max_num_turns)
++filter_turn_capped: false
++
++# Responses with fewer valid tokens are treated as env failures (0 disables)
++min_response_tokens: 8
++
++# Turn cap used by filter_turn_capped (0 disables)
++max_num_turns: 0
+diff --git a/verl/trainer/config/engine/fsdp.yaml b/verl/trainer/config/engine/fsdp.yaml
+index ea690c02..17a0b1b4 100644
+--- a/verl/trainer/config/engine/fsdp.yaml
++++ b/verl/trainer/config/engine/fsdp.yaml
+@@ -62,6 +62,25 @@ strategy: fsdp
+ # Mixed precision training param dtype
+ dtype: bfloat16 # ["bfloat16", "float16"]
+ 
++# MoE router replay (R2/R3) for the FSDP engine. Mirrors engine/veomni.yaml so
++# the FSDP path (verl/workers/engine/fsdp/transformer_impl.py) can be enabled via
++# actor.fsdp_config.router_replay.mode. FSDPEngineConfig already inherits this
++# field from EngineConfig; surfacing it here makes it overridable on the CLI
++# without a `+`. FSDP replay currently supports Qwen3.5-MoE with sp_size==1.
++router_replay:
++
++  # Target dataclass for this configuration
++  _target_: verl.workers.config.EngineRouterReplayConfig
++
++  # Router replay mode: disabled, R2, R3
++  # - R2: record top-k indices in compute_log_prob (forward-only) and
++  #       replay them in the actor update. No rollout-side change required.
++  # - R3: record top-k indices at the rollout backend and replay them in
++  #       both compute_log_prob and the actor update. Requires
++  #       rollout.enable_rollout_routing_replay=True and rollout backend
++  #       support for returning the selected indices.
++  mode: disabled
++
+ # QAT (Quantization-Aware Training) configuration
+ qat:
+ 
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index 126b77c0..29da0a2c 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -39,6 +39,9 @@ defaults:
+   # Rollout correction config.
+   - algorithm@algorithm.rollout_correction: rollout_correction
+ 
++  # Trajectory filter config (mask env-corrupted trajectories out of loss/group stats).
++  - algorithm@algorithm.trajectory_filter: trajectory_filter
++
+   # distillation config
+   - distillation@distillation: distillation
+ 
+diff --git a/verl/trainer/distillation/losses.py b/verl/trainer/distillation/losses.py
+index 07df0850..47e88295 100644
+--- a/verl/trainer/distillation/losses.py
++++ b/verl/trainer/distillation/losses.py
+@@ -209,14 +209,16 @@ def distillation_ppo_loss(
+     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+     policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+     if not distillation_loss_config.use_task_rewards:
+-        policy_loss = 0.0
++        policy_loss_coef = 0.0
++    else:
++        policy_loss_coef = 1.0
+ 
+     # Combine distillation with policy loss
+     policy_metrics.update(distill_metrics)
+     distillation_loss_coef = (
+         distillation_loss_config.distillation_loss_coef if distillation_loss_config.use_task_rewards else 1.0
+     )
+-    policy_loss += distill_loss * distillation_loss_coef
++    policy_loss = policy_loss * policy_loss_coef + distill_loss * distillation_loss_coef
+     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
+ 
+     return policy_loss, policy_metrics
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index d1eaa7bd..4f5d45ae 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -479,9 +479,10 @@ class RayPPOTrainer:
+ 
+         print(f"Dumped generations to {filename}")
+ 
+-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
++    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps=None):
+         """Dump rollout/validation samples as JSONL asynchronously."""
+-        global_steps = self.global_steps
++        if global_steps is None:
++            global_steps = self.global_steps
+         future = self._dump_executor.submit(
+             self._write_generations,
+             inputs,
+@@ -548,7 +549,7 @@ class RayPPOTrainer:
+                 dump_path=rollout_data_dir,
+             )
+ 
+-    def _maybe_log_val_generations(self, inputs, outputs, scores):
++    def _maybe_log_val_generations(self, inputs, outputs, scores, global_steps=None):
+         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+ 
+         generations_to_log = self.config.trainer.log_val_generations
+@@ -570,7 +571,9 @@ class RayPPOTrainer:
+         samples = samples[:generations_to_log]
+ 
+         # Log to each configured logger
+-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
++        if global_steps is None:
++            global_steps = self.global_steps
++        self.validation_generations_logger.log(self.config.trainer.logger, samples, global_steps)
+ 
+     def _get_gen_batch(self, batch: DataProto) -> DataProto:
+         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+@@ -596,7 +599,10 @@ class RayPPOTrainer:
+         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
+         return batch_reward
+ 
+-    def _validate(self, merged: bool = False):
++    def _validate(self, merged: bool = False, global_steps: Optional[int] = None):
++        if global_steps is None:
++            global_steps = self.global_steps
++
+         data_source_lst = []
+         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+ 
+@@ -633,7 +639,7 @@ class RayPPOTrainer:
+                 "recompute_log_prob": False,
+                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                 "validate": True,
+-                "global_steps": self.global_steps,
++                "global_steps": global_steps,
+             }
+             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+ 
+@@ -650,7 +656,7 @@ class RayPPOTrainer:
+                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+                 # wake up rollout model
+                 # replace with wake_up method once supported
+-                self.checkpoint_manager.update_weights(self.global_steps)
++                self.checkpoint_manager.update_weights(global_steps)
+ 
+             # unpad
+             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+@@ -693,7 +699,12 @@ class RayPPOTrainer:
+ 
+             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+ 
+-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
++        self._maybe_log_val_generations(
++            inputs=sample_inputs,
++            outputs=sample_outputs,
++            scores=sample_scores,
++            global_steps=global_steps,
++        )
+ 
+         # dump generations
+         val_data_dir = self.config.trainer.get("validation_data_dir", None)
+@@ -705,6 +716,7 @@ class RayPPOTrainer:
+                 scores=sample_scores,
+                 reward_extra_infos_dict=reward_extra_infos_dict,
+                 dump_path=val_data_dir,
++                global_steps=global_steps,
+             )
+ 
+         for key_info, lst in reward_extra_infos_dict.items():
+@@ -1602,6 +1614,19 @@ class RayPPOTrainer:
+                         else:
+                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+ 
++                        # Mask environment-corrupted trajectories (env failures, timeouts,
++                        # context errors, overlong truncation, turn caps) out of the loss
++                        # and group stats. No-op unless algorithm.trajectory_filter.enable.
++                        from verl.trainer.ppo.trajectory_filter import (
++                            apply_trajectory_filter,
++                            zero_filtered_advantages,
++                        )
++
++                        batch, traj_filter_metrics = apply_trajectory_filter(
++                            batch, self.config.algorithm.get("trajectory_filter", None)
++                        )
++                        metrics.update(traj_filter_metrics)
++
+                         # Compute rollout correction: IS weights, rejection sampling, and metrics
+                         # Only runs in decoupled mode (computes once per batch using stable π_old)
+                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+@@ -1632,6 +1657,9 @@ class RayPPOTrainer:
+                             config=self.config.algorithm,
+                         )
+ 
++                        # Estimator-agnostic safety net: filtered rows contribute zero gradient.
++                        batch = zero_filtered_advantages(batch)
++
+                     # update critic
+                     if self.use_critic:
+                         with marked_timer("update_critic", timing_raw, color="pink"):
+diff --git a/verl/trainer/ppo/rollout_corr_helper.py b/verl/trainer/ppo/rollout_corr_helper.py
+index 0f4d558c..809c4032 100644
+--- a/verl/trainer/ppo/rollout_corr_helper.py
++++ b/verl/trainer/ppo/rollout_corr_helper.py
+@@ -785,6 +785,7 @@ def compute_rollout_correction_and_rejection_mask(
+     rollout_is_batch_normalize: bool = False,
+     rollout_rs: Optional[str] = None,
+     rollout_rs_threshold: Optional[str | float] = None,
++    seq_dist_metrics: bool = False,
+ ) -> tuple[Optional[DataProto], torch.Tensor, dict[str, float]]:
+     """Unified interface for computing IS weights and rejection masks.
+ 
+@@ -875,6 +876,7 @@ def compute_rollout_correction_and_rejection_mask(
+         old_log_prob=old_log_prob,
+         rollout_log_prob=rollout_log_prob,
+         response_mask=response_mask,
++        seq_dist=seq_dist_metrics,
+     )
+     metrics.update(offpolicy_metrics)
+ 
+@@ -894,10 +896,20 @@ def compute_rollout_correction_and_rejection_mask(
+     return rollout_is_weights_proto, modified_response_mask, metrics_scalar
+ 
+ 
++def _seq_dist_stats(metrics: dict[str, Any], name: str, values: torch.Tensor) -> None:
++    """Log p50/p90/p99 of a per-sequence tensor (batch means hide catastrophic tails)."""
++    values = values.detach().float()
++    quantiles = torch.quantile(values, torch.tensor([0.5, 0.9, 0.99], device=values.device))
++    metrics[f"{name}_p50"] = quantiles[0].item()
++    metrics[f"{name}_p90"] = quantiles[1].item()
++    metrics[f"{name}_p99"] = quantiles[2].item()
++
++
+ def compute_offpolicy_metrics(
+     old_log_prob: torch.Tensor,
+     rollout_log_prob: Optional[torch.Tensor],
+     response_mask: torch.Tensor,
++    seq_dist: bool = False,
+ ) -> dict[str, Any]:
+     """Compute off-policy diagnostic metrics (helper function).
+ 
+@@ -925,6 +937,9 @@ def compute_offpolicy_metrics(
+         old_log_prob: Log probabilities from training policy, shape (batch_size, seq_length)
+         rollout_log_prob: Log probabilities from rollout policy, shape (batch_size, seq_length)
+         response_mask: Mask for valid tokens, shape (batch_size, seq_length)
++        seq_dist: Also log per-sequence distribution (p50/p90/p99, tail fractions) of
++            training_log_ppl, log_ppl_diff and log_chi2_seq. Batch means/maxes hide how
++            many sequences sit in the catastrophic tail; these expose it directly.
+ 
+     Returns:
+         Dictionary of off-policy metrics (without prefix)
+@@ -944,6 +959,9 @@ def compute_offpolicy_metrics(
+     # Also log log-ppl for easier analysis (avoids exponential scale)
+     metrics["training_log_ppl"] = (-mean_log_prob_training).mean().detach().item()
+ 
++    if seq_dist:
++        _seq_dist_stats(metrics, "training_log_ppl", -mean_log_prob_training)
++
+     # 2. Compute rollout off-policy metrics (only if rollout_log_probs available)
+     if rollout_log_prob is not None:
+         # 2a. kl: Direct estimator for KL(π_rollout || π_training)
+@@ -1000,6 +1018,16 @@ def compute_offpolicy_metrics(
+         chi2_seq = rho_squared_seq.mean() - 1.0
+         metrics["chi2_seq"] = chi2_seq.detach().item()
+ 
++        if seq_dist:
++            # log_ppl_diff per sequence: the primary early-warning signal — a handful of
++            # sequences the trained policy can no longer produce drive training_ppl and
++            # grad spikes long before batch means move.
++            _seq_dist_stats(metrics, "log_ppl_diff", log_ppl_diff)
++            metrics["log_ppl_diff_gt1_frac"] = (log_ppl_diff > 1.0).float().mean().detach().item()
++            metrics["log_ppl_diff_gt2_frac"] = (log_ppl_diff > 2.0).float().mean().detach().item()
++            # chi2 per sequence in log space (2 * Σ log ρ_t); raw values overflow easily.
++            _seq_dist_stats(metrics, "log_chi2_seq", 2.0 * log_ratio_sum_safe)
++
+     return metrics
+ 
+ 
+@@ -1037,6 +1065,7 @@ def compute_rollout_correction_and_add_to_batch(
+     rollout_is_batch_normalize = rollout_corr_config.get("rollout_is_batch_normalize", False)
+     rollout_rs = rollout_corr_config.get("rollout_rs", None)
+     rollout_rs_threshold = rollout_corr_config.get("rollout_rs_threshold", None)
++    seq_dist_metrics = rollout_corr_config.get("seq_dist_metrics", True)
+ 
+     # Compute IS weights and get modified response_mask
+     rollout_is_weights, modified_response_mask, rollout_corr_metrics = compute_rollout_correction_and_rejection_mask(
+@@ -1048,6 +1077,7 @@ def compute_rollout_correction_and_add_to_batch(
+         rollout_is_batch_normalize=rollout_is_batch_normalize,
+         rollout_rs=rollout_rs,
+         rollout_rs_threshold=rollout_rs_threshold,
++        seq_dist_metrics=seq_dist_metrics,
+     )
+ 
+     # ALWAYS update response_mask with rejection applied
+diff --git a/verl/trainer/ppo/trajectory_filter.py b/verl/trainer/ppo/trajectory_filter.py
+new file mode 100644
+index 00000000..1d4b09e9
+--- /dev/null
++++ b/verl/trainer/ppo/trajectory_filter.py
+@@ -0,0 +1,145 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Trajectory filter: mask environment-corrupted trajectories out of the loss and group stats.
++
++Agentic rollouts can fail for reasons unrelated to policy quality: sandbox/env setup
++failure (dummy 1-token trajectories), agent or verifier wall-clock timeout, context-length
++overflow, response-length truncation (DAPO "overlong"), turn-cap exhaustion. Their reward
++(usually a spurious 0) reflects the environment, not the policy. With GRPO
++std-normalization a spurious 0 both trains AGAINST the (possibly fine) trajectory and
++inflates the advantages of its group siblings.
++
++``apply_trajectory_filter`` neutralizes flagged trajectories without changing batch shapes:
++
++1. ``token_level_rewards`` of flagged rows are zeroed (no reward signal can leak);
++2. their ``uid`` is rewritten to a singleton group, removing them from the GRPO group
++   statistics of their siblings (singleton groups get mean=0/std=1, so with a zeroed
++   reward the resulting advantage is exactly 0);
++3. a boolean row mask is stored in ``non_tensor_batch[FILTER_MASK_KEY]`` so
++   ``zero_filtered_advantages`` can zero advantages/returns after any advantage
++   estimator ran (belt-and-braces for non-GRPO estimators).
++
++Flags come from the agent loop's ``extra_fields`` (propagated into ``non_tensor_batch``
++by ``AgentLoopWorker._postprocess``), with trainer-side fallbacks computed from tensors.
++
++Configured by ``algorithm.trajectory_filter`` (see TrajectoryFilterConfig); disabled by
++default. Per-reason counts are logged under ``trajectory_filter/``.
++"""
++
++import numpy as np
++import torch
++
++from verl import DataProto
++
++FILTER_MASK_KEY = "trajectory_filter_mask"
++
++
++def _flag_array(batch: DataProto, key: str) -> np.ndarray:
++    """Read a boolean per-row flag from non_tensor_batch; missing key/None entries -> False."""
++    n = len(batch)
++    if key not in batch.non_tensor_batch:
++        return np.zeros(n, dtype=bool)
++    return np.array([bool(x) for x in batch.non_tensor_batch[key]], dtype=bool)
++
++
++def _response_token_counts(batch: DataProto) -> torch.Tensor:
++    """Number of attended tokens in the response window, shape (bs,)."""
++    response_len = batch.batch["responses"].shape[1]
++    return batch.batch["attention_mask"][:, -response_len:].sum(dim=-1)
++
++
++def apply_trajectory_filter(batch: DataProto, config) -> tuple[DataProto, dict]:
++    """Flag env-corrupted trajectories and neutralize their reward/group contribution.
++
++    Must run AFTER ``token_level_rewards`` is set and BEFORE advantage computation.
++
++    Args:
++        batch: training batch with ``responses``, ``attention_mask``,
++            ``token_level_rewards`` and (for GRPO) ``non_tensor_batch["uid"]``.
++        config: ``algorithm.trajectory_filter`` (TrajectoryFilterConfig / DictConfig / None).
++
++    Returns:
++        (batch, metrics): batch is modified in place; metrics carry per-reason counts.
++    """
++    if config is None or not config.get("enable", False):
++        return batch, {}
++
++    n = len(batch)
++    invalid = np.zeros(n, dtype=bool)
++    reasons: dict[str, np.ndarray] = {}
++
++    if config.get("filter_env_failures", True):
++        mask = _flag_array(batch, "is_env_failure")
++        if "trajectory_token_source" in batch.non_tensor_batch:
++            mask |= np.array(
++                [x == "dummy" for x in batch.non_tensor_batch["trajectory_token_source"]], dtype=bool
++            )
++        min_tokens = int(config.get("min_response_tokens", 0))
++        if min_tokens > 0:
++            mask |= (_response_token_counts(batch) < min_tokens).cpu().numpy()
++        reasons["env_failure"] = mask
++
++    if config.get("filter_timeouts", True):
++        reasons["timeout"] = _flag_array(batch, "is_timeout")
++
++    if config.get("filter_context_errors", True):
++        reasons["context_error"] = _flag_array(batch, "is_context_error")
++
++    if config.get("filter_overlong", True):
++        mask = _flag_array(batch, "is_overlong")
++        # Fallback: a response that fills the whole window was truncated by the cap.
++        response_len = batch.batch["responses"].shape[1]
++        mask |= (_response_token_counts(batch) >= response_len).cpu().numpy()
++        reasons["overlong"] = mask
++
++    max_turns = int(config.get("max_num_turns", 0))
++    if config.get("filter_turn_capped", False) and max_turns > 0 and "__num_turns__" in batch.non_tensor_batch:
++        num_turns = np.asarray(batch.non_tensor_batch["__num_turns__"], dtype=np.int64)
++        reasons["turn_capped"] = num_turns >= max_turns
++
++    for mask in reasons.values():
++        invalid |= mask
++
++    metrics = {f"trajectory_filter/{name}_count": int(mask.sum()) for name, mask in reasons.items()}
++    metrics["trajectory_filter/invalid_count"] = int(invalid.sum())
++    metrics["trajectory_filter/invalid_ratio"] = float(invalid.mean()) if n else 0.0
++
++    if invalid.any():
++        invalid_t = torch.from_numpy(invalid).to(batch.batch["token_level_rewards"].device)
++        # 1) no reward signal may leak through the singleton group
++        batch.batch["token_level_rewards"][invalid_t] = 0.0
++        # 2) remove from sibling GRPO group statistics via singleton uid
++        if "uid" in batch.non_tensor_batch:
++            uids = batch.non_tensor_batch["uid"]
++            for i in np.nonzero(invalid)[0]:
++                uids[i] = f"{uids[i]}__filtered_{i}"
++        # 3) remember rows for post-advantage zeroing
++        batch.non_tensor_batch[FILTER_MASK_KEY] = invalid
++
++    return batch, metrics
++
++
++def zero_filtered_advantages(batch: DataProto) -> DataProto:
++    """Zero advantages/returns of rows flagged by ``apply_trajectory_filter``.
++
++    Estimator-agnostic safety net: a zero advantage contributes exactly zero policy
++    gradient regardless of clipping or IS weighting. No-op when nothing was flagged.
++    """
++    if FILTER_MASK_KEY not in batch.non_tensor_batch:
++        return batch
++    invalid = torch.from_numpy(np.asarray(batch.non_tensor_batch[FILTER_MASK_KEY], dtype=bool))
++    for key in ("advantages", "returns"):
++        if key in batch.batch:
++            batch.batch[key][invalid.to(batch.batch[key].device)] = 0.0
++    return batch
+diff --git a/verl/utils/fsdp_utils.py b/verl/utils/fsdp_utils.py
+index 6d84ded5..8092806c 100644
+--- a/verl/utils/fsdp_utils.py
++++ b/verl/utils/fsdp_utils.py
+@@ -1041,6 +1041,69 @@ def merged_lora_context(actor, backup_adapters=False):
+             fsdp_merge_unmerge(actor, do_merge=False)
+ 
+ 
++def fsdp1_sharded_save_to_cpu(
++    model: torch.nn.Module,
++) -> dict[str, torch.Tensor]:
++    """
++    Sharded Save for FSDP1: Each process saves its local FlatParameter shards to CPU memory.
++
++    Args:
++        model: FSDP1-wrapped model (using FlatParameter).
++
++    Returns:
++        cpu_sharded_state: Dictionary of CPU shards for the current process.
++                          Key = parameter name, Value = CPU tensor
++    """
++    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
++
++    assert isinstance(model, FSDP), "Model must be wrapped with FSDP1 (FullyShardedDataParallel)"
++
++    # Initialize FSDP if not already done
++    _lazy_init(model, model)
++
++    cpu_sharded_state = {}
++
++    # Snapshot each rank's local FlatParameter shards directly instead of going
++    # through state_dict(): the default FULL_STATE_DICT path unshards onto the
++    # compute device, which asserts when CPUOffload(offload_params=True) keeps
++    # the flat parameters on CPU between forwards.
++    with torch.no_grad():
++        for param_name, param in model.named_parameters():
++            cpu_sharded_state[param_name] = param.detach().to("cpu", copy=True)
++
++    return cpu_sharded_state
++
++
++def fsdp1_sharded_load_from_cpu(
++    model: torch.nn.Module,
++    cpu_sharded_state: dict[str, torch.Tensor],
++) -> None:
++    """
++    Sharded Load for FSDP1: Each process loads its CPU shard back to GPU.
++
++    Args:
++        model: FSDP1 model to be restored.
++        cpu_sharded_state: Shard data read from CPU memory by the current process.
++    """
++    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
++
++    assert isinstance(model, FSDP), "Model must be wrapped with FSDP1 (FullyShardedDataParallel)"
++
++    # Initialize FSDP if not already done
++    _lazy_init(model, model)
++
++    # Copy each local shard back in place, mirroring fsdp1_sharded_save_to_cpu.
++    # Works whether the flat parameters currently live on GPU or on CPU
++    # (CPUOffload), unlike load_state_dict() which unshards onto the compute
++    # device.
++    with torch.no_grad():
++        for param_name, param in model.named_parameters():
++            param.data.copy_(cpu_sharded_state[param_name].to(param.device))
++
++    # Process synchronization
++    dist.barrier()
++
++
+ def fsdp2_sharded_save_to_cpu(
+     model: torch.nn.Module,
+ ) -> tuple[dict[str, tuple[torch.Tensor, DTensorSpec]], DTensorSpec]:
+diff --git a/verl/utils/megatron/router_replay_patch.py b/verl/utils/megatron/router_replay_patch.py
+index 012ab3ff..386b61ce 100644
+--- a/verl/utils/megatron/router_replay_patch.py
++++ b/verl/utils/megatron/router_replay_patch.py
+@@ -35,98 +35,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
+ # https://github.com/THUDM/slime/blob/main/slime/utils/routing_replay.py
+ 
+ 
+-class RouterReplayAction(Enum):
+-    RECORD = "record"
+-    REPLAY_FORWARD = "replay_forward"
+-    REPLAY_BACKWARD = "replay_backward"
+-
+-
+-class RouterReplay:
+-    """
+-    A class to manage the recording and replaying of MoE routing decisions.
+-    It holds all router instances and provides static methods to globally
+-    control recording and replaying.
+-    """
+-
+-    # Static variable to hold all router instances, one per MoE layer.
+-    router_instances = []
+-
+-    @staticmethod
+-    def set_replay_data(all_layers_topk_indices: list):
+-        """
+-        Distributes the topk indices for all layers to their respective RouterReplay instances.
+-        :param all_layers_topk_indices: A list of tensors, where each tensor contains the
+-                                        topk indices for a specific layer. The order
+-                                        must match the instantiation order of the routers.
+-        """
+-        if len(all_layers_topk_indices) != len(RouterReplay.router_instances):
+-            raise ValueError(
+-                f"The number of replay tensors ({len(all_layers_topk_indices)}) "
+-                f"does not match the number of router instances ({len(RouterReplay.router_instances)})."
+-            )
+-        for i, router_instance in enumerate(RouterReplay.router_instances):
+-            router_instance.set_target_indices(all_layers_topk_indices[i])
+-
+-    @staticmethod
+-    def get_recorded_data() -> list:
+-        """
+-        Collects the recorded topk indices from all RouterReplay instances.
+-        :return: A list of tensors, each containing the recorded topk indices for a layer.
+-        """
+-        return [router.get_recorded_indices() for router in RouterReplay.router_instances]
+-
+-    @staticmethod
+-    def clear_global_indices():
+-        """Clears the recorded and target topk indices in all instances."""
+-        for router in RouterReplay.router_instances:
+-            router.clear_indices()
+-
+-    def __init__(self):
+-        """Initializes a RouterReplay instance for a specific layer."""
+-        self.target_topk_idx = None  # For replay
+-        self.recorded_topk_idx = None  # For recording
+-        self.router_replay_action = None  # Router replay action for this layer
+-        self.replay_backward_list = []  # List of tensors for backward pass replay
+-        RouterReplay.router_instances.append(self)
+-
+-    def set_target_indices(self, topk_indices: torch.Tensor):
+-        """Sets the target topk indices for replay."""
+-        self.target_topk_idx = topk_indices
+-        self.replay_backward_list.append(topk_indices)
+-
+-    def get_recorded_indices(self):
+-        """Returns the recorded topk indices."""
+-        return self.recorded_topk_idx
+-
+-    def record_indices(self, topk_indices: torch.Tensor):
+-        """Records the topk indices."""
+-        self.recorded_topk_idx = topk_indices
+-
+-    def clear_indices(self):
+-        """Clears the recorded and target topk indices."""
+-        self.recorded_topk_idx = None
+-        self.target_topk_idx = None
+-        self.replay_backward_list = []
+-
+-    def set_router_replay_action(self, router_replay_action: RouterReplayAction):
+-        """Sets the router replay action for this layer."""
+-        self.router_replay_action = router_replay_action
+-
+-    def clear_router_replay_action(self):
+-        """Clears the router replay action for this layer."""
+-        self.router_replay_action = None
+-
+-    @staticmethod
+-    def set_global_router_replay_action(router_replay_action: RouterReplayAction):
+-        """Sets the router replay action for all router instances."""
+-        for router in RouterReplay.router_instances:
+-            router.set_router_replay_action(router_replay_action)
+-
+-    @staticmethod
+-    def clear_global_router_replay_action():
+-        """Clears the router replay action for all router instances."""
+-        for router in RouterReplay.router_instances:
+-            router.clear_router_replay_action()
++# RouterReplay / RouterReplayAction moved to the backend-agnostic verl.utils.router_replay
++# so a Megatron-free (e.g. FSDP) engine can drive replay through the same framework.
++# Re-exported here for backward compatibility with existing importers.
++from verl.utils.router_replay import RouterReplay, RouterReplayAction  # noqa: E402,F401
+ 
+ 
+ def _patched_topk_routing_with_score_function(
+diff --git a/verl/utils/router_replay.py b/verl/utils/router_replay.py
+new file mode 100644
+index 00000000..722f5059
+--- /dev/null
++++ b/verl/utils/router_replay.py
+@@ -0,0 +1,122 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Backend-agnostic MoE router-replay holder.
++
++The ``RouterReplay`` registry + ``RouterReplayAction`` enum are pure data
++structures with no backend (Megatron / FSDP / VeOmni) dependency. They used to
++live in ``verl/utils/megatron/router_replay_patch.py``, whose module-level
++``import megatron`` makes it unimportable in a Megatron-free (e.g. FSDP) env.
++Moved here so the FSDP engine can drive router replay through the same framework.
++``router_replay_patch`` re-exports these names for backward compatibility.
++
++Reference: https://github.com/THUDM/slime/blob/main/slime/utils/routing_replay.py
++"""
++
++from enum import Enum
++
++import torch
++
++
++class RouterReplayAction(Enum):
++    RECORD = "record"
++    REPLAY_FORWARD = "replay_forward"
++    REPLAY_BACKWARD = "replay_backward"
++
++
++class RouterReplay:
++    """
++    A class to manage the recording and replaying of MoE routing decisions.
++    It holds all router instances and provides static methods to globally
++    control recording and replaying.
++    """
++
++    # Static variable to hold all router instances, one per MoE layer.
++    router_instances = []
++
++    @staticmethod
++    def set_replay_data(all_layers_topk_indices: list):
++        """
++        Distributes the topk indices for all layers to their respective RouterReplay instances.
++        :param all_layers_topk_indices: A list of tensors, where each tensor contains the
++                                        topk indices for a specific layer. The order
++                                        must match the instantiation order of the routers.
++        """
++        if len(all_layers_topk_indices) != len(RouterReplay.router_instances):
++            raise ValueError(
++                f"The number of replay tensors ({len(all_layers_topk_indices)}) "
++                f"does not match the number of router instances ({len(RouterReplay.router_instances)})."
++            )
++        for i, router_instance in enumerate(RouterReplay.router_instances):
++            router_instance.set_target_indices(all_layers_topk_indices[i])
++
++    @staticmethod
++    def get_recorded_data() -> list:
++        """
++        Collects the recorded topk indices from all RouterReplay instances.
++        :return: A list of tensors, each containing the recorded topk indices for a layer.
++        """
++        return [router.get_recorded_indices() for router in RouterReplay.router_instances]
++
++    @staticmethod
++    def clear_global_indices():
++        """Clears the recorded and target topk indices in all instances."""
++        for router in RouterReplay.router_instances:
++            router.clear_indices()
++
++    def __init__(self):
++        """Initializes a RouterReplay instance for a specific layer."""
++        self.target_topk_idx = None  # For replay
++        self.recorded_topk_idx = None  # For recording
++        self.router_replay_action = None  # Router replay action for this layer
++        self.replay_backward_list = []  # List of tensors for backward pass replay
++        RouterReplay.router_instances.append(self)
++
++    def set_target_indices(self, topk_indices: torch.Tensor):
++        """Sets the target topk indices for replay."""
++        self.target_topk_idx = topk_indices
++        self.replay_backward_list.append(topk_indices)
++
++    def get_recorded_indices(self):
++        """Returns the recorded topk indices."""
++        return self.recorded_topk_idx
++
++    def record_indices(self, topk_indices: torch.Tensor):
++        """Records the topk indices."""
++        self.recorded_topk_idx = topk_indices
++
++    def clear_indices(self):
++        """Clears the recorded and target topk indices."""
++        self.recorded_topk_idx = None
++        self.target_topk_idx = None
++        self.replay_backward_list = []
++
++    def set_router_replay_action(self, router_replay_action: RouterReplayAction):
++        """Sets the router replay action for this layer."""
++        self.router_replay_action = router_replay_action
++
++    def clear_router_replay_action(self):
++        """Clears the router replay action for this layer."""
++        self.router_replay_action = None
++
++    @staticmethod
++    def set_global_router_replay_action(router_replay_action: RouterReplayAction):
++        """Sets the router replay action for all router instances."""
++        for router in RouterReplay.router_instances:
++            router.set_router_replay_action(router_replay_action)
++
++    @staticmethod
++    def clear_global_router_replay_action():
++        """Clears the router replay action for all router instances."""
++        for router in RouterReplay.router_instances:
++            router.clear_router_replay_action()
+diff --git a/verl/utils/vllm/vllm_fp8_utils.py b/verl/utils/vllm/vllm_fp8_utils.py
+index 2477295a..e74e68b4 100644
+--- a/verl/utils/vllm/vllm_fp8_utils.py
++++ b/verl/utils/vllm/vllm_fp8_utils.py
+@@ -108,9 +108,8 @@ def is_fp8_weight(name, model):
+ def is_mxfp8_vllm_ascend(quant_config):
+     try:
+         from vllm_ascend.quantization.modelslim_config import AscendModelSlimConfig
+-        from vllm_ascend.quantization.quant_config import AscendQuantConfig
+ 
+-        if isinstance(quant_config, AscendModelSlimConfig) or isinstance(quant_config, AscendQuantConfig):
++        if isinstance(quant_config, AscendModelSlimConfig):
+             quant_method = quant_config.quant_description.get("quant_method")
+             return quant_method in ["ascend"]
+         return False
+diff --git a/verl/workers/engine/base.py b/verl/workers/engine/base.py
+index ff72de58..b64b6dee 100644
+--- a/verl/workers/engine/base.py
++++ b/verl/workers/engine/base.py
+@@ -256,8 +256,8 @@ class BaseEngineCtx:
+             )
+ 
+     def __enter__(self):
+-        self._context_switch(get_device_name())
+         self.engine.mode = self.mode
++        self._context_switch(get_device_name())
+ 
+     def __exit__(self, exc_type, exc_val, exc_tb):
+         self._context_switch("cpu")
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index 2c66c6a3..a696a00c 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -297,6 +297,28 @@ class FSDPEngine(BaseEngine):
+                 fused_kernels_backend=fused_kernels_backend,
+             )
+ 
++            # R3 (rollout routing replay) for the FSDP path: patch the HF Qwen3.5-MoE
++            # router so training can replay rollout's expert selection. Only when
++            # router_replay is enabled and this is a Qwen3.5-MoE model. DRAFT: needs
++            # GPU validation (see _maybe_set_router_replay).
++            _rr_cfg = getattr(self.engine_config, "router_replay", None)
++            _rr_mode = getattr(_rr_cfg, "mode", "disabled")
++            if _rr_mode != "disabled":
++                from verl.models.transformers.qwen3_5_router_replay import apply_qwen3_5_router_replay_patch
++
++                # Patch whatever Qwen3.5-MoE router gates exist on the module
++                # (returns 0 for non-Qwen3.5 models, harmless). Keying off the
++                # actual router modules rather than a config.model_type string is
++                # robust to multimodal/nested configs (e.g. model_type reported as
++                # 'qwen3_5_moe_text' on the language sub-config).
++                n_gates = apply_qwen3_5_router_replay_patch(module)
++                logger.warning(
++                    "[R3] engine build: patched %d Qwen3.5-MoE router gate(s) (mode=%s, model_type=%s)",
++                    n_gates,
++                    _rr_mode,
++                    getattr(module.config, "model_type", None),
++                )
++
+             # some parameters may not in torch_dtype
+             module.to(torch_dtype)
+ 
+@@ -1267,10 +1289,83 @@ class FSDPEngineWithLMHead(FSDPEngine):
+             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
+         )
+         with autocast_ctx:
+-            raw_output = self.module(
+-                **model_inputs,
+-                use_cache=False,
+-            )  # prevent model thinks we are generating
++            # R3 (rollout routing replay) — DRAFT, NEEDS GPU VALIDATION.
++            # Arm replay for this forward: force the MoE router to rollout's recorded
++            # expert selection (gating weights still recomputed from current logits).
++            # Gated on the upstream `enable_routing_replay` non-tensor flag (set by the
++            # TrainingWorker's _with_routing_replay_flag decorator on actor_* methods,
++            # so ref-policy passes get enabled=False), mirroring the Megatron engine.
++            # routed_experts must be packed in the SAME remove-padding order as
++            # input_ids; if the shapes don't line up we skip + warn rather than
++            # silently corrupt. sp_size==1 only (Ulysses SP pads/slices the sequence
++            # and breaks both the alignment and the GDN layers).
++            _r3_armed = False
++            _rr_enabled = tu.get_non_tensor_data(micro_batch, key="enable_routing_replay", default=False)
++            _routed = micro_batch.get("routed_experts", None)
++            if _rr_enabled and _routed is not None and self.ulysses_sequence_parallel_size == 1:
++                from verl.utils.router_replay import RouterReplay, RouterReplayAction
++
++                if RouterReplay.router_instances:
++                    _rf = (
++                        _routed.values()
++                        if getattr(_routed, "is_nested", False)
++                        else _routed.reshape(-1, _routed.shape[-2], _routed.shape[-1])
++                    )  # (total_nnz, num_layers, topk)
++                    _nnz = model_inputs["input_ids"].shape[-1]
++                    if _rf.shape[0] == _nnz and _rf.shape[1] == len(RouterReplay.router_instances):
++                        # No shift here: harbor's _build_routed_experts stores each
++                        # captured row at the position of the forward that produced
++                        # it (token position - 1), so routed_experts[j] is already
++                        # the routing of position j's forward. The previous
++                        # ``torch.roll(_rf, -1)`` compensated for the old
++                        # token-position placement and would now double-shift; the
++                        # roll was also only exact for 1-sequence micro-batches, a
++                        # limitation the assembly-side placement removes.
++                        RouterReplay.set_replay_data([_rf[:, _l, :] for _l in range(_rf.shape[1])])
++                        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
++                        _r3_armed = True
++                        _ed = getattr(self, "_r3_eng_diag", 0)
++                        if _ed < 2 and os.getenv("R3_DIAG") == "1":  # [R3-ENG] structure probe (set R3_DIAG=1)
++                            self._r3_eng_diag = _ed + 1
++                            _rmask = micro_batch.get("response_mask", None)
++                            _rmsum = int(_rmask.sum()) if _rmask is not None else -1
++                            _nz = int((_rf.reshape(_rf.shape[0], -1) != 0).any(dim=-1).sum())
++                            print(
++                                f"[R3-ENG] is_nested={getattr(_routed, 'is_nested', False)} "
++                                f"rf_shape={tuple(_rf.shape)} nnz={_nnz} layers={_rf.shape[1]} "
++                                f"routers={len(RouterReplay.router_instances)} nonzero_rows={_nz} "
++                                f"response_mask_sum={_rmsum}",
++                                flush=True,
++                            )
++                    else:
++                        logger.warning(
++                            "R3: replay shape mismatch (tokens %d vs %d, layers %d vs %d); skipping replay.",
++                            _rf.shape[0],
++                            _nnz,
++                            _rf.shape[1],
++                            len(RouterReplay.router_instances),
++                        )
++            if _rr_enabled and not _r3_armed:
++                from verl.utils.router_replay import RouterReplay as _RR_DIAG
++
++                logger.warning(
++                    "[R3] forward: replay NOT armed — enabled=%s routed_experts_present=%s sp=%d router_instances=%d",
++                    _rr_enabled,
++                    _routed is not None,
++                    self.ulysses_sequence_parallel_size,
++                    len(_RR_DIAG.router_instances),
++                )
++            try:
++                raw_output = self.module(
++                    **model_inputs,
++                    use_cache=False,
++                )  # prevent model thinks we are generating
++            finally:
++                if _r3_armed:
++                    from verl.utils.router_replay import RouterReplay
++
++                    RouterReplay.clear_global_router_replay_action()
++                    RouterReplay.clear_global_indices()
+ 
+             model_output = self.prepare_model_outputs(
+                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
+diff --git a/verl/workers/engine/mindspeed/transformer_impl.py b/verl/workers/engine/mindspeed/transformer_impl.py
+index b12048c0..ec5b254e 100644
+--- a/verl/workers/engine/mindspeed/transformer_impl.py
++++ b/verl/workers/engine/mindspeed/transformer_impl.py
+@@ -35,6 +35,7 @@ from ..megatron import MegatronEngineWithLMHead, MegatronEngineWithValueHead
+ from .utils import (
+     apply_patch,
+     gpt_model_provider,
++    reset_fp8_reuse_quantized_weight,
+ )
+ 
+ logger = logging.getLogger(__file__)
+@@ -70,6 +71,19 @@ class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
+         _mindspeed_repatch(self.engine_config)
+         super()._init_device_mesh()
+ 
++    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
++        """
++        Move model parameters, optimizer states, or both to the specified device.
++        Note that this function executes irrespective of offload config. It serves as manual control
++
++        Args:
++            device: Target device identifier.
++            model: If True, move the model.
++            optimizer: If True, move the optimizer states.
++        """
++        reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
++        super().to(device=device, model=model, optimizer=optimizer, grad=grad)
++
+ 
+ @EngineRegistry.register(model_type="value_model", backend="megatron", device="npu")
+ class MindspeedEngineWithValueHead(MegatronEngineWithValueHead):
+@@ -137,3 +151,16 @@ class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
+             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
+ 
+         return module
++
++    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
++        """
++        Move model parameters, optimizer states, or both to the specified device.
++        Note that this function executes irrespective of offload config. It serves as manual control
++
++        Args:
++            device: Target device identifier.
++            model: If True, move the model.
++            optimizer: If True, move the optimizer states.
++        """
++        reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
++        super().to(device=device, model=model, optimizer=optimizer, grad=grad)
+diff --git a/verl/workers/engine/mindspeed/utils.py b/verl/workers/engine/mindspeed/utils.py
+index 67a3dd9e..42e949d4 100644
+--- a/verl/workers/engine/mindspeed/utils.py
++++ b/verl/workers/engine/mindspeed/utils.py
+@@ -221,3 +221,20 @@ def gpt_model_provider(pre_process=True, post_process=True):
+     )
+ 
+     return model
++
++
++def reset_fp8_reuse_quantized_weight(engine, device: str, model: bool, optimizer: bool, grad: bool):
++    override_config = getattr(engine.engine_config, "override_transformer_config", None)
++    if override_config and override_config.get("fp8_reuse_quantized_weight", False):
++        from mindspeed.te.pytorch.fp8.reuse import (
++            clear_weight_quantization_reuse_cache,
++            set_weight_release_enabled,
++        )
++
++        # clear quantized weights on NPU
++        clear_weight_quantization_reuse_cache(release_storage=True)
++
++        # enable release high-precision weights only when all modules are in training mode. For ref model,
++        # we need to keep its high-precision weights for offloading. For actor_update model, the high-precision
++        # weights will be released if possible, and then recovered before optimizer step
++        set_weight_release_enabled(getattr(engine, "mode", None) == "train")
+diff --git a/verl/workers/engine/veomni/transformer_impl.py b/verl/workers/engine/veomni/transformer_impl.py
+index f0ea3813..b52829e7 100644
+--- a/verl/workers/engine/veomni/transformer_impl.py
++++ b/verl/workers/engine/veomni/transformer_impl.py
+@@ -972,58 +972,40 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
+             # prompt tokens out and let them go through native routing.
+             replay_mask = None
+             if self._router_replay_mode == "R3":
++                # Per-rmpad-token bool mask in the SAME [total_nnz] layout as
++                # ``routed_experts.values()``: a token participates in replay
++                # iff its routing row is non-zero, i.e. the rollout backend
++                # actually recorded it. The previous construction derived
++                # ``[prompt_lens zeros, response_lens ones]`` from
++                # ``response_mask.sum()`` — that assumes the recorded tokens
++                # form one contiguous tail, which only holds for single-turn
++                # data. Multi-turn agent trajectories interleave generated
++                # tokens with injected tool-result tokens (zero placeholders)
++                # inside the response region, so the length-based boundary
++                # lands mid-sequence: tail placeholders get replayed as
++                # expert 0 while earlier recorded tokens fall back to native
++                # routing (observed as pearson 0.9969 -> 0.8486 on SWE data).
++                # Row-content detection is layout-agnostic and matches the
++                # FSDP-path placeholder semantics exactly.
++                mask_flat = flat.reshape(flat.size(0), -1).ne(0).any(dim=-1)
++                # Consistency probe: response_mask marks the tokens the
++                # rollout backend generated, so its sum should equal the
++                # number of recorded rows. A mismatch means the routing
++                # tensor and the batch disagree (placement/plumbing drift) —
++                # warn loudly but keep the row-content mask, which is the
++                # ground truth of what was actually recorded.
+                 response_mask = micro_batch.get("response_mask", None)
+-                if response_mask is None:
+-                    raise RuntimeError(
+-                        "router_replay R3: micro_batch missing 'response_mask'. "
+-                        "R3 needs the response_mask to know which tokens have "
+-                        "real recorded routing (response) vs. zero placeholders "
+-                        "(prompt). Verify left_right_2_no_padding preserved it."
+-                    )
+-                # Build a per-rmpad-token bool mask in the SAME [total_nnz]
+-                # layout as ``input_ids.values()`` (also matches
+-                # ``routed_experts.values()`` since they share the same
+-                # ``index_first_axis(unpad_input(input_ids).indices)``
+-                # transform): per sample i, ``prompt_lens[i]`` zeros
+-                # followed by ``response_lens[i]`` ones.
+-                #
+-                # We CANNOT use ``micro_batch['loss_mask']`` directly —
+-                # after ``left_right_2_no_padding`` it's still a strided
+-                # ``(bs, max_response_len)`` tensor (not nested), which
+-                # neither has the right shape nor a valid ``.values()``
+-                # for a strided layout.
+-                total_lens = input_ids.offsets().diff()  # (bs,)
+-                response_lens = response_mask.sum(dim=-1).to(total_lens.dtype)  # (bs,)
+-                prompt_lens = total_lens - response_lens  # (bs,)
+-                # Defensive: response_lens > total_lens means the
+-                # response_mask describes more tokens than the input has,
+-                # which is data corruption. Failing here surfaces a clear
+-                # message instead of letting repeat_interleave silently
+-                # produce a malformed mask.
+-                if torch.any(prompt_lens < 0):
+-                    raise RuntimeError(
+-                        f"router_replay R3: response_mask sum exceeds total token "
+-                        f"count for some samples — prompt_lens={prompt_lens.tolist()}. "
+-                        "Likely cause: response_mask was not aligned with the "
+-                        "input_ids the actor sees (rollout/trainer plumbing bug)."
+-                    )
+-                bs = total_lens.size(0)
+-                # values=[0, 1, 0, 1, ...] (length 2*bs), counts=[p_0, r_0, p_1, r_1, ...]
+-                values = torch.tensor([False, True], dtype=torch.bool, device=total_lens.device).repeat(bs)
+-                counts = torch.stack([prompt_lens, response_lens], dim=1).flatten()
+-                mask_flat = torch.repeat_interleave(values, counts)
+-                # Defensive: the constructed mask must align with
+-                # routed_experts at the rmpad layer, otherwise the
+-                # downstream ``torch.where(mask, target, native)`` would
+-                # silently misalign and the EP all-to-all would still
+-                # blow up. Fail-fast here with a clearer message.
+-                if mask_flat.numel() != flat.size(0):
+-                    raise RuntimeError(
+-                        f"router_replay R3: constructed replay_mask has "
+-                        f"{mask_flat.numel()} entries but routed_experts.values() "
+-                        f"has {flat.size(0)}. response_mask + input_ids.offsets() "
+-                        "do not describe the same total token count."
+-                    )
++                if response_mask is not None:
++                    _n_recorded = int(mask_flat.sum())
++                    _n_response = int(response_mask.sum())
++                    if _n_recorded != _n_response:
++                        logger.warning(
++                            "router_replay R3: recorded routing rows (%d) != response_mask sum (%d); "
++                            "replaying the %d recorded rows only.",
++                            _n_recorded,
++                            _n_response,
++                            _n_recorded,
++                        )
+                 # Mirror the same pad+slice rule used for routed_experts.
+                 replay_mask = rr.slice_microbatch_replay_mask(mask_flat)
+ 
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index bf379b49..96d35a6d 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -471,14 +471,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         else:
+             tool_config = None
+ 
+-        # Router replay is supported on the megatron engine and on the veomni
+-        # engine. Both expose `router_replay` on their per-strategy engine
+-        # config (the field lives on the shared `EngineConfig` base).
++        # Router replay is supported on the megatron, veomni and fsdp engines.
++        # Each exposes `router_replay` on its per-strategy engine config (the
++        # field lives on the shared `EngineConfig` base). The fsdp engine config
++        # is mounted at `actor.fsdp_config` (see config/actor/dp_actor.yaml).
+         actor_strategy = self.config.actor.strategy
+         if actor_strategy == "megatron":
+             rr_mode = self.config.actor.megatron.router_replay.mode
+         elif actor_strategy == "veomni":
+             rr_mode = self.config.actor.veomni.router_replay.mode
++        elif actor_strategy in ("fsdp", "fsdp2"):
++            rr_mode = self.config.actor.fsdp_config.router_replay.mode
+         else:
+             rr_mode = "disabled"
+         self.enable_routing_replay = rr_mode != "disabled"
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index 415a4e17..d1a55b0b 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -176,6 +176,40 @@ class LLMServerClient:
+         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
+         self._load_balancer.release_server.remote(server_id=server_id)
+ 
++    async def kv_cache_usage_probe(self, request_id: str) -> dict[str, Any]:
++        """Return KV cache usage from the sticky server for ``request_id``.
++
++        Backends that do not implement the probe return an empty dict so callers
++        can gracefully fall back to normal scheduling.
++        """
++        server_id, server = await self._acquire_server(request_id)
++        try:
++            try:
++                return await server.kv_cache_usage_probe.remote()
++            except Exception as exc:
++                logger.debug(
++                    "kv_cache_usage_probe failed on server=%s request_id=%s: %s",
++                    server_id, request_id, exc,
++                )
++                return {}
++        finally:
++            self._release_server(server_id)
++
++    async def prefix_cache_probe(self, request_id: str, *, prompt_ids: list[int]) -> dict[str, Any]:
++        """Probe prefix-cache residency on the sticky server for ``request_id``."""
++        server_id, server = await self._acquire_server(request_id)
++        try:
++            try:
++                return await server.prefix_cache_probe.remote(prompt_ids=prompt_ids)
++            except Exception as exc:
++                logger.debug(
++                    "prefix_cache_probe failed on server=%s request_id=%s: %s",
++                    server_id, request_id, exc,
++                )
++                return {}
++        finally:
++            self._release_server(server_id)
++
+     @rollout_trace_op
+     async def generate(
+         self,
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 95a9391f..23463a50 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -21,6 +21,7 @@ import threading
+ from types import MethodType
+ from typing import Any, Literal, Optional, get_args
+ 
++import numpy as np
+ import torch
+ from vllm.outputs import RequestOutput
+ 
+@@ -391,5 +392,5 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
+     prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
+     prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
+ 
+-    result_dict["prompt_ids"] = prompt_ids_ls
+-    result_dict["prompt_logprobs"] = prompt_logprobs_ls
++    result_dict["prompt_ids"] = np.array(prompt_ids_ls, dtype=np.int32)
++    result_dict["prompt_logprobs"] = np.array(prompt_logprobs_ls, dtype=np.float32)
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index d4194e1c..d39cbc42 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -601,6 +601,22 @@ class vLLMHttpServer:
+             extra_fields=extra_fields,
+         )
+ 
++    async def kv_cache_usage_probe(self) -> dict[str, Any]:
++        if self.node_rank != 0:
++            return {}
++        if not hasattr(self.engine, "kv_cache_usage_probe"):
++            return {}
++        return await self.engine.kv_cache_usage_probe()
++
++    async def prefix_cache_probe(self, prompt_ids: list[int]) -> dict[str, Any]:
++        if self.node_rank != 0:
++            return {}
++        if not hasattr(self.engine, "prefix_cache_probe"):
++            return {}
++        prompt_ids = normalize_token_ids(prompt_ids)
++        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
++        return await self.engine.prefix_cache_probe(prompt_ids)
++
+     async def wake_up(self, tags: list[str] | None = None):
+         if self.node_rank != 0:
+             return
+@@ -1011,7 +1027,13 @@ class vLLMReplica(RolloutReplica):
+                 # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
+                 # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+                 "NCCL_CUMEM_ENABLE": "0",
++                "VLLM_ASCEND_AUTO_DETECT_QUANTIZATION": "0",
+             }
++            if os.environ.get("VLLM_ASCEND_TASK_QUEUE_ENABLE", None):
++                # use VLLM_ASCEND_TASK_QUEUE_ENABLE to support different TASK_QUEUE_ENABLE mode for
++                # train and rollout on Ascend NPU
++                env_vars["TASK_QUEUE_ENABLE"] = os.environ["VLLM_ASCEND_TASK_QUEUE_ENABLE"]
++
+             server = self.server_class.options(
+                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                     node_id=node_id,
