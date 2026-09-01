@@ -22,15 +22,12 @@ cleanup_ray_and_shm() {
 }
 
 resolve_ray_addresses() {
-    # Ray's head name is supplied by the scheduler and resolves to the pod's
-    # eth0 address.  `hostname -I` does not guarantee interface order (on DLC it
-    # returns net0 before eth0), so selecting its first address can make every
-    # node look like a worker.  Resolve the local address from the same
-    # interface explicitly and force the scheduler name through IPv4 DNS.
-    IP_LOCAL=$(ip -4 -o addr show dev eth0 scope global 2>/dev/null \
+    # Use the same interface as NCCL/GLOO/TP. `hostname -I` does not guarantee
+    # interface order, so resolve the local Ray address explicitly.
+    IP_LOCAL=$(ip -4 -o addr show dev "$TRAIN_NETWORK_INTERFACE" scope global 2>/dev/null \
         | awk 'NR == 1 {sub(/\/.*/, "", $4); print $4}')
     [ -n "$IP_LOCAL" ] || {
-        echo "[FATAL] could not determine an IPv4 address for eth0; Ray requires the scheduler network interface." >&2
+        echo "[FATAL] could not determine an IPv4 address for TRAIN_NETWORK_INTERFACE=${TRAIN_NETWORK_INTERFACE}." >&2
         exit 1
     }
     : "${MASTER_ADDR:=$IP_LOCAL}"
@@ -38,8 +35,13 @@ resolve_ray_addresses() {
     if [ -z "$IP_HEAD" ]; then
         IP_HEAD="$MASTER_ADDR"
     fi
-    export IP_LOCAL MASTER_ADDR IP_HEAD
-    echo "HEAD=$IP_HEAD  MASTER_ADDR=$MASTER_ADDR  LOCAL=$IP_LOCAL  NNODES=$NNODES"
+    RAY_NODE_ROLE=worker
+    if ip -4 -o addr show scope global 2>/dev/null \
+        | awk -v head="$IP_HEAD" '{sub(/\/.*/, "", $4); if ($4 == head) found=1} END {exit !found}'; then
+        RAY_NODE_ROLE=head
+    fi
+    export IP_LOCAL MASTER_ADDR IP_HEAD RAY_NODE_ROLE
+    echo "HEAD=$IP_HEAD  MASTER_ADDR=$MASTER_ADDR  LOCAL=$IP_LOCAL  IFACE=$TRAIN_NETWORK_INTERFACE  ROLE=$RAY_NODE_ROLE  NNODES=$NNODES"
 }
 
 stop_ray_head_on_exit() {
@@ -96,9 +98,9 @@ wait_for_ray_head_shutdown() {
 }
 
 start_ray_node() {
-    if [ "$IP_LOCAL" = "$IP_HEAD" ]; then
+    if [ "$RAY_NODE_ROLE" = head ]; then
         echo "[HEAD] starting ray head"
-        ray start --head --node-ip-address="$IP_HEAD" --port="$RAY_PORT" \
+        ray start --head --node-ip-address="$IP_LOCAL" --port="$RAY_PORT" \
             --object-store-memory="$RAY_OBJECT_STORE_MEMORY" \
             --num-gpus="$NGPUS_PER_NODE" --disable-usage-stats --dashboard-host=0.0.0.0
         trap 'stop_ray_head_on_exit "$?"' EXIT
@@ -109,7 +111,7 @@ start_ray_node() {
                 >/dev/null 2>&1 && break
             sleep 2
         done
-        ray start --address="$IP_HEAD:$RAY_PORT" \
+        ray start --address="$IP_HEAD:$RAY_PORT" --node-ip-address="$IP_LOCAL" \
             --object-store-memory="$RAY_OBJECT_STORE_MEMORY" \
             --num-gpus="$NGPUS_PER_NODE" --disable-usage-stats
     fi
@@ -118,7 +120,7 @@ start_ray_node() {
 wait_for_ray_cluster_or_exit_worker() {
     local up old_gpid
 
-    if [ "$IP_LOCAL" = "$IP_HEAD" ]; then
+    if [ "$RAY_NODE_ROLE" = head ]; then
         up=0
         for _ in $(seq 1 60); do
             up=$(ray status 2>/dev/null | grep -c "node_" || true)

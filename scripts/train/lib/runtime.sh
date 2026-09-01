@@ -82,7 +82,7 @@ validate_runtime_config() {
         VERL_ENTRY_MODULE VERL_CONFIG_NAME TRAINING_MODE MODEL_ENGINE
         MODEL_PATH TRAIN_FILES VAL_FILES VENV_PATH HARBOR_LOG_DIR
         NNODES NGPUS_PER_NODE RAY_PORT RAY_DASHBOARD_PORT RAY_OBJECT_STORE_MEMORY
-        SERVED_MODEL_NAME TOOL_CALL_PARSER
+        SERVED_MODEL_NAME TOOL_CALL_PARSER TRAIN_NETWORK_INTERFACE
     )
 
     for name in "${required_vars[@]}"; do
@@ -240,6 +240,7 @@ print_run_configuration() {
     kv config     "$CONFIG_PATH"
     kv experiment "project=$project_name  exp=$exp_name"
     kv axes       "mode=$TRAINING_MODE engine=$MODEL_ENGINE scaffold=${SCAFFOLD:-?} backend=${BACKEND:-?}"
+    kv network    "interface=$TRAIN_NETWORK_INTERFACE  ray/nccl/gloo/tp"
     kv model      "${MODEL_PATH:-?}  [$moe]"
     kv ""         "served=${SERVED_MODEL_NAME:-?}  tool_parser=${TOOL_CALL_PARSER:-?}"
     kv data       "train=${TRAIN_FILES:-?}"
