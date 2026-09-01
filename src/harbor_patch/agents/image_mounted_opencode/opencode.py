@@ -1,5 +1,4 @@
-"""harbor_patch image-mounted OpenCode — exposes chat history to verl via
-the LiteLLM proxy trajectory log.
+"""Image-mounted OpenCode runtime for Harbor.
 
 Naming mirrors ``image_mounted_claude_code``: the dominant configuration mounts
 a pre-built opencode runtime image at ``/opt/custom-agent-runtime/opencode``.
@@ -7,22 +6,19 @@ The parent ``CustomOpenCode`` auto-detects the mount and falls back to an
 in-container ``npm install``-based path when no image is mounted, so this
 single class covers both modes.
 
-Architecture (matches the CC pattern in this repo):
+Current training traffic goes directly to Lego-RL's in-process proxy:
 
     opencode (in pod, hosted_vllm provider via @ai-sdk/openai-compatible)
       -- OpenAI Chat Completions -->
-        LiteLLM proxy + trajectory_logger callback
-          -- writes one JSON line per LLM call to logs_dir/litellm-trajectory.jsonl
-          -- forwards as openai/{served} to vLLM
+        /sess/{id}/v1/chat/completions
+          -- shared generation core --> server_manager.generate(...)
 
-Upstream ``CustomOpenCode`` already injects ``x-trajectory-output-path`` into
-the provider's ``options.headers`` (see ``_inject_litellm_debug_headers``),
-but does not populate ``context.metadata["all_messages"]`` itself — verl's
-``BuiltinCCAgentLoop`` would otherwise see an empty trial. We subclass
+Upstream ``CustomOpenCode`` does not populate
+``context.metadata["all_messages"]`` itself. Legacy transcript consumers
+would otherwise see an empty trial. We subclass
 ``CustomOpenCode`` and override ``populate_context_post_run`` to read the
-JSONL and assemble the final OpenAI-format chat history. The last successful
-record's ``request_body.messages`` is the full prompt the LLM saw on the last
-turn; we append the corresponding assistant response to produce the trajectory.
+legacy JSONL when present. The maintained loop trains only from proxy-captured
+token ids, masks, log probabilities, and routing metadata.
 """
 
 import asyncio

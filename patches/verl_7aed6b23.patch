@@ -301,15 +301,21 @@ index 268f8d5f..d2e7779b 100644
  
      generate_sequences: float = 0.0
      tool_calls: float = 0.0
-@@ -552,6 +560,7 @@ class AgentLoopWorker:
+@@ -552,6 +560,13 @@ class AgentLoopWorker:
              sample_sampling_params = dict(sampling_params)
              if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                  apply_greedy_sampling_params(sample_sampling_params)
 +            kwargs["global_steps"] = batch.meta_info.get("global_steps", 0)
++            # Concrete loops may use this stable identity for deterministic
++            # per-trajectory decisions (for example mixed-harness selection).
++            # It is derived before concurrent scheduling and must not be
++            # inferred from worker-local execution order.
++            kwargs["trajectory_info"] = dict(trajectory_info[i])
++            kwargs["rollout_n"] = trajectory_info[i]["rollout_n"]
              tasks.append(
                  asyncio.create_task(
                      self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-@@ -1108,13 +1117,28 @@ class AgentLoopManager:
+@@ -1108,13 +1123,28 @@ class AgentLoopManager:
          Returns:
              DataProto: Output batch.
          """
@@ -345,7 +351,7 @@ index 268f8d5f..d2e7779b 100644
          output = DataProto.concat(outputs)
  
          # calculate performance metrics
-@@ -1156,4 +1180,25 @@ class AgentLoopManager:
+@@ -1156,4 +1186,25 @@ class AgentLoopManager:
              timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
              timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
  

@@ -61,7 +61,7 @@ Only these four require a different template. Everything else is a parameter.
 | --- | --- | --- |
 | `TRAIN_MODE` | `async` \| `sync` | `fully_async_main` + `fully_async_fsdp.yaml` (split train/rollout pools) vs `main_ppo` + `sync.yaml` (one colocated pool) |
 | `ENGINE` | `veomni` \| `fsdp` | `model_engine=veomni` + `veomni.*` (required for hybrid-GDN models) vs `strategy=fsdp2` + `fsdp_config.*`. Follows the model — see the table below |
-| `SCAFFOLD` | `ohsdk` \| `oh` \| `cc` \| `oc` | agent class + runtime image + agent-loop config. `ohsdk` is primary; `cc` = Claude Code; `oc` = OpenCode |
+| `SCAFFOLD` | `ohsdk` \| `oh` \| `cc` \| `oc` \| `mixed` | agent class + runtime image + agent-loop config. `mixed` resolves one complete harness definition per sample. |
 | `BACKEND` | `k8s` \| `docker` | sandbox backend — see [Backends](/docs/run-training/backends) |
 
 Node counts (`NNODES`, `N_NODES_TRAIN`, `N_NODES_ROLLOUT`) are parameters, not axes:
@@ -118,7 +118,7 @@ MODEL_PATH=/models/my-model    # switch policy model — also revisit
 TOOL_PARSER=qwen3_coder        # the values that travel with it
 SP_SIZE=1
 
-SCAFFOLD=cc                    # ohsdk | oh | cc | oc
+SCAFFOLD=cc                    # ohsdk | oh | cc | oc | mixed
 TRAIN_MODE=async               # sync ↔ async — also copy the matching template (entrypoint + YAML change)
 BACKEND=docker                 # Docker sandboxes — see /docs/run-training/backends
 

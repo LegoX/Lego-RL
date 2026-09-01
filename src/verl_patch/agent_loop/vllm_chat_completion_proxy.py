@@ -1,10 +1,11 @@
 """
 In-process vLLM Chat Completions proxy for Harbor.
 
-This module hosts the aiohttp server that mimics the OpenAI
-`/v1/chat/completions` + `/v1/models` endpoints. Harbor (via LiteLLM) sends HTTP
-requests to this proxy; the proxy tokenizes messages using the same
-`apply_chat_template` path as verl agent loops and forwards the request to
+This module hosts OpenAI ``/v1/chat/completions`` / ``/v1/models`` and
+Anthropic ``/v1/messages`` surfaces. Harnesses send HTTP requests directly to
+their per-session route; the proxy normalizes both protocols, tokenizes through
+the same ``apply_chat_template`` path, and forwards generation to verl's
+server manager while retaining exact token-level trajectory metadata.
 
 Kept as a standalone module to avoid bloating `builtin_swe_agent_loop.py`.
 """
@@ -685,7 +686,7 @@ def _turn_routing_per_token(routed_experts: Any, n_tokens: int) -> list:
     per-token list aligned 1:1 with the turn's output token ids -- each element a
     ``[num_layers, topk]`` list, or ``None`` when routing is unavailable (R3 off /
     non-MoE). Kept as plain Python lists to mirror ``traj_response_logprobs``;
-    assembled into a tensor only in ``BuiltinCCAgentLoop._make_output``.
+    assembled into a tensor only in ``BuiltinSWEAgentLoop.run``.
     """
     if routed_experts is None or n_tokens <= 0:
         return [None] * max(0, n_tokens)

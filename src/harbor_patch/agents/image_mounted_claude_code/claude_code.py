@@ -1,5 +1,4 @@
-"""harbor_patch image-mounted ClaudeCode — exposes chat history to verl via
-the LiteLLM proxy trajectory log.
+"""Image-mounted Claude Code runtime for Harbor.
 
 Naming mirrors ``image_mounted_openhands_ai``: the dominant configuration
 mounts a pre-built claude-code runtime image at
@@ -7,22 +6,15 @@ mounts a pre-built claude-code runtime image at
 auto-detects the mount and falls back to an in-container ``npm install`` when
 no image is mounted, so this single class covers both modes.
 
-Architecture (matches OpenHands SDK pattern in this repo):
+Training traffic is routed directly to Lego-RL's in-process proxy:
 
     claude-code (in pod)
-      -- Anthropic format -->
-        LiteLLM proxy + trajectory_logger callback
-          -- writes one JSON line per LLM call to logs_dir/litellm-trajectory.jsonl
-          -- forwards as OpenAI to vLLM
+      -- Anthropic Messages --> /sess/{id}/v1/messages
+        -- shared generation core --> server_manager.generate(...)
 
-The upstream ClaudeCode does not populate ``context.metadata["all_messages"]``,
-so the verl ``BuiltinSWEAgentLoop`` sees an empty trial. We subclass
-``CustomClaudeCode`` (which already wires the ``x-trajectory-output-path``
-header and supports the mounted runtime image) and override
-``populate_context_post_run`` to read that JSONL and assemble the final
-OpenAI-format chat history. The last record's ``request_body.messages`` is
-the full prompt the LLM saw on the last turn; we append the corresponding
-assistant response to that to produce the trajectory.
+The loop's source of truth is the proxy-captured token trajectory. The legacy
+``populate_context_post_run`` fallback below remains useful for old external
+LiteLLM deployments, but current Lego-RL training does not re-tokenize it.
 """
 
 import json

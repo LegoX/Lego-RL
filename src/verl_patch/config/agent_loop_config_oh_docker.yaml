@@ -6,15 +6,18 @@
 # RemoteDockerEnvironment.__init__ accepts — no kubeconfig/namespace/pod_* like k8s).
 - name: builtin_swe_agent
   _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
+  # Shared worker controls live at the loop level, not inside Harbor's
+  # per-harness TrialConfig.
+  tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+  max_consecutive_no_tool: ${oc.decode:${oc.env:HARBOR_MAX_CONSECUTIVE_NO_TOOL,3}}
+  trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+  max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
   harbor_cfg:
     agent:
       name: ${oc.decode:${oc.env:HARBOR_AGENT_NAME,null}}
       model_name: hosted_vllm/vllm_model
-      tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
       import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_openhands_ai.openhands:OpenHands}
       max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,null}}
-      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
-      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
       kwargs:
         max_iterations: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
         version: ${oc.env:HARBOR_AGENT_VERSION,0.50.0}
@@ -43,4 +46,3 @@
     agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
     agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
     verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
-    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
