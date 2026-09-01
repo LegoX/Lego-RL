@@ -251,6 +251,10 @@ async def test_retry_keeps_selected_harness_and_anthropic_base(tmp_path, monkeyp
         not cfg["agent"]["env"]["ANTHROPIC_BASE_URL"].endswith("/v1")
         for cfg in FakeTrial.configs
     )
+    assert all(
+        cfg["agent"]["extra_allowed_hosts"] == ["proxy"]
+        for cfg in FakeTrial.configs
+    )
     assert len({cfg["trial_name"] for cfg in FakeTrial.configs}) == 2
     assert all(cfg["trial_name"].startswith("cc-") for cfg in FakeTrial.configs)
     assert proxy.popped == [session_id for session_id, _ in proxy.opened]
@@ -281,5 +285,6 @@ async def test_openai_trial_uses_chat_completions_base(tmp_path, monkeypatch):
 
     cfg = FakeTrial.configs[0]
     assert cfg["agent"]["env"]["LLM_BASE_URL"].endswith("/v1")
+    assert cfg["agent"]["extra_allowed_hosts"] == ["proxy"]
     assert "ANTHROPIC_BASE_URL" not in cfg["agent"]["env"]
     assert cfg["trial_name"].startswith("ohsdk-")

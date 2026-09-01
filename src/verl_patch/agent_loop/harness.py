@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -374,6 +375,20 @@ def inject_harness_endpoint(
     """Inject the selected session endpoint into a copied Harbor config."""
 
     agent_cfg = harbor_cfg.setdefault("agent", {})
+    endpoint_base = (
+        anthropic_base if definition.protocol == "anthropic" else openai_base
+    )
+    endpoint_host = urlsplit(endpoint_base).hostname
+    if not endpoint_host:
+        raise ValueError(f"Harness endpoint has no hostname: {endpoint_base!r}")
+    # Agent pods switch to an egress allowlist before inference, so preserve
+    # access to the exact per-worker proxy host without opening its whole subnet.
+    extra_allowed_hosts = agent_cfg.setdefault("extra_allowed_hosts", [])
+    if not isinstance(extra_allowed_hosts, list):
+        raise ValueError("agent.extra_allowed_hosts must be a list")
+    if endpoint_host not in extra_allowed_hosts:
+        extra_allowed_hosts.append(endpoint_host)
+
     agent_cfg.setdefault("kwargs", {})["api_base"] = openai_base
     agent_env = agent_cfg.setdefault("env", {})
 

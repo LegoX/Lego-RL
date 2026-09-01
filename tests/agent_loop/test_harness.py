@@ -172,6 +172,7 @@ def test_endpoint_injection_preserves_protocol_paths(definitions):
     )
     assert openai_cfg["agent"]["kwargs"]["api_base"].endswith("/v1")
     assert openai_cfg["agent"]["env"]["LLM_BASE_URL"].endswith("/v1")
+    assert openai_cfg["agent"]["extra_allowed_hosts"] == ["proxy"]
     assert "ANTHROPIC_BASE_URL" not in openai_cfg["agent"]["env"]
 
     anthropic_cfg = deepcopy(definitions["claude_code"].harbor_cfg)
@@ -184,7 +185,28 @@ def test_endpoint_injection_preserves_protocol_paths(definitions):
         anthropic_api_key="anthropic-key",
     )
     assert anthropic_cfg["agent"]["env"]["ANTHROPIC_BASE_URL"] == "http://proxy/sess/b"
+    assert anthropic_cfg["agent"]["extra_allowed_hosts"] == ["proxy"]
     assert not anthropic_cfg["agent"]["env"]["ANTHROPIC_BASE_URL"].endswith("/v1")
+
+
+def test_endpoint_host_is_added_to_existing_allowlist_once(definitions):
+    cfg = deepcopy(definitions["openhands_sdk"].harbor_cfg)
+    cfg["agent"]["extra_allowed_hosts"] = ["registry.internal"]
+
+    for _ in range(2):
+        inject_harness_endpoint(
+            cfg,
+            definitions["openhands_sdk"],
+            openai_base="http://22.54.171.134:41797/sess/a/v1",
+            anthropic_base="http://22.54.171.134:41797/sess/a",
+            openai_api_key="openai-key",
+            anthropic_api_key="anthropic-key",
+        )
+
+    assert cfg["agent"]["extra_allowed_hosts"] == [
+        "registry.internal",
+        "22.54.171.134",
+    ]
 
 
 def test_opencode_gets_compatible_provider_endpoint():
