@@ -22,14 +22,77 @@ cleanup_ray_and_shm() {
 }
 
 resolve_ray_addresses() {
-    IP_LOCAL=$(hostname -I | awk '{print $1}')
+    # Ray's head name is supplied by the scheduler and resolves to the pod's
+    # eth0 address.  `hostname -I` does not guarantee interface order (on DLC it
+    # returns net0 before eth0), so selecting its first address can make every
+    # node look like a worker.  Resolve the local address from the same
+    # interface explicitly and force the scheduler name through IPv4 DNS.
+    IP_LOCAL=$(ip -4 -o addr show dev eth0 scope global 2>/dev/null \
+        | awk 'NR == 1 {sub(/\/.*/, "", $4); print $4}')
+    [ -n "$IP_LOCAL" ] || {
+        echo "[FATAL] could not determine an IPv4 address for eth0; Ray requires the scheduler network interface." >&2
+        exit 1
+    }
     : "${MASTER_ADDR:=$IP_LOCAL}"
-    IP_HEAD=$(getent hosts "$MASTER_ADDR" 2>/dev/null | awk '{print $1; exit}' || true)
+    IP_HEAD=$(getent ahostsv4 "$MASTER_ADDR" 2>/dev/null | awk 'NR == 1 {print $1; exit}' || true)
     if [ -z "$IP_HEAD" ]; then
         IP_HEAD="$MASTER_ADDR"
     fi
     export IP_LOCAL MASTER_ADDR IP_HEAD
     echo "HEAD=$IP_HEAD  MASTER_ADDR=$MASTER_ADDR  LOCAL=$IP_LOCAL  NNODES=$NNODES"
+}
+
+stop_ray_head_on_exit() {
+    local exit_status="$1"
+
+    # Prevent recursion because this function exits with the trainer's original
+    # status after stopping the head runtime.
+    trap - EXIT
+    echo "[HEAD] runner exiting; stopping Ray so worker launchers can finish."
+    ray stop --force --grace-period=5 || true
+    exit "$exit_status"
+}
+
+ray_head_is_reachable() {
+    "$PYTHON_BIN" - "$IP_HEAD" "$RAY_PORT" <<'PY'
+import socket
+import sys
+
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2):
+    pass
+PY
+}
+
+cleanup_worker_on_exit() {
+    local exit_status="$1"
+
+    trap - EXIT
+    if [ -n "${GPU_WANDB_PID:-}" ]; then
+        kill "$GPU_WANDB_PID" 2>/dev/null || true
+        wait "$GPU_WANDB_PID" 2>/dev/null || true
+    fi
+    if [ -n "${GPU_WANDB_PID_FILE:-}" ]; then
+        rm -f "$GPU_WANDB_PID_FILE"
+    fi
+    ray stop --force --grace-period=5 || true
+    exit "$exit_status"
+}
+
+wait_for_ray_head_shutdown() {
+    local failed_probes=0
+    local max_failed_probes=6
+
+    echo "[WORKER] joined; keeping this launcher alive until the Ray head stops."
+    while [ "$failed_probes" -lt "$max_failed_probes" ]; do
+        if ray_head_is_reachable >/dev/null 2>&1; then
+            failed_probes=0
+        else
+            failed_probes=$((failed_probes + 1))
+            echo "[WORKER] head probe failed (${failed_probes}/${max_failed_probes}): ${IP_HEAD}:${RAY_PORT}"
+        fi
+        [ "$failed_probes" -ge "$max_failed_probes" ] || sleep 10
+    done
+    echo "[WORKER] Ray head is no longer reachable; stopping the local runtime."
 }
 
 start_ray_node() {
@@ -38,6 +101,7 @@ start_ray_node() {
         ray start --head --node-ip-address="$IP_HEAD" --port="$RAY_PORT" \
             --object-store-memory="$RAY_OBJECT_STORE_MEMORY" \
             --num-gpus="$NGPUS_PER_NODE" --disable-usage-stats --dashboard-host=0.0.0.0
+        trap 'stop_ray_head_on_exit "$?"' EXIT
     else
         echo "[WORKER] waiting for head $IP_HEAD:$RAY_PORT"
         for _ in $(seq 1 30); do
@@ -66,7 +130,6 @@ wait_for_ray_cluster_or_exit_worker() {
             echo "[FATAL] every node must run this script with MASTER_ADDR=${IP_HEAD};" >&2
             echo "[FATAL] check that missing nodes can reach ${IP_HEAD}:${RAY_PORT}." >&2
             ray status || true
-            ray stop --force || true
             exit 1
         fi
         ray status || true
@@ -97,9 +160,14 @@ while True:
 ' > "$GPU_WANDB_LOG" 2>&1 &
     GPU_WANDB_PID=$!
     echo "$GPU_WANDB_PID" > "$GPU_WANDB_PID_FILE"
-    disown "$GPU_WANDB_PID" 2>/dev/null || true
     echo "[GPU wandb] PID=${GPU_WANDB_PID} -> ${GPU_WANDB_LOG}"
-    echo "[WORKER] joined; head drives training. exiting worker script."
+
+    # Ray daemonizes its worker processes.  On managed training platforms the
+    # shell is the pod's main process, so exiting here tears the pod down and
+    # silently removes this node's GPUs from the cluster.  Keep the launcher in
+    # the foreground until the head runner closes the GCS port.
+    trap 'cleanup_worker_on_exit "$?"' EXIT
+    wait_for_ray_head_shutdown
     exit 0
 }
 
