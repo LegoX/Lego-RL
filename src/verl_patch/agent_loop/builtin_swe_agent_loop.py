@@ -313,6 +313,10 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         """
         # Extract task data from kwargs
         raw_prompt = kwargs.get("raw_prompt", [])
+        # True during validation rollouts.  Mixed validation intentionally
+        # resolves one configured harness for every sample so metrics are
+        # comparable across validation steps.
+        is_val = bool(kwargs.get("validate", False))
         try:
             extra_info = normalize_sample_mapping(
                 kwargs.get("extra_info", {}), field="extra_info"
@@ -321,7 +325,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             logger.error("Invalid extra_info: %s", exc)
             try:
                 fallback_selection = self.harness_resolver.resolve(
-                    {key: value for key, value in kwargs.items() if key != "extra_info"}
+                    {key: value for key, value in kwargs.items() if key != "extra_info"},
+                    is_val=is_val,
                 )
             except ValueError:
                 fallback_selection = None
@@ -333,7 +338,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             )
 
         try:
-            harness_selection = self.harness_resolver.resolve(kwargs)
+            harness_selection = self.harness_resolver.resolve(kwargs, is_val=is_val)
         except ValueError as exc:
             # Unknown explicit metadata is a sample configuration error.  Do
             # not silently change the requested training distribution.
@@ -361,8 +366,6 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
 
         # Get global step for trial directory organization
         global_steps = kwargs.get("global_steps", 0)
-        # True during validation rollouts; selects the val-specific retry/timeout knobs.
-        is_val = bool(kwargs.get("validate", False))
 
         # Timing metrics - pre-populate with harbor phase keys so aggregation is
         # stable across samples even when a trial ends early (e.g. empty output
@@ -628,7 +631,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         if harness_selection is None:
             # ``run`` always passes its already-resolved selection. This
             # fallback keeps direct helper callers backward compatible.
-            harness_selection = self.harness_resolver.resolve({})
+            harness_selection = self.harness_resolver.resolve({}, is_val=is_val)
         definition = harness_selection.definition
 
         cfg = deepcopy(definition.harbor_cfg)

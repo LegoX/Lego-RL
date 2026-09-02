@@ -92,6 +92,10 @@ defaults to equal-weight `weighted_random`; set
 Task-level selection is deterministic, while trajectory-level selection draws
 independently because fully-async worker shards do not carry a reliable sibling
 rollout ID.
+Validation is separate from training selection: mixed runs use
+`HARBOR_VAL_HARNESS` (default `openhands_sdk`) for every validation sample, so
+validation metrics stay comparable across steps. Explicit validation metadata is
+still checked and unknown harness names fail that trajectory.
 Unknown explicit names fail that trajectory instead of silently changing its
 harness. Selection defaults to task granularity, so sibling GRPO rollouts use
 the same harness.

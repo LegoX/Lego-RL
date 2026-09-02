@@ -22,7 +22,9 @@ from urllib.parse import urlsplit
 import numpy as np
 
 HarnessProtocol = Literal["openai", "anthropic"]
-HarnessSelectionSource = Literal["metadata", "weighted_random", "default"]
+HarnessSelectionSource = Literal[
+    "metadata", "weighted_random", "default", "validation"
+]
 
 
 _KNOWN_HARBOR_AGENT_NAMES = {
@@ -233,6 +235,34 @@ class HarnessResolver:
                 f"configured harnesses: {sorted(self.definitions)}"
             )
 
+        # Validation in a mixed run should use one stable harness for every
+        # validation sample.  ``val_harness`` is intentionally separate from
+        # the training fallback policy: training may select per-task or
+        # per-trajectory, while validation is a comparable fixed benchmark.
+        # Keep the OpenHands SDK as the mixed-harness default. Configurations
+        # without that harness must set ``val_harness`` explicitly if they also
+        # require fixed validation selection.
+        self.validation_harness = policy.get("val_harness")
+        if self.validation_harness is None:
+            self.validation_harness = policy.get("validation_harness")
+        if self.validation_harness is None and "openhands_sdk" in self.definitions:
+            self.validation_harness = "openhands_sdk"
+        if self.validation_harness is not None:
+            if (
+                not isinstance(self.validation_harness, str)
+                or not self.validation_harness.strip()
+            ):
+                raise ValueError(
+                    "harness_selection.val_harness must be a non-empty string"
+                )
+            self.validation_harness = self.validation_harness.strip()
+            if self.validation_harness not in self.definitions:
+                raise ValueError(
+                    "Unknown harness_selection.val_harness="
+                    f"{self.validation_harness!r}; "
+                    f"configured harnesses: {sorted(self.definitions)}"
+                )
+
         self.fallback = policy.get("fallback", "default")
         if self.fallback not in ("default", "weighted_random"):
             raise ValueError(
@@ -271,7 +301,12 @@ class HarnessResolver:
                 "Multiple harnesses require harness_selection.default or weighted_random fallback"
             )
 
-    def resolve(self, kwargs: Mapping[str, Any]) -> HarnessSelection:
+    def resolve(
+        self, kwargs: Mapping[str, Any], *, is_val: bool | None = None
+    ) -> HarnessSelection:
+        if is_val is None:
+            is_val = bool(kwargs.get("validate", False))
+
         extra_info = _mapping_value(kwargs.get("extra_info", {}), field="extra_info")
 
         # Metadata-key order is authoritative. For each key, a directly
@@ -279,13 +314,23 @@ class HarnessResolver:
         # With the default keys this yields:
         # direct agent_harness > extra_info.agent_harness > direct harness >
         # extra_info.harness.
+        metadata_selection: HarnessDefinition | None = None
         for key in self.metadata_keys:
             if key in kwargs:
-                return HarnessSelection(self._explicit(key, kwargs[key]), "metadata")
+                metadata_selection = self._explicit(key, kwargs[key])
+                break
             if key in extra_info:
-                return HarnessSelection(
-                    self._explicit(f"extra_info.{key}", extra_info[key]), "metadata"
+                metadata_selection = self._explicit(
+                    f"extra_info.{key}", extra_info[key]
                 )
+                break
+
+        if is_val and self.validation_harness is not None:
+            return HarnessSelection(
+                self.definitions[self.validation_harness], "validation"
+            )
+        if metadata_selection is not None:
+            return HarnessSelection(metadata_selection, "metadata")
 
         if self.fallback == "weighted_random":
             return HarnessSelection(

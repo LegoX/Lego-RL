@@ -15,6 +15,9 @@
       - harness
     default: ${oc.env:HARBOR_HARNESS_DEFAULT,openhands_sdk}
     fallback: ${oc.env:HARBOR_HARNESS_FALLBACK,default}
+    # Validation uses one harness for every sample to keep val metrics
+    # comparable. Override with HARBOR_VAL_HARNESS (default: OpenHands SDK).
+    val_harness: ${oc.env:HARBOR_VAL_HARNESS,openhands_sdk}
     # Used only by deterministic task-level selection.
     random_seed: ${oc.decode:${oc.env:HARBOR_HARNESS_RANDOM_SEED,1234}}
     granularity: ${oc.env:HARBOR_HARNESS_GRANULARITY,task}

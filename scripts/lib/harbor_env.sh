@@ -58,11 +58,13 @@ case "$SCAFFOLD" in
     _loop_default="agent_loop_config_oh.yaml"; : "${ENABLE_R3:=False}" ;;
   mixed)  # Per-sample selection; each complete runtime definition lives in mixed YAML.
     : "${HARBOR_AGENT_NAME:=null}"
+    : "${HARBOR_VAL_HARNESS:=openhands_sdk}"
     _loop_default="agent_loop_config_mixed.yaml"; : "${ENABLE_R3:=True}" ;;
   *) echo "[harbor_env][FATAL] unknown SCAFFOLD='$SCAFFOLD' (supports ohsdk|oh|cc|oc|mixed)" >&2; return 1 2>/dev/null || exit 1 ;;
 esac
 export HARBOR_AGENT_NAME HARBOR_AGENT_IMPORT_PATH HARBOR_AGENT_RUNTIME_IMAGE \
        HARBOR_AGENT_RUNTIME_MOUNT_PATH HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH HARBOR_AGENT_VERSION ENABLE_R3
+[ "$SCAFFOLD" = "mixed" ] && export HARBOR_VAL_HARNESS
 # tool_parser: this one variable drives both vLLM serving and agent-side parsing; must align with chat_template (oc uses in-pod config, doesn't have this)
 [ "$SCAFFOLD" != "oc" ] && export HARBOR_TOOL_PARSER="${TOOL_PARSER:-${HARBOR_TOOL_PARSER:-qwen3_coder}}"
 [ -n "${HARBOR_AGENT_MODEL_INFO:-}" ] && export HARBOR_AGENT_MODEL_INFO

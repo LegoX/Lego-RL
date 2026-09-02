@@ -100,6 +100,56 @@ def test_task_granularity_is_stable_across_rollouts(definitions):
     assert len(names) == 1
 
 
+def test_validation_uses_configured_harness_even_when_metadata_differs(definitions):
+    resolver = HarnessResolver(
+        definitions,
+        {
+            "default": "openhands_sdk",
+            "fallback": "weighted_random",
+            "weights": {"openhands_sdk": 1, "claude_code": 1},
+            "val_harness": "claude_code",
+        },
+    )
+
+    selected = resolver.resolve(
+        {
+            "validate": True,
+            "extra_info": {"agent_harness": "openhands_sdk"},
+            "index": 17,
+        }
+    )
+
+    assert selected.definition.name == "claude_code"
+    assert selected.source == "validation"
+
+
+def test_validation_still_rejects_unknown_explicit_harness(definitions):
+    resolver = HarnessResolver(
+        definitions,
+        {"val_harness": "openhands_sdk"},
+    )
+
+    with pytest.raises(ValueError, match="Unknown harness"):
+        resolver.resolve(
+            {"validate": True, "extra_info": {"agent_harness": "missing"}}
+        )
+
+
+def test_validation_defaults_to_openhands_sdk(definitions):
+    resolver = HarnessResolver(
+        definitions,
+        {
+            "fallback": "weighted_random",
+            "weights": {"openhands_sdk": 1, "claude_code": 1},
+        },
+    )
+
+    selected = resolver.resolve({"validate": True, "index": 17})
+
+    assert selected.definition.name == "openhands_sdk"
+    assert selected.source == "validation"
+
+
 def test_weighted_choice_is_stable_across_processes():
     code = r"""
 import json

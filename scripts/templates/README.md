@@ -125,7 +125,7 @@ scripts/train/configs/fully_async_3nodes_qwen35_ohsdk_veomni.env
 | `scaffold/oh.env` | OpenHands agent identity and runtime image settings. |
 | `scaffold/cc.env` | Claude Code agent identity and runtime image settings. |
 | `scaffold/oc.env` | OpenCode agent identity and runtime image settings. |
-| `scaffold/mixed.env` | Mixed-harness selection defaults; per-harness Harbor/runtime definitions live in `agent_loop_config_mixed.yaml`. |
+| `scaffold/mixed.env` | Mixed-harness selection defaults (including fixed validation harness); per-harness Harbor/runtime definitions live in `agent_loop_config_mixed.yaml`. |
 | `verl/common.env` | Verl-native defaults shared by sync/async and VeOmni/FSDP: data, model, actor, rollout, ref, algorithm, topology, experiment/log defaults. |
 | `verl/async.env` | Fully-async entry/config selection and `async_training.*` defaults. |
 | `verl/sync.env` | Sync entry/config selection and sync-specific train batch defaults. |
