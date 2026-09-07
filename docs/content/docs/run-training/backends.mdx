@@ -32,7 +32,14 @@ HARBOR_NYDUS_MIRROR=...                                        # optional lazy-p
 # optional pod-level knobs
 K8S_POD_STARTUP_TIMEOUT=1200            # seconds to wait for a pod to start
 K8S_POD_ACTIVE_DEADLINE_SECONDS=6000    # hard per-pod deadline
+HARBOR_EXCLUDE_NODES=cpu003,cpu004      # never schedule pods on these nodes (hard nodeAffinity NotIn)
 ```
+
+`HARBOR_EXCLUDE_NODES` is for worker nodes that cannot reach the trainer host:
+a pod placed there dies on an LLM connect timeout after the full agent timeout and
+its row is dropped as `env_setup_failed`. Probe from inside a pod on each node
+(`nc -w 4 <trainer-ip> <port>`) rather than from the control-plane host, which
+usually has a route the workers lack.
 
 Pods are labeled `harbor-managed=true`; `scripts/cleanup_before_run.sh` reaps only
 finished pods (phase Failed / Succeeded / Unknown) by that label, never running ones.
