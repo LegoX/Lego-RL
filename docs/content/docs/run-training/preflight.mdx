@@ -153,6 +153,23 @@ An unset value is only a warning where it is legitimately optional (an empty
 `INSTANCES_FILE` means "the whole index"); a value that *is* set but doesn't resolve
 on disk is always fatal.
 
+### 10. SAO / critic (train only)
+
+Value-based runs (`verl/sao.env`, or any `CRITIC_ENABLE=True`) add rules for the ways a
+run can *look* like SAO and not be one — the config layer is first-assignment-wins and
+the actor's loss config is frozen at construction, so nothing downstream would notice:
+
+| Check | Why |
+| --- | --- |
+| `ADV_ESTIMATOR=gae` ⇔ `CRITIC_ENABLE=True` (fatal) | GAE with no critic has no values; a critic under GRPO burns a training pool for nothing |
+| `verl/sao.env` listed **before** `verl/common.env` (fatal) | after `common.env` every SAO default is a no-op and the run is GRPO wearing an SAO name |
+| `ROLLOUT_CORRECTION_BYPASS=True` ⇒ `POLICY_LOSS_MODE=bypass_mode` (fatal) | otherwise the actor runs GSPO and the DIS weights never reach the loss |
+| imported verl has `sao_dis` / `lam_critic` (fatal) | `patches/verl_sao_7aed6b23.patch` not applied — re-run `setup_env.sh` |
+| critic token budget × `SP_SIZE` ≥ `MAX_PROMPT + MAX_RESP` (fatal; equal is a warning) | one rank asserting in `rearrange_micro_batches` leaves the others deadlocked in `_compute_values` until `NCCL_TIMEOUT` |
+| `CRITIC_FREEZE_PARAM_PATTERNS` vs the checkpoint's attention layout (fatal) | verl raises on a pattern that matches nothing; `linear_attn.` / `visual.` exist only on Qwen3.5-style hybrids. Freezing only `self_attn.` on a hybrid warns |
+| freeze patterns with FSDP1 and `use_orig_params=False` (fatal) | FSDP1 cannot flatten a unit with mixed `requires_grad`; use `fsdp2` |
+| `CRITIC_GRAD_CLIP ≤ 1`, `GAE_WHITEN_ADVANTAGES=False` with a cold critic, `N_RESP > 1` (warn) | the settings that starved and then collapsed run r6 — see [SAO](/docs/run-training/sao#what-went-wrong-on-r6) |
+
 ## Manual checks
 
 Preflight reads the config, not the cluster. Confirm these by hand before a long run:

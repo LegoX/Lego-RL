@@ -6,7 +6,8 @@ description: >
   Reads the process table, the run log's metric lines and the trials directory,
   then checks the metrics against this cluster's known failure signatures —
   R3 pearson collapse, lr=0, grad starvation, env_setup_failed avalanches,
-  val fake-zeros, no-tool-call collapse — and says which one matches. Read-only,
+  val fake-zeros, no-tool-call collapse, and for SAO/critic runs critic
+  starvation and the all-negative-batch collapse — and says which one matches. Read-only,
   local host only: never kills, never restarts, never edits. Triggers on
   "how's the run doing", "what step is it on", "is reward going up",
   "is this run broken", "diagnose the training run".
@@ -89,8 +90,15 @@ and read the keys below (these names are exact — they come from the real logs)
 
 ```bash
 grep -E ' step:[0-9]+ - training/global_step' "$LOG" | tail -1 \
-  | grep -oE '(training/rollout_actor_probs_pearson_corr|actor/(lr|grad_norm|kl_coef)|critic/rewards/mean|num_turns/mean|trajectory_filter/[a-z_/]+|response_length/(mean|clip_ratio)):[0-9.e+-]+'
+  | grep -oE '(training/rollout_actor_probs_pearson_corr|actor/(lr|grad_norm|kl_coef|pg_clipfrac)|actor/rollout_corr/(kl|rollout_is_eff_sample_size|rollout_is_ratio_fraction_low)|critic/(rewards/mean|advantages/mean|vf_explained_var|vf_loss|grad_norm|lr)|num_turns/mean|trajectory_filter/[a-z_/]+|response_length/(mean|clip_ratio)):[0-9.e+-]+'
 ```
+
+Tell a **SAO / critic run** apart first: its config block says `gae` with a
+`critic` line, and the log carries `critic/vf_explained_var`. On such a run
+`training/rollout_actor_probs_pearson_corr` and `actor/entropy` are **absent by
+design** (bypass mode: `old_log_probs == rollout_log_probs`, so pearson would be
+1.0 by construction) — their absence is not the R3 signature. Read the
+`actor/rollout_corr/*` keys instead.
 
 | Metric key | Healthy | What a bad value means |
 |---|---|---|
@@ -104,6 +112,11 @@ grep -E ' step:[0-9]+ - training/global_step' "$LOG" | tail -1 \
 | `trajectory_filter/invalid_ratio` | < ~0.1 | High = most of the batch is being dropped; the effective batch is far smaller than configured. |
 | `response_length/clip_ratio` | low | High = responses hitting the window; the tail is being truncated. |
 | `val-core/…`, `val-aux/num_turns/…` | non-zero at test_freq steps | All-zero val while train reward is fine = the val split's images are unpullable, **not** a model regression. |
+| `critic/vf_explained_var` (SAO) | leaves <0 within ~20 steps, then 0.2–0.5 | Flat ≤ 0.3 for 50+ steps = the critic never converged; with `critic/grad_norm` far above `CRITIC_GRAD_CLIP` that is **critic starvation** (every update clipped down). Huge negatives on a step whose `critic/returns/min ≈ max` are a degenerate batch, ignore that step. |
+| `critic/grad_norm` (SAO) | median ~10 on 30B–35B, spikes to 30–70 | Alarm only on **three consecutive steps > 30**; a single spike (even 200+, e.g. an empty batch after sandboxes vanished) is not instability. |
+| `critic/advantages/mean` (SAO) | ≈ 0 with whitening on | Drifting negative for consecutive steps with whitening off = all-negative batches; the precursor of the think-spam collapse. |
+| `actor/rollout_corr/rollout_is_eff_sample_size` (SAO) | ≥ 0.99 | Well below = DIS is zeroing many tokens (staleness or backend mismatch); with `rollout_is_ratio_fraction_low` at an exact multiple of 1/batch the DIS mirror is missing and the run trains sequence-TIS. |
+| `actor/pg_clipfrac` (SAO) | **absent** | Present on a bypass-mode run = the actor is not in `bypass_mode`; DIS never reached the loss. |
 
 Also worth a line each when present: `fully_async/processing_time/tp99` (long
 tail), `fully_async/count/dropped_stale_samples` (staleness pressure),
@@ -123,6 +136,9 @@ the user chasing the wrong layer for hours.
 | **env avalanche** | `trajectory_filter/reason/env_setup_failed` climbing across steps; reward down in step |
 | **val fake-zero** | val metrics 0 while `critic/rewards/mean` is healthy |
 | **no-tool-call collapse** | `num_turns/mean` falling toward 1 over consecutive steps + reward falling; filter reasons *normal* |
+| **critic starvation** (SAO) | `critic/vf_explained_var` flat ≤ 0.3 for 50+ steps while `critic/grad_norm` sits well above the configured clip; val flat. Fix on the next run: `CRITIC_GRAD_CLIP=10`, a warm `CRITIC_MODEL_PATH`, `CRITIC_WARMUP=20` |
+| **all-negative-batch collapse** (SAO) | `critic/advantages/mean` negative on 3+ consecutive steps (whitening off) followed by `num_turns/mean` rising while reward falls — a reward-neutral tool (e.g. `think`) is being relatively reinforced. `GAE_WHITEN_ADVANTAGES=True` on the next run; roll back to before the drift |
+| **DIS not reaching the actor** (SAO) | `actor/pg_clipfrac` present, or `rollout_is_ratio_fraction_low` landing on exact multiples of 1/batch — the policy-loss mirror in `hydra_args.sh` was removed; the run is not SAO |
 | **deadlock / stall** | process alive, log mtime old, no new step line; check whether the tail sits in val or in a rollout wait |
 | **step slowdown** | minutes/step up sharply — compare the node/replica counts in the run's own config block before blaming the tasks |
 
@@ -143,7 +159,8 @@ Keep metric keys verbatim so they can be grepped.
   stage    step <N> (<epoch>) · running <etime> · ~<M> min/step · log last written <X> min ago
   procs    runner=<pid>  trainer=<pid>  GPUs in use: <n>
   reward   critic/rewards/mean=<v> (last <k> steps: <trend>)
-  grads    actor/grad_norm=<v>   actor/lr=<v>   pearson=<v>
+  grads    actor/grad_norm=<v>   actor/lr=<v>   pearson=<v | n/a (bypass mode)>
+  critic   vf_explained_var=<v>  grad_norm=<v>  ESS=<v>        (SAO runs only)
   traj     num_turns/mean=<v>  invalid_ratio=<v>  env_setup_failed=<v> timeout=<v>
   val      <value from the most recent val, or "test_freq not reached yet">
 
