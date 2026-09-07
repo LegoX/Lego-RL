@@ -27,6 +27,30 @@ which is outside any git repository, so the patches are lost on every `pip insta
 rebuild, or move to a new machine. Idempotent; `--check` reports without writing. Only needed
 on older vLLM (<0.19, i.e. before the built-in routed-experts capturer).
 
+### `apply_veomni_valuehead_patch.py`
+
+Makes VeOmni able to build a **value model (critic)** at all. VeOmni's per-family model
+registry dispatches `"<Family>ForTokenClassification"` by substring and, unpatched, falls
+through to the CausalLM class — so a critic (SAO / PPO) is silently built as a language model
+and GAE sees vocab-sized "values" (surfaced as `size of tensor a (8) must match ... (151936)`).
+veomni is a wheel, not a managed checkout, so this edits site-packages: `setup_env.sh` runs it
+once after installing, and `train.sh` re-runs it before any `CRITIC_ENABLE=True` VeOmni launch.
+It also installs the Qwen3.5-MoE `ForTokenClassification` sidecar from
+`src/verl_patch/models/` (Qwen3.5-MoE ships no such class). Idempotent; `--check` reports
+without writing and exits non-zero when a patch is missing.
+
+### `merge_critic_ckpt.sh` / `merge_critic_ckpt_streaming.py`
+
+Merge a sharded **critic** checkpoint (`global_step_N/critic/`, which has no loadable weights)
+into a HuggingFace directory that `CRITIC_MODEL_PATH` can load — the warm-start critic that
+stabilised the SAO 35B runs. Both fix a verl trap first: the critic's saved `config.json` says
+`architectures: [...ForCausalLM]`, so the stock merger drops the value head. The streaming
+variant bounds host memory (a 30B critic needs >120 GB with the stock path) and **refuses
+Qwen3.5-MoE checkpoints**, whose fused-expert layout it would silently corrupt; for those use
+`merge_qwen35_fsdp_to_hf.py` on the critic directory and rewrite the architecture by hand.
+
+Usage: `bash utils/merge_critic_ckpt.sh <step>/critic <out_dir>` (fp32 shards → bf16).
+
 ### `merge_veomni_fsdp_to_hf.py`
 
 Merges a veomni-FSDP2 actor checkpoint (`model_world_size_N_rank_*.pt`, whose 1-D mesh is named
