@@ -81,3 +81,36 @@ model_moe_verdict() {
         printf 'unknown'
     fi
 }
+
+# model_attention_kinds [model_path] → prints a space-separated list of the
+# attention module kinds the checkpoint has: any of `self_attn` (full attention),
+# `linear_attn` (GatedDeltaNet / hybrid layers) and `visual` (a vision tower).
+# Prints nothing when config.json cannot be read.
+#
+# Used to validate CRITIC_FREEZE_PARAM_PATTERNS: verl raises on a pattern that
+# matches no parameter, and `linear_attn.` / `visual.` exist only on hybrid
+# multimodal families such as Qwen3.5-MoE.
+model_attention_kinds() {
+    local path="${1:-${MODEL_PATH:-}}"
+    [ -n "$path" ] && [ -f "$path/config.json" ] || return 0
+    "${PYTHON_BIN:-python3}" - "$path/config.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+scopes = [cfg] + [v for v in (cfg.get("text_config"), cfg.get("llm_config")) if isinstance(v, dict)]
+kinds = []
+layer_types = next((s["layer_types"] for s in scopes if isinstance(s.get("layer_types"), list)), None)
+if layer_types:
+    if any(t == "full_attention" for t in layer_types): kinds.append("self_attn")
+    if any(t == "linear_attention" for t in layer_types): kinds.append("linear_attn")
+else:
+    kinds.append("self_attn")
+    if any(k in s for s in scopes for k in ("linear_num_value_heads", "linear_conv_kernel_dim")):
+        kinds.append("linear_attn")
+if isinstance(cfg.get("vision_config"), dict):
+    kinds.append("visual")
+print(" ".join(kinds))
+PY
+}
