@@ -85,6 +85,9 @@
         pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,900}}
         pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
         agent_runtime_image: ${oc.decode:${oc.env:HARBOR_AGENT_RUNTIME_IMAGE,null}}
+        # Node names to keep sandbox pods OFF, comma-separated. Empty = no
+        # affinity block, spec unchanged. See kubernetes.py:exclude_nodes.
+        exclude_nodes: ${oc.env:HARBOR_EXCLUDE_NODES,}
         agent_runtime_mount_path: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/claude-code}
         agent_runtime_image_subpath: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH,opt/custom-agent-runtime/claude-code}
         # JSON list of extra hostPath mounts injected into each task pod.

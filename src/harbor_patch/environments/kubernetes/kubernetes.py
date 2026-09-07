@@ -467,6 +467,11 @@ class KubernetesEnvironment(BaseEnvironment):
       kubeconfig_path        Explicit path to a kubeconfig file (optional)
       image_pull_secrets     List of secret names for private registries (optional)
       tolerations            List of toleration dicts (optional)
+      exclude_nodes          Node names to keep pods OFF, as a list or a
+                             comma-separated string. Becomes a required
+                             nodeAffinity NotIn on kubernetes.io/hostname.
+                             Empty/unset = no affinity block at all, so the
+                             pod spec is byte-identical to before.
       pod_startup_timeout_sec  Seconds to wait for pod Ready (default: 300)
       pod_active_deadline_seconds  Hard upper bound on pod lifetime in seconds,
                                    enforced by the kubelet. Acts as a K8s-side
@@ -566,6 +571,7 @@ class KubernetesEnvironment(BaseEnvironment):
         kubeconfig_path: str | None = None,
         image_pull_secrets: list[str] | None = None,
         tolerations: list[dict] | None = None,
+        exclude_nodes: list[str] | str | None = None,
         pod_startup_timeout_sec: int = 300,
         pod_active_deadline_seconds: int | None = None,
         agent_runtime_image: str | None = None,
@@ -602,6 +608,13 @@ class KubernetesEnvironment(BaseEnvironment):
         self.kubeconfig_path = kubeconfig_path
         self.image_pull_secrets = image_pull_secrets or []
         self.tolerations = tolerations or []
+        # Node names this trial must NOT be scheduled onto. Accepts a list or a
+        # comma-separated string so it can come straight from an env var
+        # (HARBOR_EXCLUDE_NODES). Typical use: worker nodes with no route back to
+        # the trainer host, where every pod dies on an LLM connect timeout.
+        if isinstance(exclude_nodes, str):
+            exclude_nodes = [n.strip() for n in exclude_nodes.split(",") if n.strip()]
+        self.exclude_nodes = list(exclude_nodes or [])
         self.pod_startup_timeout_sec = pod_startup_timeout_sec
 
         # None means "no hard deadline"; 0 also disables it. Otherwise we pass
@@ -1119,6 +1132,35 @@ class KubernetesEnvironment(BaseEnvironment):
             else None
         )
 
+        # Keep the pod off nodes listed in exclude_nodes.
+        # requiredDuringScheduling, not preferred: a soft rule still places pods
+        # there under pressure, and one placed pod is one dead trial.
+        # IgnoredDuringExecution because we only care about placement; evicting a
+        # running pod if a node were later relabelled would lose work for nothing.
+        affinity_obj = (
+            k8s_client.V1Affinity(
+                node_affinity=k8s_client.V1NodeAffinity(
+                    required_during_scheduling_ignored_during_execution=(
+                        k8s_client.V1NodeSelector(
+                            node_selector_terms=[
+                                k8s_client.V1NodeSelectorTerm(
+                                    match_expressions=[
+                                        k8s_client.V1NodeSelectorRequirement(
+                                            key="kubernetes.io/hostname",
+                                            operator="NotIn",
+                                            values=self.exclude_nodes,
+                                        )
+                                    ]
+                                )
+                            ]
+                        )
+                    )
+                )
+            )
+            if self.exclude_nodes
+            else None
+        )
+
         labels = {
             "app": "harbor-sandbox",
             "session": self.session_id[:63],
@@ -1210,6 +1252,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 restart_policy="Never",
                 image_pull_secrets=pull_secrets,
                 tolerations=tolerations_objs,
+                affinity=affinity_obj,
                 volumes=volumes,
                 # Hard upper bound on pod lifetime. The kubelet terminates the
                 # pod after this many seconds regardless of whether the driver
