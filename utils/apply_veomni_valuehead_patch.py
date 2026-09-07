@@ -59,6 +59,7 @@ Run with `--check` to report status without writing.
 Usage:
     python utils/apply_veomni_valuehead_patch.py            # apply
     python utils/apply_veomni_valuehead_patch.py --check    # report only
+    python utils/apply_veomni_valuehead_patch.py --verify   # dispatch self-test only
 """
 
 from __future__ import annotations
@@ -68,11 +69,15 @@ import sys
 
 
 def _veomni_dir() -> str:
-    try:
-        import veomni  # noqa: PLC0415
-    except Exception as e:  # pragma: no cover
-        sys.exit(f"[veomni-valuehead] cannot import veomni: {e!r}")
-    return os.path.dirname(os.path.abspath(veomni.__file__))
+    # Locate without importing: importing veomni registers the *unpatched*
+    # per-family dispatch functions, and the in-process verify below would then
+    # test stale module objects instead of the files we just rewrote.
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.find_spec("veomni")
+    if spec is None or not spec.origin:
+        sys.exit("[veomni-valuehead] cannot locate veomni (not installed in this interpreter)")
+    return os.path.dirname(os.path.abspath(spec.origin))
 
 
 QWEN3_MOE = "models/transformers/qwen3_moe/__init__.py"
@@ -498,6 +503,9 @@ def _verify(root: str) -> int:
 def main() -> int:
     check_only = "--check" in sys.argv
     root = _veomni_dir()
+    if "--verify" in sys.argv:
+        # Fresh-interpreter verification entry point (see the apply path below).
+        return 3 if _verify(root) else 0
     print(f"[veomni-valuehead] veomni at: {root}")
     total_applied = total_skipped = total_missing = 0
     total_missing += _install_q35_sidecar(root, check_only)
@@ -548,8 +556,14 @@ def main() -> int:
         return 2
 
     if not check_only:
-        print("[veomni-valuehead] verifying dispatch:")
-        if _verify(root):
+        # Verify in a fresh interpreter: the verl value-head patch step above may
+        # already have imported veomni here, and MODELING_REGISTRY would keep the
+        # pre-patch dispatch functions bound (false "FAIL" right after "[APPLY]").
+        import subprocess  # noqa: PLC0415
+
+        print("[veomni-valuehead] verifying dispatch (fresh interpreter):")
+        rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--verify"], check=False).returncode
+        if rc:
             print("[veomni-valuehead] VERIFY FAILED -- do not run a veomni critic.")
             return 3
     return 0
