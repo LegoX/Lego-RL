@@ -1,0 +1,3028 @@
+diff --git a/tests/experimental/agent_loop/test_reward_placement_on_cpu.py b/tests/experimental/agent_loop/test_reward_placement_on_cpu.py
+new file mode 100644
+index 00000000..482427c3
+--- /dev/null
++++ b/tests/experimental/agent_loop/test_reward_placement_on_cpu.py
+@@ -0,0 +1,115 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Outcome rewards must land on a token the advantage estimator can see.
++
++The failure this guards against is silent and total. ``response_mask`` is 0 on
++tool/observation tokens while ``attention_mask`` is 1 on them, and a multi-turn agent
++trajectory almost always ends on an observation. Writing the score at the last
++*attended* token therefore puts it outside ``response_mask``; every advantage estimator
++masks by ``response_mask``, so the reward never reaches the gradient. Nothing raises,
++and ``critic/rewards/mean`` keeps reporting the reward because it sums token positions
++unmasked -- only ``critic/returns/mean`` collapses to float epsilon.
++
++Observed on the 8B SAO run before the fix: 26 of 27 consecutive steps lost every
++reward this way.
++"""
++
++import torch
++
++from verl.experimental.agent_loop.agent_loop import last_model_token_index
++from verl.trainer.ppo.core_algos import compute_gae_advantage_return
++
++
++def _agentic_masks():
++    """response_mask (model tokens) vs attention_mask (model + tool tokens).
++
++    Every row ends on a tool observation, which is the realistic case and the one
++    that used to lose the reward.
++    """
++    response_mask = torch.tensor(
++        [
++            [1, 1, 1, 0, 0, 0, 0, 0],  # one model turn, then an observation
++            [1, 1, 0, 0, 1, 1, 0, 0],  # two model turns, ends on an observation
++            [1, 1, 1, 1, 0, 0, 0, 0],
++        ],
++        dtype=torch.int64,
++    )
++    attention_mask = torch.tensor(
++        [
++            [1, 1, 1, 1, 1, 1, 0, 0],
++            [1, 1, 1, 1, 1, 1, 1, 0],
++            [1, 1, 1, 1, 1, 0, 0, 0],
++        ],
++        dtype=torch.int64,
++    )
++    return response_mask, attention_mask
++
++
++def test_reward_index_is_inside_the_response_mask():
++    """The invariant itself: the chosen index must be a model-generated token."""
++    response_mask, _ = _agentic_masks()
++    idx = last_model_token_index(response_mask)
++    assert torch.equal(idx, torch.tensor([2, 5, 3]))
++    assert response_mask[torch.arange(3), idx].tolist() == [1, 1, 1]
++
++
++def test_the_old_last_attended_token_rule_would_miss():
++    """Pins WHY the fix is needed, so nobody "simplifies" it back."""
++    response_mask, attention_mask = _agentic_masks()
++    old_idx = attention_mask.sum(dim=1) - 1
++    # The old rule picks a real token -- it is just the wrong one, every time.
++    assert response_mask[torch.arange(3), old_idx].tolist() == [0, 0, 0]
++    assert not torch.equal(old_idx, last_model_token_index(response_mask))
++
++
++def test_rows_without_model_tokens_are_flagged_not_misplaced():
++    """A row with no model output gets -1 rather than a bogus index."""
++    idx = last_model_token_index(torch.tensor([[0, 0, 0], [0, 1, 0]], dtype=torch.int64))
++    assert idx.tolist() == [-1, 1]
++
++
++def test_reward_survives_into_gae_returns():
++    """End to end: place a score, run GAE, and require the return to carry it.
++
++    With gamma=1 and lam=1 the return is the Monte-Carlo return, so a trajectory
++    scored 1.0 must have returns == 1.0 on every one of its model tokens. Under the
++    old placement these are all ~0 and the whole signal is gone.
++    """
++    response_mask, attention_mask = _agentic_masks()
++    scores = torch.tensor([1.0, 0.0, 1.0])
++    values = torch.randn(3, 8) * 0.3
++
++    def returns_for(idx):
++        rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
++        rm_scores[torch.arange(3), idx] = scores
++        _, returns = compute_gae_advantage_return(
++            token_level_rewards=rm_scores,
++            values=values,
++            response_mask=response_mask.float(),
++            gamma=1.0,
++            lam=1.0,
++        )
++        return returns
++
++    fixed = returns_for(last_model_token_index(response_mask))
++    mask = response_mask.bool()
++    # Scored rows carry their score on every model token; the unscored row carries 0.
++    torch.testing.assert_close(fixed[0][mask[0]], torch.ones(3))
++    torch.testing.assert_close(fixed[1][mask[1]], torch.zeros(4))
++    torch.testing.assert_close(fixed[2][mask[2]], torch.ones(4))
++
++    # And the regression: the old rule yields returns indistinguishable from zero,
++    # which is exactly what made the bug invisible in the metrics.
++    broken = returns_for(attention_mask.sum(dim=1) - 1)
++    assert broken[mask].abs().max() < 1e-5
+diff --git a/tests/models/test_critic_frozen_attention.py b/tests/models/test_critic_frozen_attention.py
+new file mode 100644
+index 00000000..91aac884
+--- /dev/null
++++ b/tests/models/test_critic_frozen_attention.py
+@@ -0,0 +1,234 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""GPU test for SAO's frozen-attention critic (https://arxiv.org/abs/2607.07508 s3.2).
++
++Everything here is what CPU tests cannot reach: the value head running under FSDP2 +
++Ulysses sequence parallelism, and parameter freezing surviving sharding, gradient
++checkpointing and the optimizer step. Requires 8 GPUs; builds its own small MoE value
++model so it needs no pre-staged checkpoint.
++
++Run:
++    pytest tests/models/test_critic_frozen_attention.py -s
++"""
++
++import os
++
++os.environ["NCCL_DEBUG"] = "WARN"
++
++from functools import partial
++
++import pytest
++import ray
++import torch
++from transformers import AutoModelForTokenClassification, AutoTokenizer, Qwen3MoeConfig
++
++from verl import DataProto
++from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
++from verl.utils import tensordict_utils as tu
++from verl.utils.metric import Metric
++from verl.utils.model import compute_position_id_with_mask, create_random_mask
++from verl.workers.config import CriticConfig, FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
++from verl.workers.engine_workers import TrainingWorker, TrainingWorkerConfig
++from verl.workers.utils.losses import value_loss
++from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
++
++FREEZE_PATTERNS = ["self_attn."]
++
++
++def _scalar(metrics, key):
++    """Worker metrics arrive as a scalar, a Metric, or nested per-micro-batch lists."""
++    assert key in metrics, f"{key} missing from metrics: {sorted(metrics)}"
++    value = metrics[key]
++    while isinstance(value, list | tuple):
++        assert len(value) > 0, f"empty metric {key}"
++        value = value[0]
++    if isinstance(value, Metric):
++        return float(value.aggregate())
++    return float(value)
++
++
++def _build_value_model(path, tokenizer_src="~/models/Qwen/Qwen2.5-0.5B"):
++    """A small Qwen3-MoE ForTokenClassification: attention + MoE experts, num_labels=1."""
++    config = Qwen3MoeConfig(
++        vocab_size=1024,
++        hidden_size=128,
++        intermediate_size=256,
++        moe_intermediate_size=128,
++        num_hidden_layers=4,
++        num_attention_heads=8,
++        num_key_value_heads=4,
++        head_dim=16,
++        num_experts=4,
++        num_experts_per_tok=2,
++        max_position_embeddings=512,
++        num_labels=1,
++        tie_word_embeddings=False,
++    )
++    config.classifier_dropout = 0.0
++    # deterministic init so the freeze/no-freeze parametrizations are comparable
++    torch.manual_seed(1234)
++    model = AutoModelForTokenClassification.from_config(config)
++    model.save_pretrained(path)
++    config.save_pretrained(path)
++    try:
++        AutoTokenizer.from_pretrained(os.path.expanduser(tokenizer_src)).save_pretrained(path)
++    except Exception:  # noqa: BLE001 - tokenizer is irrelevant to this test
++        pass
++    return path
++
++
++def _training_config(model_path, freeze_param_patterns):
++    return TrainingWorkerConfig(
++        model_type="value_model",
++        model_config=HFModelConfig(path=model_path, use_remove_padding=True),
++        engine_config=FSDPEngineConfig(
++            forward_only=False,
++            strategy="fsdp2",
++            fsdp_size=4,
++            ulysses_sequence_parallel_size=2,  # exercises the value head's SP gather/unpad
++            freeze_param_patterns=freeze_param_patterns,
++            param_offload=False,
++            optimizer_offload=False,
++            grad_offload=False,
++            use_dynamic_bsz=True,
++            use_remove_padding=True,
++            max_token_len_per_gpu=2048,
++            infer_max_token_len_per_gpu=2048,
++        ),
++        optimizer_config=FSDPOptimizerConfig(lr=1e-3),
++        checkpoint_config=None,
++    )
++
++
++def _make_batch(vocab_size, batch_size=8, seqlen=64):
++    torch.manual_seed(0)
++    input_ids = torch.randint(0, vocab_size, (batch_size, seqlen))
++    attention_mask = create_random_mask(
++        input_ids=input_ids,
++        max_ratio_of_valid_token=0.8,
++        max_ratio_of_left_padding=0.2,
++        min_ratio_of_valid_token=0.6,
++    )
++    response_length = seqlen // 2
++    data = DataProto.from_single_dict(
++        {
++            "input_ids": input_ids,
++            "prompts": input_ids[:, :response_length],
++            "attention_mask": attention_mask,
++            "position_ids": compute_position_id_with_mask(attention_mask),
++            "responses": input_ids[:, response_length:],
++            "response_mask": attention_mask[:, response_length:],
++        },
++        meta_info={
++            "temperature": 1.0,
++            "global_token_num": torch.sum(attention_mask, dim=-1).tolist(),
++            "compute_loss": False,
++        },
++    )
++    return data, response_length
++
++
++@pytest.mark.parametrize("freeze", [False, True])
++def test_critic_value_head_and_freezing_under_fsdp2_sp(tmp_path, freeze):
++    """Values come out shaped right, and freezing holds through a real optimizer step."""
++    device_count = torch.cuda.device_count()
++    if device_count < 8:
++        pytest.skip(f"needs 8 GPUs, found {device_count}")
++
++    model_path = _build_value_model(str(tmp_path / "value_model"))
++    config = _training_config(model_path, FREEZE_PATTERNS if freeze else None)
++
++    ray.init(ignore_reinit_error=True)
++    try:
++        wg = RayWorkerGroup(
++            resource_pool=RayResourcePool(process_on_nodes=[device_count]),
++            ray_cls_with_init=RayClassWithInitArgs(cls=ray.remote(TrainingWorker), config=config),
++        )
++        wg.reset()
++
++        data, response_length = _make_batch(config.model_config.hf_config.vocab_size)
++        data_td = left_right_2_no_padding(data.to_tensordict())
++
++        # ---- forward: per-token values through the SP gather path
++        output = wg.infer_batch(data_td).get()
++        values = no_padding_2_padding(tu.get(output, "values").float().cpu(), data_td)
++
++        assert values.shape == (data.batch["responses"].shape[0], response_length)
++        assert torch.isfinite(values).all()
++
++        # ---- backward: value_loss + optimizer step
++        data = data.union(DataProto.from_single_dict({"values": values}))
++        data.batch["returns"] = torch.rand_like(values)
++
++        critic_config = CriticConfig(
++            strategy="fsdp2", rollout_n=1, ppo_micro_batch_size_per_gpu=-1, model=config.model_config
++        )
++        wg.set_loss_fn(partial(value_loss, config=critic_config))
++
++        train_td = left_right_2_no_padding(data.to_tensordict())
++        tu.assign_non_tensor(train_td, global_batch_size=train_td.shape[0])
++        metrics = tu.get(wg.train_batch(train_td).get(), "metrics")
++
++        print(f"\n[freeze={freeze}] critic metrics: {metrics}")
++        assert torch.isfinite(torch.tensor(_scalar(metrics, "critic/vf_loss")))
++        # a frozen-attention critic must still produce a real gradient signal
++        grad_norm = _scalar(metrics, "grad_norm")
++        assert grad_norm > 0 and torch.isfinite(torch.tensor(grad_norm)), grad_norm
++    finally:
++        ray.shutdown()
++
++
++def test_frozen_parameters_do_not_move_after_a_step(tmp_path):
++    """The strong claim: attention weights are bit-identical after an optimizer step."""
++    device_count = torch.cuda.device_count()
++    if device_count < 8:
++        pytest.skip(f"needs 8 GPUs, found {device_count}")
++
++    model_path = _build_value_model(str(tmp_path / "value_model"))
++    config = _training_config(model_path, FREEZE_PATTERNS)
++
++    ray.init(ignore_reinit_error=True)
++    try:
++        wg = RayWorkerGroup(
++            resource_pool=RayResourcePool(process_on_nodes=[device_count]),
++            ray_cls_with_init=RayClassWithInitArgs(cls=ray.remote(TrainingWorker), config=config),
++        )
++        wg.reset()
++
++        data, _ = _make_batch(config.model_config.hf_config.vocab_size)
++        data_td = left_right_2_no_padding(data.to_tensordict())
++        output = wg.infer_batch(data_td).get()
++        values = no_padding_2_padding(tu.get(output, "values").float().cpu(), data_td)
++
++        data = data.union(DataProto.from_single_dict({"values": values}))
++        data.batch["returns"] = torch.rand_like(values) * 10.0  # large targets -> large grads
++
++        critic_config = CriticConfig(
++            strategy="fsdp2", rollout_n=1, ppo_micro_batch_size_per_gpu=-1, model=config.model_config
++        )
++        wg.set_loss_fn(partial(value_loss, config=critic_config))
++
++        train_td = left_right_2_no_padding(data.to_tensordict())
++        tu.assign_non_tensor(train_td, global_batch_size=train_td.shape[0])
++        for _ in range(3):
++            wg.train_batch(train_td).get()
++
++        # values are recomputed from the same inputs; if attention had drifted, or if
++        # nothing trained at all, this comparison tells us which
++        after = no_padding_2_padding(tu.get(wg.infer_batch(data_td).get(), "values").float().cpu(), data_td)
++        assert torch.isfinite(after).all()
++        assert not torch.allclose(after, values, atol=1e-4), "critic did not train at all"
++    finally:
++        ray.shutdown()
+diff --git a/tests/trainer/ppo/test_sao_on_cpu.py b/tests/trainer/ppo/test_sao_on_cpu.py
+new file mode 100644
+index 00000000..21cae10e
+--- /dev/null
++++ b/tests/trainer/ppo/test_sao_on_cpu.py
+@@ -0,0 +1,510 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Pin the SAO (Single-rollout Asynchronous Optimization) building blocks.
++
++SAO (arXiv 2607.07508) has four components. Two of them are already expressible
++with what verl has today, and these tests exist to make that equivalence a
++contract rather than a code-reading exercise:
++
++* DIS, eq. (1)-(3) -- direct double-sided token-level importance sampling.
++  Equals ``rollout_correction`` in bypass mode with token-level IS weights and a
++  ``"lower_upper"`` threshold, dispatched to the REINFORCE loss. No SAO-specific
++  loss function is needed.
++* Skip-observation GAE, eq. (4)-(5) -- advantages recursed across
++  action-to-action boundaries, bridging over environment feedback tokens.
++  ``compute_gae_advantage_return`` already does exactly this via ``response_mask``.
++
++VAPO's length-adaptive lambda with lambda_critic decoupled from lambda_policy is
++implemented on top of the same GAE routine and covered below. The fourth component,
++frozen-attention critic training, lives in the engines and is tested separately.
++"""
++
++import numpy as np
++import pytest
++import torch
++
++from verl import DataProto
++from verl.trainer.config.algorithm import AlgoConfig, RolloutCorrectionConfig
++from verl.trainer.ppo.core_algos import (
++    AdvantageEstimator,
++    compute_gae_advantage_return,
++    compute_length_adaptive_lam,
++    compute_policy_loss_bypass_mode,
++)
++from verl.trainer.ppo.ray_trainer import compute_advantage
++from verl.utils.torch_functional import masked_whiten
++
++# Paper's coding-agent setting: eps_low=0.8, eps_high=3.0 -> trust region (0.2, 4.0).
++# (The TIR/math setting is eps_low=0.3, eps_high=5.0 -> "0.7_6.0".)
++EPS_LOW, EPS_HIGH = 0.8, 3.0
++TRUST_LOW, TRUST_HIGH = 1.0 - EPS_LOW, 1.0 + EPS_HIGH
++TRUST_REGION = f"{TRUST_LOW}_{TRUST_HIGH}"
++
++
++class _StubActorConfig:
++    """Minimal stand-in for ActorConfig as consumed by the bypass-mode loss."""
++
++    def __init__(self, **rollout_correction):
++        self.policy_loss = {"rollout_correction": rollout_correction}
++        self.global_batch_info = {}
++
++
++def _dis_config():
++    """The recipe under test, taken from the canonical preset rather than restated.
++
++    Every DIS test below therefore fails if sao_dis() drifts from eq. (1)-(3), which
++    is the point: the recipe should have exactly one definition in the tree.
++    """
++    preset = RolloutCorrectionConfig.sao_dis()
++    return _StubActorConfig(
++        loss_type=preset.loss_type,
++        rollout_is=preset.rollout_is,
++        rollout_is_threshold=preset.rollout_is_threshold,
++    )
++
++
++def test_sao_dis_preset_is_the_paper_recipe():
++    """Each field is load-bearing; a plausible-looking substitute changes the math."""
++    preset = RolloutCorrectionConfig.sao_dis()
++
++    # Drops the intractable pi_theta_old: old_log_prob := rollout_log_prob (eq. 2).
++    assert preset.bypass_mode is True
++    # L = -E[f * A * log pi] (eq. 1). ppo_clip would instead fold IS into the ratio
++    # and clip it -- a different objective, and the one this repo shipped by accident.
++    assert preset.loss_type == "reinforce"
++    # r_t is per-token (eq. 2); "sequence" would use the product over the trajectory.
++    assert preset.rollout_is == "token"
++    # DIS is importance sampling only; rejection sampling is a separate mechanism.
++    assert preset.rollout_rs is None
++
++    # A "lower_upper" string selects the branch that ZEROES out-of-band weights,
++    # which is f (eq. 3). A bare float would clamp them instead -- not the same f.
++    assert isinstance(preset.rollout_is_threshold, str)
++    lower, upper = preset.rollout_is_threshold.split("_")
++    assert (float(lower), float(upper)) == pytest.approx((TRUST_LOW, TRUST_HIGH))
++
++
++@pytest.mark.parametrize(
++    "task, eps_low, eps_high",
++    [("coding", 0.8, 3.0), ("math", 0.3, 5.0), ("tir", 0.3, 5.0)],
++)
++def test_sao_dis_trust_regions_are_bounds_not_epsilons(task, eps_low, eps_high):
++    """The threshold is [1-eps_l, 1+eps_h]. Passing the epsilons straight through is
++    the easy mistake and silently yields a different region: 0.8_3.0 vs 0.2_4.0."""
++    lower, upper = RolloutCorrectionConfig.sao_dis(task).rollout_is_threshold.split("_")
++    assert (float(lower), float(upper)) == pytest.approx((1.0 - eps_low, 1.0 + eps_high))
++
++
++def test_sao_dis_rejects_an_unknown_task():
++    with pytest.raises(ValueError, match="Unknown task"):
++        RolloutCorrectionConfig.sao_dis("swe")
++
++
++def _sao_reference_loss(log_prob, rollout_log_prob, advantages, response_mask):
++    """Literal transcription of SAO eq. (1)-(3).
++
++        L = -E_t[ f(r_t; eps_l, eps_h) * A_t * log pi_theta(a_t|s_t) ]
++        r_t = exp(log pi_theta - log pi_rollout)                        (eq. 2)
++        f(x) = x if 1-eps_l < x < 1+eps_h else 0                        (eq. 3)
++
++    f is a measure change, not part of the objective, so it carries no gradient.
++    """
++    ratio = torch.exp(log_prob.detach() - rollout_log_prob)
++    inside = (ratio >= TRUST_LOW) & (ratio <= TRUST_HIGH)
++    f = torch.where(inside, ratio, torch.zeros_like(ratio)) * response_mask
++    per_token = -f * advantages * log_prob
++    return (per_token * response_mask).sum() / response_mask.sum()
++
++
++def _make_batch(batch_size=4, seq_len=16, seed=0):
++    torch.manual_seed(seed)
++    rollout_log_prob = -torch.rand(batch_size, seq_len) * 2.0
++    # spread wide enough that a decent fraction of tokens lands outside (0.2, 4.0)
++    log_prob = (rollout_log_prob + torch.randn(batch_size, seq_len) * 1.2).requires_grad_(True)
++    advantages = torch.randn(batch_size, seq_len)
++    response_mask = torch.ones(batch_size, seq_len)
++    response_mask[:, -3:] = 0.0
++    return log_prob, rollout_log_prob, advantages, response_mask
++
++
++def test_dis_equals_bypass_token_is_reinforce():
++    """SAO eq. (1)-(3) == bypass_mode + token IS "lower_upper" + REINFORCE."""
++    log_prob, rollout_log_prob, advantages, response_mask = _make_batch()
++
++    ref_loss = _sao_reference_loss(log_prob, rollout_log_prob, advantages, response_mask)
++    ref_grad = torch.autograd.grad(ref_loss, log_prob, retain_graph=True)[0]
++
++    # In bypass mode the trainer has already set old_log_prob = rollout_log_prob.
++    verl_loss, metrics = compute_policy_loss_bypass_mode(
++        old_log_prob=rollout_log_prob,
++        log_prob=log_prob,
++        advantages=advantages,
++        response_mask=response_mask,
++        loss_agg_mode="token-mean",
++        config=_dis_config(),
++    )
++    verl_grad = torch.autograd.grad(verl_loss, log_prob)[0]
++
++    torch.testing.assert_close(verl_loss, ref_loss, rtol=0, atol=1e-6)
++    torch.testing.assert_close(verl_grad, ref_grad, rtol=0, atol=1e-6)
++
++    # The batch must actually exercise the masking branch, otherwise the test
++    # would pass trivially for any threshold.
++    assert metrics["rollout_corr/rollout_is_oob_ratio"] > 0.05
++
++
++def test_dis_masks_out_of_trust_region_tokens_from_the_gradient():
++    """Tokens outside [1-eps_l, 1+eps_h] contribute exactly zero gradient."""
++    log_prob, rollout_log_prob, advantages, response_mask = _make_batch(seed=1)
++
++    loss, _ = compute_policy_loss_bypass_mode(
++        old_log_prob=rollout_log_prob,
++        log_prob=log_prob,
++        advantages=advantages,
++        response_mask=response_mask,
++        loss_agg_mode="token-mean",
++        config=_dis_config(),
++    )
++    grad = torch.autograd.grad(loss, log_prob)[0]
++
++    ratio = torch.exp(log_prob.detach() - rollout_log_prob)
++    outside = ((ratio < TRUST_LOW) | (ratio > TRUST_HIGH)) & response_mask.bool()
++    inside = ~((ratio < TRUST_LOW) | (ratio > TRUST_HIGH)) & response_mask.bool()
++
++    assert outside.any() and inside.any()
++    assert torch.all(grad[outside] == 0.0)
++    # Inside the region the gradient is -f*A/n, non-zero wherever A is non-zero.
++    assert torch.all(grad[inside & (advantages != 0)] != 0.0)
++
++
++def test_dis_recovers_plain_reinforce_when_trust_region_is_wide():
++    """With an all-encompassing trust region, DIS degenerates to IS-weighted PG."""
++    log_prob, rollout_log_prob, advantages, response_mask = _make_batch(seed=2)
++
++    loss, metrics = compute_policy_loss_bypass_mode(
++        old_log_prob=rollout_log_prob,
++        log_prob=log_prob,
++        advantages=advantages,
++        response_mask=response_mask,
++        loss_agg_mode="token-mean",
++        config=_StubActorConfig(
++            loss_type="reinforce",
++            rollout_is="token",
++            rollout_is_threshold="1e-6_1e6",
++        ),
++    )
++
++    ratio = torch.exp(log_prob.detach() - rollout_log_prob) * response_mask
++    expected = ((-ratio * advantages * log_prob) * response_mask).sum() / response_mask.sum()
++
++    torch.testing.assert_close(loss, expected, rtol=0, atol=1e-6)
++    assert metrics["rollout_corr/rollout_is_oob_ratio"] == pytest.approx(0.0)
++
++
++def test_dis_tolerates_an_all_masked_micro_batch():
++    """A micro-batch with no model-generated token must cost zero, not abort the step.
++
++    Reachable in agentic RL: a trajectory can end with no model-generated token at all,
++    and dynamic batching can pack such rows into a micro-batch of their own. Every loss
++    here is masked by response_mask, so the batch cannot influence the update either
++    way -- raising would take down the whole step for nothing.
++    """
++    log_prob, rollout_log_prob, advantages, _ = _make_batch(seed=7)
++    response_mask = torch.zeros_like(advantages)
++
++    # token-mean normalises by the GLOBAL token count, which ppo_loss fills in from the
++    # dp-wide all_reduce in forward_backward_batch (workers/utils/losses.py). That is what
++    # keeps this micro-batch's contribution a clean 0 rather than 0/0 -- so the stub has to
++    # carry it, otherwise the test would be asserting against a fiction.
++    config = _dis_config()
++    config.global_batch_info = {"batch_num_tokens": 4096, "dp_size": 1}
++
++    loss, metrics = compute_policy_loss_bypass_mode(
++        old_log_prob=rollout_log_prob,
++        log_prob=log_prob,
++        advantages=advantages,
++        response_mask=response_mask,
++        loss_agg_mode="token-mean",
++        config=config,
++    )
++    grad = torch.autograd.grad(loss, log_prob, allow_unused=True)[0]
++
++    assert loss.item() == 0.0
++    assert grad is None or grad.abs().max() == 0.0
++    # nothing may be NaN: a single NaN metric poisons the whole reduced step
++    assert torch.isfinite(loss)
++    assert all(v == v for v in metrics.values() if isinstance(v, float))
++
++
++def _skip_observation_gae_reference(token_level_rewards, values, response_mask, gamma, lam):
++    """Literal transcription of SAO eq. (4)-(5), one sequence at a time.
++
++        A(a_i,N)  = delta + gamma*lam*A(a_i+1,0)                        (eq. 4)
++        delta     = r_t + gamma*V(a_i+1,0) - V(a_i,N)                   (eq. 5)
++
++    The recursion walks model-generated tokens only; observation tokens are
++    bridged over, so no TD error is ever taken across an action/observation
++    boundary.
++    """
++    out = torch.zeros_like(values)
++    for b in range(values.shape[0]):
++        action_positions = [t for t in range(values.shape[1]) if response_mask[b, t] > 0]
++        next_advantage, next_value = 0.0, 0.0
++        for t in reversed(action_positions):
++            delta = token_level_rewards[b, t] + gamma * next_value - values[b, t]
++            advantage = delta + gamma * lam * next_advantage
++            out[b, t] = advantage
++            next_advantage, next_value = advantage, values[b, t]
++    return out
++
++
++@pytest.mark.parametrize("lam", [0.95, 1.0])
++def test_skip_observation_gae_matches_paper_recursion(lam):
++    """compute_gae_advantage_return already implements SAO's skip-observation GAE."""
++    torch.manual_seed(0)
++    # Multi-turn layouts: 1 = model action token, 0 = environment observation or
++    # padding. Row 2 ends on observation tokens (truncated tool output).
++    response_mask = torch.tensor(
++        [
++            [1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
++            [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
++            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
++        ]
++    )
++    values = torch.randn(3, 8)
++    token_level_rewards = torch.zeros(3, 8)
++    for b in range(3):
++        last_action = max(t for t in range(8) if response_mask[b, t] > 0)
++        token_level_rewards[b, last_action] = 1.0
++    gamma = 1.0
++
++    _, returns = compute_gae_advantage_return(token_level_rewards, values, response_mask, gamma, lam)
++    # advantages are whitened before being returned; returns = raw_advantages + values
++    raw_advantages = returns - values
++
++    expected = _skip_observation_gae_reference(token_level_rewards, values, response_mask, gamma, lam)
++
++    torch.testing.assert_close(raw_advantages * response_mask, expected * response_mask, rtol=0, atol=1e-6)
++
++
++def test_gae_accepts_per_sequence_lambda():
++    """VAPO length-adaptive lambda needs a per-sequence lam; shape must be (bs,).
++
++    A (bs, 1) lambda silently broadcasts to (bs, bs) inside the recursion and
++    raises, so callers must squeeze.
++    """
++    torch.manual_seed(0)
++    batch_size, seq_len = 3, 8
++    response_mask = torch.ones(batch_size, seq_len)
++    values = torch.randn(batch_size, seq_len)
++    token_level_rewards = torch.zeros(batch_size, seq_len)
++    token_level_rewards[:, -1] = 1.0
++
++    lam_per_sequence = torch.tensor([0.9, 0.95, 1.0])
++    _, returns = compute_gae_advantage_return(
++        token_level_rewards, values, response_mask, torch.tensor(1.0), lam_per_sequence
++    )
++    raw_advantages = returns - values
++
++    for row, lam in enumerate(lam_per_sequence.tolist()):
++        _, row_returns = compute_gae_advantage_return(
++            token_level_rewards[row : row + 1],
++            values[row : row + 1],
++            response_mask[row : row + 1],
++            1.0,
++            lam,
++        )
++        torch.testing.assert_close(
++            raw_advantages[row], (row_returns - values[row : row + 1])[0], rtol=0, atol=1e-6
++        )
++
++    with pytest.raises(RuntimeError):
++        compute_gae_advantage_return(
++            token_level_rewards, values, response_mask, torch.tensor(1.0), lam_per_sequence.view(-1, 1)
++        )
++
++
++def _gae_fixture(seed=0, batch_size=3, seq_len=10):
++    """A multi-turn batch: rows differ in how many tokens the model actually generated."""
++    torch.manual_seed(seed)
++    response_mask = torch.ones(batch_size, seq_len)
++    response_mask[0, 4:6] = 0.0  # observation tokens mid-trajectory
++    response_mask[1, -4:] = 0.0  # padding tail -> a shorter sequence
++    values = torch.randn(batch_size, seq_len)
++    token_level_rewards = torch.zeros(batch_size, seq_len)
++    for b in range(batch_size):
++        token_level_rewards[b, max(t for t in range(seq_len) if response_mask[b, t] > 0)] = 1.0
++    return token_level_rewards, values, response_mask
++
++
++def test_length_adaptive_lam_matches_vapo_formula():
++    """lam = 1 - 1/(alpha*l) over GENERATED tokens, giving a length-invariant horizon."""
++    _, _, response_mask = _gae_fixture()
++    alpha = 1.5
++
++    lam = compute_length_adaptive_lam(response_mask, alpha)
++    lengths = response_mask.sum(-1)
++
++    assert lam.shape == (response_mask.shape[0],)
++    torch.testing.assert_close(lam, 1.0 - 1.0 / (alpha * lengths), rtol=0, atol=1e-6)
++    # rows have different generated-token counts, so the lambdas must differ
++    assert lengths[0] != lengths[1] and lam[0] != lam[1]
++
++    with pytest.raises(ValueError):
++        compute_length_adaptive_lam(response_mask, 0.0)
++
++
++def test_length_adaptive_lam_gives_a_length_invariant_horizon():
++    """lam**l -> exp(-1/alpha) as l grows: the effective horizon tracks the trajectory.
++
++    This is the property that motivates the formula, and it is asymptotic in l -- at a
++    handful of tokens the discrete decay is still visibly off, so assert it at the
++    sequence lengths agentic RL actually runs at.
++    """
++    alpha = 1.5
++    lengths = torch.tensor([64, 512, 4096, 131072], dtype=torch.float64)
++    # one row per length, fully generated
++    response_mask = torch.zeros(len(lengths), int(lengths.max()), dtype=torch.float64)
++    for row, length in enumerate(lengths.tolist()):
++        response_mask[row, : int(length)] = 1.0
++
++    lam = compute_length_adaptive_lam(response_mask, alpha).to(torch.float64)
++    horizon = lam**lengths
++
++    torch.testing.assert_close(
++        horizon, torch.full_like(horizon, float(np.exp(-1 / alpha))), rtol=0, atol=3e-3
++    )
++    # The discrete-decay error shrinks with length...
++    err = (horizon - np.exp(-1 / alpha)).abs()
++    assert err[2] < err[0]
++    # ...until float32 becomes the limit rather than the math: at l=131072 lambda is
++    # 1 - 5.1e-6, and float32 spacing near 1.0 is 6e-8, so only ~2 significant digits
++    # of that offset survive. The horizon is still within 3e-3, which is far tighter
++    # than anything GAE is sensitive to, but do not expect monotone convergence here.
++    assert err[3] < 3e-3
++
++
++def test_lam_critic_decouples_returns_from_advantages():
++    """lam_critic drives the returns only; lam still drives the advantages."""
++    token_level_rewards, values, response_mask = _gae_fixture()
++    gamma, lam_policy, lam_critic = 1.0, 0.5, 1.0
++
++    adv, ret = compute_gae_advantage_return(
++        token_level_rewards, values, response_mask, gamma, lam_policy,
++        lam_critic=lam_critic, whiten_advantages=False,
++    )
++
++    adv_policy_only, _ = compute_gae_advantage_return(
++        token_level_rewards, values, response_mask, gamma, lam_policy, whiten_advantages=False
++    )
++    _, ret_critic_only = compute_gae_advantage_return(
++        token_level_rewards, values, response_mask, gamma, lam_critic, whiten_advantages=False
++    )
++
++    torch.testing.assert_close(adv, adv_policy_only, rtol=0, atol=1e-6)
++    torch.testing.assert_close(ret, ret_critic_only, rtol=0, atol=1e-6)
++    # and the two lambdas really do disagree, so the test is not vacuous
++    assert not torch.allclose(ret - values, adv, atol=1e-3)
++
++    # gamma=1 with a single terminal reward makes the lam_critic=1 target the plain
++    # Monte-Carlo return, i.e. the reward itself on every generated token.
++    torch.testing.assert_close(
++        (ret * response_mask), (torch.ones_like(ret) * response_mask), rtol=0, atol=1e-5
++    )
++
++
++def test_lam_critic_none_preserves_legacy_coupling():
++    """Defaults must reproduce verl's historical GAE exactly."""
++    token_level_rewards, values, response_mask = _gae_fixture(seed=3)
++    adv, ret = compute_gae_advantage_return(token_level_rewards, values, response_mask, 1.0, 0.95)
++
++    raw = ret - values
++    torch.testing.assert_close(adv, masked_whiten(raw, response_mask), rtol=0, atol=1e-6)
++
++
++def test_gae_whiten_advantages_toggle():
++    """whiten_advantages only affects advantages, never the critic's target."""
++    token_level_rewards, values, response_mask = _gae_fixture(seed=4)
++
++    adv_w, ret_w = compute_gae_advantage_return(
++        token_level_rewards, values, response_mask, 1.0, 0.95, whiten_advantages=True
++    )
++    adv_raw, ret_raw = compute_gae_advantage_return(
++        token_level_rewards, values, response_mask, 1.0, 0.95, whiten_advantages=False
++    )
++
++    torch.testing.assert_close(ret_w, ret_raw, rtol=0, atol=1e-6)
++    torch.testing.assert_close(adv_w, masked_whiten(adv_raw, response_mask), rtol=0, atol=1e-6)
++    assert not torch.allclose(adv_w, adv_raw, atol=1e-3)
++
++
++def test_compute_advantage_wires_the_sao_gae_config():
++    """The AlgoConfig fields must actually reach the estimator, not just exist."""
++    token_level_rewards, values, response_mask = _gae_fixture(seed=5)
++    data = DataProto.from_dict(
++        tensors={
++            "token_level_rewards": token_level_rewards,
++            "values": values,
++            "response_mask": response_mask,
++        }
++    )
++    config = AlgoConfig(
++        adv_estimator="gae",
++        gamma=1.0,
++        lam=1.0,
++        lam_critic=1.0,
++        length_adaptive_lam_alpha=1.5,
++        gae_whiten_advantages=False,
++    )
++
++    out = compute_advantage(data, AdvantageEstimator.GAE, gamma=1.0, lam=1.0, config=config)
++
++    expected_adv, expected_ret = compute_gae_advantage_return(
++        token_level_rewards,
++        values,
++        response_mask,
++        1.0,
++        compute_length_adaptive_lam(response_mask, 1.5),
++        lam_critic=1.0,
++        whiten_advantages=False,
++    )
++    torch.testing.assert_close(out.batch["advantages"], expected_adv, rtol=0, atol=1e-6)
++    torch.testing.assert_close(out.batch["returns"], expected_ret, rtol=0, atol=1e-6)
++
++    # the passed-in lam=1.0 must have been overridden by the length-adaptive one
++    plain_adv, _ = compute_gae_advantage_return(
++        token_level_rewards, values, response_mask, 1.0, 1.0, whiten_advantages=False
++    )
++    assert not torch.allclose(out.batch["advantages"], plain_adv, atol=1e-3)
++
++
++def test_compute_advantage_defaults_are_backward_compatible():
++    """A default AlgoConfig must give byte-identical results to the pre-SAO code path."""
++    token_level_rewards, values, response_mask = _gae_fixture(seed=6)
++    data = DataProto.from_dict(
++        tensors={
++            "token_level_rewards": token_level_rewards,
++            "values": values,
++            "response_mask": response_mask,
++        }
++    )
++
++    out = compute_advantage(data, AdvantageEstimator.GAE, gamma=1.0, lam=0.95, config=AlgoConfig())
++
++    legacy_adv, legacy_ret = compute_gae_advantage_return(
++        token_level_rewards, values, response_mask, 1.0, 0.95
++    )
++    torch.testing.assert_close(out.batch["advantages"], legacy_adv, rtol=0, atol=0)
++    torch.testing.assert_close(out.batch["returns"], legacy_ret, rtol=0, atol=0)
+diff --git a/tests/trainer/ppo/test_trajectory_filter_on_cpu.py b/tests/trainer/ppo/test_trajectory_filter_on_cpu.py
+new file mode 100644
+index 00000000..61d05bc3
+--- /dev/null
++++ b/tests/trainer/ppo/test_trajectory_filter_on_cpu.py
+@@ -0,0 +1,132 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Trajectory filter, focusing on rows with no model-generated token.
++
++Such a row contributes no gradient to any loss (every loss is masked by
++response_mask) but it does break the rollout-correction path, which raises on an
++all-masked micro-batch instead of tolerating it.
++"""
++
++import numpy as np
++import pytest
++import torch
++
++from verl import DataProto
++from verl.trainer.ppo.trajectory_filter import (
++    FILTER_MASK_KEY,
++    TERMINATION_REASON_KEY,
++    TerminationReason,
++    apply_trajectory_filter,
++    zero_filtered_advantages,
++)
++
++
++class _Cfg(dict):
++    """Stands in for TrajectoryFilterConfig / DictConfig."""
++
++
++def _batch(response_masks, reasons=None):
++    n = len(response_masks)
++    mask = torch.tensor(response_masks, dtype=torch.float32)
++    tensors = {
++        "response_mask": mask,
++        "token_level_rewards": torch.ones_like(mask),
++        "advantages": torch.ones_like(mask),
++        "returns": torch.ones_like(mask),
++    }
++    non_tensors = {"uid": np.array([f"uid{i}" for i in range(n)], dtype=object)}
++    if reasons is not None:
++        non_tensors[TERMINATION_REASON_KEY] = np.array(reasons, dtype=object)
++    return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors)
++
++
++def test_empty_rows_are_flagged_and_neutralized():
++    batch = _batch([[1, 1, 0], [0, 0, 0], [1, 0, 0]], reasons=[TerminationReason.AGENT_COMPLETED] * 3)
++
++    batch, metrics = apply_trajectory_filter(batch, _Cfg(enable=True))
++
++    assert metrics["trajectory_filter/no_response_token_count"] == 1
++    assert metrics["trajectory_filter/invalid_count"] == 1
++    assert list(batch.non_tensor_batch[FILTER_MASK_KEY]) == [False, True, False]
++    # reward neutralized on the empty row only
++    assert batch.batch["token_level_rewards"][1].sum() == 0
++    assert batch.batch["token_level_rewards"][0].sum() > 0
++    # and the uid is made a singleton so it cannot pollute group statistics
++    assert batch.non_tensor_batch["uid"][1] != "uid1"
++
++    batch = zero_filtered_advantages(batch)
++    assert batch.batch["advantages"][1].sum() == 0
++    assert batch.batch["returns"][1].sum() == 0
++    assert batch.batch["advantages"][0].sum() > 0
++
++
++def test_empty_rows_are_caught_even_when_the_filter_is_disabled():
++    """Structural, not a policy choice: an empty row is unusable either way."""
++    for config in (None, _Cfg(enable=False)):
++        batch = _batch([[1, 1, 0], [0, 0, 0]])
++        batch, metrics = apply_trajectory_filter(batch, config)
++
++        assert metrics["trajectory_filter/no_response_token_count"] == 1
++        assert list(batch.non_tensor_batch[FILTER_MASK_KEY]) == [False, True]
++        assert batch.batch["token_level_rewards"][1].sum() == 0
++
++
++def test_disabled_filter_stays_a_no_op_without_empty_rows():
++    batch = _batch([[1, 1, 0], [1, 0, 0]])
++    batch, metrics = apply_trajectory_filter(batch, _Cfg(enable=False))
++
++    assert metrics == {}
++    assert FILTER_MASK_KEY not in batch.non_tensor_batch
++    assert batch.batch["token_level_rewards"].sum() > 0
++
++
++def test_empty_rows_union_with_drop_reasons():
++    batch = _batch(
++        [[1, 1, 0], [0, 0, 0], [1, 1, 1]],
++        reasons=[TerminationReason.TIMEOUT, TerminationReason.AGENT_COMPLETED, TerminationReason.OVERLONG],
++    )
++
++    batch, metrics = apply_trajectory_filter(batch, _Cfg(enable=True, drop_reasons=[TerminationReason.TIMEOUT]))
++
++    # row 0 dropped by reason, row 1 by being empty, row 2 kept
++    assert list(batch.non_tensor_batch[FILTER_MASK_KEY]) == [True, True, False]
++    assert metrics["trajectory_filter/invalid_count"] == 2
++    assert metrics["trajectory_filter/no_response_token_count"] == 1
++    # the empty row was agent_completed, so the reason counts must not be perturbed
++    assert metrics[f"trajectory_filter/reason/{TerminationReason.AGENT_COMPLETED}"] == 1
++
++
++def test_missing_response_mask_is_tolerated():
++    batch = DataProto.from_dict(
++        tensors={"token_level_rewards": torch.ones(2, 3)},
++        non_tensors={"uid": np.array(["a", "b"], dtype=object)},
++    )
++    batch, metrics = apply_trajectory_filter(batch, _Cfg(enable=False))
++    assert metrics == {}
++
++
++@pytest.mark.xfail(
++    reason="apply_trajectory_filter neutralizes rows but deliberately preserves batch shapes, "
++    "so an empty row still reaches the loss with an all-zero response_mask. Filtering is the "
++    "semantic half of the fix; tolerating an all-masked micro-batch in the rollout-correction "
++    "path is the other half (see test_dis_tolerates_an_all_masked_micro_batch).",
++    strict=True,
++)
++def test_filtering_alone_does_not_make_the_row_loss_safe():
++    batch = _batch([[0, 0, 0], [0, 0, 0]], reasons=[TerminationReason.AGENT_COMPLETED] * 2)
++    batch, _ = apply_trajectory_filter(batch, _Cfg(enable=True))
++
++    # what a micro-batch made only of these rows would hand to the DIS path
++    assert batch.batch["response_mask"].any(), "row would still trip the all-masked guard"
+diff --git a/tests/trainer/ppo/test_value_loss_normalization_on_cpu.py b/tests/trainer/ppo/test_value_loss_normalization_on_cpu.py
+new file mode 100644
+index 00000000..b7e0defb
+--- /dev/null
++++ b/tests/trainer/ppo/test_value_loss_normalization_on_cpu.py
+@@ -0,0 +1,186 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Pin the critic value-loss normalization contract.
++
++The engines (FSDP/VeOmni ``forward_backward_batch``) backward each micro-batch's
++loss WITHOUT dividing by the micro-batch count, so the loss function itself must
++normalize by the global batch: summing the per-micro-batch losses has to
++reproduce the whole-batch loss. ``ppo_loss`` has always done this through
++``global_batch_info``; ``value_loss``/``compute_value_loss`` historically did
++not — the critic loss was the sum of per-micro-batch token-means, so its value
++and gradient scaled with the number of (packed) micro-batches. With a fixed
++``grad_clip``, a smaller critic packing budget therefore silently divided the
++critic's effective learning rate (measured ~6x between the 200000- and
++25000-token budgets on the 3-node SAO runs).
++
++These tests make partition invariance a contract:
++
++* the sum of ``compute_value_loss`` over ANY partition of a batch into
++  micro-batches equals the whole-batch loss — value and gradient — once
++  ``batch_num_tokens`` is passed;
++* without ``batch_num_tokens`` the old per-micro-batch normalization is
++  preserved bit-for-bit (and is demonstrably partition-dependent, which is the
++  bug this file exists to prevent from returning);
++* ``dp_size`` scales the loss linearly, compensating the mean-reduce of
++  data-parallel gradient synchronization.
++
++These tests pin ``token-mean`` only. ``seq-mean-token-sum-norm`` is still
++partition-dependent unless ``loss_scale_factor`` is passed through; CriticConfig
++does not expose that field, and no in-tree critic config uses that mode.
++"""
++
++import pytest
++import torch
++
++from verl.trainer.ppo.core_algos import compute_value_loss
++
++CLIPRANGE_VALUE = 0.5
++
++
++def _make_batch(seed=0, bsz=12, max_len=64, dtype=torch.float64):
++    """Variable-length masked batch; `values` offset so the clip branch engages."""
++    g = torch.Generator().manual_seed(seed)
++    lengths = torch.randint(2, max_len + 1, (bsz,), generator=g)
++    mask = torch.zeros(bsz, max_len, dtype=torch.bool)
++    for i, length in enumerate(lengths):
++        mask[i, :length] = True
++    vpreds = torch.randn(bsz, max_len, generator=g, dtype=dtype)
++    returns = torch.randn(bsz, max_len, generator=g, dtype=dtype)
++    # |vpreds - values| > cliprange_value on a decent fraction of tokens, so both
++    # branches of the clipped loss are exercised.
++    values = vpreds + 0.8 * torch.randn(bsz, max_len, generator=g, dtype=dtype)
++    return vpreds, returns, values, mask
++
++
++# Partitions of the 12 sequences into "micro-batches": the whole batch at once,
++# one sequence per micro-batch (static micro_bsz=1), balanced packs, and
++# unbalanced packs (the dynamic-packing shapes).
++PARTITIONS = {
++    "one-pack": [list(range(12))],
++    "micro-bsz-1": [[i] for i in range(12)],
++    "balanced-packs": [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]],
++    "unbalanced-packs": [[0], [1, 2, 3, 4, 5], [6], [7, 8, 9, 10, 11]],
++}
++
++
++def _loss_of_rows(vpreds, returns, values, mask, rows, **kwargs):
++    loss, _ = compute_value_loss(
++        vpreds=vpreds[rows],
++        returns=returns[rows],
++        values=values[rows],
++        response_mask=mask[rows],
++        cliprange_value=CLIPRANGE_VALUE,
++        loss_agg_mode="token-mean",
++        **kwargs,
++    )
++    return loss
++
++
++@pytest.mark.parametrize("partition_name", PARTITIONS.keys())
++def test_partition_invariance_with_global_normalization(partition_name):
++    """Sum over any micro-batch partition == whole-batch loss, value and grad."""
++    vpreds, returns, values, mask = _make_batch()
++    vpreds.requires_grad_(True)
++    batch_num_tokens = int(mask.sum().item())
++
++    loss_ref = _loss_of_rows(vpreds, returns, values, mask, list(range(12)), batch_num_tokens=batch_num_tokens)
++    (grad_ref,) = torch.autograd.grad(loss_ref, vpreds, retain_graph=False)
++
++    parts = [
++        _loss_of_rows(vpreds, returns, values, mask, rows, batch_num_tokens=batch_num_tokens)
++        for rows in PARTITIONS[partition_name]
++    ]
++    loss_sum = torch.stack(parts).sum()
++    torch.testing.assert_close(loss_sum, loss_ref.detach(), rtol=1e-9, atol=1e-12)
++
++    (grad_sum,) = torch.autograd.grad(loss_sum, vpreds)
++    torch.testing.assert_close(grad_sum, grad_ref, rtol=1e-9, atol=1e-12)
++
++
++def test_partition_dependent_without_global_normalization():
++    """Document the bug: per-micro-batch token-means SUM to ~n_parts x the mean.
++
++    This is the pre-fix behavior (batch_num_tokens=None). It is why the critic's
++    gradient scaled with the number of packs: a 25000-token budget producing ~10
++    packs trained with ~10x the gradient of a budget producing 1 pack.
++    """
++    vpreds, returns, values, mask = _make_batch()
++    batch_num_tokens = int(mask.sum().item())
++
++    loss_ref = _loss_of_rows(vpreds, returns, values, mask, list(range(12)), batch_num_tokens=batch_num_tokens).detach()
++
++    partition = PARTITIONS["balanced-packs"]
++    loss_sum = torch.stack([_loss_of_rows(vpreds, returns, values, mask, rows) for rows in partition]).sum()
++
++    # Squared-error losses are positive, so each pack's token-mean is O(loss_ref)
++    # and the sum inflates roughly with the pack count.
++    assert loss_sum > 1.5 * loss_ref
++    assert not torch.isclose(loss_sum, loss_ref, rtol=0.05)
++
++
++def test_defaults_preserve_legacy_per_micro_batch_behavior():
++    """No new kwargs -> bit-for-bit the old formula (masked token-mean, x0.5)."""
++    vpreds, returns, values, mask = _make_batch()
++    rows = [1, 4, 7]
++
++    loss, clipfrac = compute_value_loss(
++        vpreds=vpreds[rows],
++        returns=returns[rows],
++        values=values[rows],
++        response_mask=mask[rows],
++        cliprange_value=CLIPRANGE_VALUE,
++        loss_agg_mode="token-mean",
++    )
++
++    vp, rt, vl, mk = vpreds[rows], returns[rows], values[rows], mask[rows]
++    clipped = torch.clamp(vp, vl - CLIPRANGE_VALUE, vl + CLIPRANGE_VALUE)
++    losses1 = (vp - rt) ** 2
++    losses2 = (clipped - rt) ** 2
++    expected = 0.5 * (torch.max(losses1, losses2) * mk).sum() / mk.sum()
++    torch.testing.assert_close(loss, expected, rtol=1e-12, atol=1e-14)
++
++    expected_clipfrac = ((losses2 > losses1).double() * mk).sum() / mk.sum()
++    torch.testing.assert_close(clipfrac.double(), expected_clipfrac, rtol=1e-6, atol=1e-8)
++
++
++def test_dp_size_scales_linearly():
++    """dp_size multiplies the loss by dp_size (compensates DP grad mean-reduce)."""
++    vpreds, returns, values, mask = _make_batch()
++    batch_num_tokens = int(mask.sum().item())
++    rows = list(range(12))
++
++    loss_dp1 = _loss_of_rows(vpreds, returns, values, mask, rows, batch_num_tokens=batch_num_tokens, dp_size=1)
++    loss_dp4 = _loss_of_rows(vpreds, returns, values, mask, rows, batch_num_tokens=batch_num_tokens, dp_size=4)
++    torch.testing.assert_close(loss_dp4, 4.0 * loss_dp1, rtol=1e-12, atol=1e-14)
++
++
++def test_clipfrac_independent_of_normalization():
++    """vf_clipfrac is a masked mean; the normalization kwargs must not touch it."""
++    vpreds, returns, values, mask = _make_batch()
++    rows = [0, 2, 5, 9]
++
++    def clipfrac(**kwargs):
++        _, cf = compute_value_loss(
++            vpreds=vpreds[rows],
++            returns=returns[rows],
++            values=values[rows],
++            response_mask=mask[rows],
++            cliprange_value=CLIPRANGE_VALUE,
++            loss_agg_mode="token-mean",
++            **kwargs,
++        )
++        return cf
++
++    torch.testing.assert_close(clipfrac(), clipfrac(batch_num_tokens=int(mask.sum().item()), dp_size=2))
+diff --git a/tests/workers/test_param_freezing_on_cpu.py b/tests/workers/test_param_freezing_on_cpu.py
+new file mode 100644
+index 00000000..a4f4718a
+--- /dev/null
++++ b/tests/workers/test_param_freezing_on_cpu.py
+@@ -0,0 +1,162 @@
++# Copyright 2025 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests for engine-level parameter freezing.
++
++Used by SAO's frozen-attention value model (https://arxiv.org/abs/2607.07508 section
++3.2): the critic trains its MoE/MLP projections while the attention modules stay at
++their pretrained values, which keeps critic gradient norms from blowing up. The
++algorithm-side SAO pieces are covered in tests/trainer/ppo/test_sao_on_cpu.py.
++"""
++
++import pytest
++import torch
++import torch.nn as nn
++
++from verl.workers.engine.utils import apply_param_freezing
++
++
++class _ToyDecoderLayer(nn.Module):
++    """Mimics the parameter naming of a Qwen-style MoE decoder layer."""
++
++    def __init__(self, dim=8, num_experts=2):
++        super().__init__()
++        self.self_attn = nn.ModuleDict(
++            {
++                "q_proj": nn.Linear(dim, dim, bias=False),
++                "k_proj": nn.Linear(dim, dim, bias=False),
++                "v_proj": nn.Linear(dim, dim, bias=False),
++                "o_proj": nn.Linear(dim, dim, bias=False),
++            }
++        )
++        self.mlp = nn.ModuleDict(
++            {
++                "gate": nn.Linear(dim, num_experts, bias=False),
++                "experts": nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_experts)]),
++            }
++        )
++        self.input_layernorm = nn.LayerNorm(dim)
++
++
++class _ToyModel(nn.Module):
++    def __init__(self, num_layers=3, dim=8):
++        super().__init__()
++        self.embed_tokens = nn.Embedding(16, dim)
++        self.layers = nn.ModuleList([_ToyDecoderLayer(dim) for _ in range(num_layers)])
++        self.score = nn.Linear(dim, 1, bias=False)  # value head
++
++    def forward(self, ids):
++        # every parameter must participate, otherwise "no gradient" below would be
++        # testing the fixture rather than the freezing
++        h = self.embed_tokens(ids)
++        for layer in self.layers:
++            attn = layer.self_attn
++            normed = layer.input_layernorm(h)
++            h = h + attn["o_proj"](attn["v_proj"](attn["k_proj"](attn["q_proj"](normed))))
++            weights = layer.mlp["gate"](h).softmax(dim=-1)
++            h = h + sum(
++                weights[..., i : i + 1] * expert(h) for i, expert in enumerate(layer.mlp["experts"])
++            )
++        return self.score(h)
++
++
++def _names(model, requires_grad):
++    return {n for n, p in model.named_parameters() if p.requires_grad is requires_grad}
++
++
++def test_disabled_by_default():
++    model = _ToyModel()
++    for patterns in (None, []):
++        assert apply_param_freezing(model, patterns) is None
++        assert _names(model, False) == set()
++
++
++def test_freezes_only_matching_parameters():
++    model = _ToyModel()
++
++    summary = apply_param_freezing(model, ["self_attn."])
++
++    frozen, trainable = _names(model, False), _names(model, True)
++    assert frozen and all(".self_attn." in n for n in frozen)
++    assert not any(".self_attn." in n for n in trainable)
++    # the MoE side, the value head and the embeddings must survive -- that is the
++    # entire point of frozen-attention critic training
++    assert {"score.weight", "embed_tokens.weight"} <= trainable
++    assert any(".mlp.experts." in n for n in trainable)
++
++    # 3 layers x 4 attention projections
++    assert summary["frozen_tensors"] == 12
++    assert summary["matched_by_pattern"] == {"self_attn.": 12}
++    assert summary["frozen_params"] + summary["trainable_params"] == sum(p.numel() for p in model.parameters())
++
++
++def test_multiple_patterns_are_unioned():
++    model = _ToyModel()
++
++    summary = apply_param_freezing(model, ["self_attn.", "input_layernorm"])
++
++    assert summary["matched_by_pattern"] == {"self_attn.": 12, "input_layernorm": 6}
++    assert all(".self_attn." in n or "input_layernorm" in n for n in _names(model, False))
++
++
++def test_unmatched_pattern_raises():
++    """A typo must not silently train the module you meant to freeze."""
++    model = _ToyModel()
++
++    with pytest.raises(ValueError, match="matched no parameter"):
++        apply_param_freezing(model, ["self_attn.", "attention."])
++
++    # and nothing may be left half-applied in a way that hides the error
++    with pytest.raises(ValueError, match="matched no parameter"):
++        apply_param_freezing(_ToyModel(), ["nonexistent"])
++
++
++def test_freezing_everything_raises():
++    model = _ToyModel()
++    with pytest.raises(ValueError, match="nothing left to train"):
++        apply_param_freezing(model, [""])
++
++
++def test_frozen_parameters_get_no_gradient():
++    """End-to-end: backward must leave frozen params with grad None."""
++    model = _ToyModel()
++    apply_param_freezing(model, ["self_attn."])
++
++    model(torch.randint(0, 16, (2, 5))).sum().backward()
++
++    for name, param in model.named_parameters():
++        if ".self_attn." in name:
++            assert param.grad is None, name
++        else:
++            assert param.grad is not None, name
++
++
++def test_optimizer_receives_only_trainable_parameters():
++    """Mirrors what the engines do when they build the optimizer."""
++    model = _ToyModel()
++    apply_param_freezing(model, ["self_attn."])
++
++    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
++
++    optimized = {id(p) for group in optimizer.param_groups for p in group["params"]}
++    for name, param in model.named_parameters():
++        assert (id(param) in optimized) is (".self_attn." not in name), name
++
++    before = {n: p.detach().clone() for n, p in model.named_parameters()}
++    model(torch.randint(0, 16, (2, 5))).sum().backward()
++    optimizer.step()
++
++    for name, param in model.named_parameters():
++        changed = not torch.equal(param.detach(), before[name])
++        assert changed is (".self_attn." not in name), name
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index d2e7779b..5f1b6c46 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -76,6 +76,38 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ DEFAULT_ROUTING_CACHE_SIZE = 10000
+ 
+ 
++def last_model_token_index(response_mask: torch.Tensor) -> torch.Tensor:
++    """Index of the last model-generated token per row; -1 for rows with none.
++
++    Outcome rewards must be written here, NOT at the last attended token.
++
++    In multi-turn agentic rollouts ``response_mask`` is 0 on tool/observation tokens
++    while ``attention_mask`` is 1 on them, and a trajectory almost always ends on an
++    observation rather than on the model's own output. Every advantage estimator masks
++    by ``response_mask``, so a score written at the last attended position is silently
++    invisible: GAE returns collapse to the value function, advantages become whitened
++    value noise, and the policy gradient carries no reward at all. Nothing raises --
++    ``critic/rewards/mean`` keeps reporting the reward because it sums over all token
++    positions unmasked, while ``critic/returns/mean`` sits at float epsilon.
++
++    Measured on the 8B SAO run before this was fixed: 26 of 27 consecutive steps had
++    every reward land outside the mask, i.e. roughly 0.6% of the reward signal
++    survived into the gradient.
++
++    Args:
++        response_mask: (bs, response_length), 1 on model-generated tokens.
++
++    Returns:
++        (bs,) int64 indices, or -1 where the row has no model-generated token. Such
++        rows carry no gradient anyway and are separately neutralised by
++        ``trajectory_filter``.
++    """
++    mask = response_mask.to(torch.bool)
++    # argmax over the reversed mask finds the first 1 from the right.
++    idx = mask.size(-1) - 1 - mask.flip(-1).to(torch.int64).argmax(dim=-1)
++    return torch.where(mask.any(dim=-1), idx, torch.full_like(idx, -1))
++
++
+ class AgentLoopMetrics(BaseModel):
+     """Agent loop performance metrics.
+ 
+@@ -135,11 +167,15 @@ class AgentLoopOutput(BaseModel):
+         if routed_experts is not None:
+             output["routed_experts"] = torch.tensor(routed_experts, dtype=torch.int64)
+ 
+-        # rm_scores: reward score for each token
++        # rm_scores: reward score for each token. It MUST land on a token where
++        # response_mask is 1 -- see last_model_token_index() for why.
+         reward_score = output.pop("reward_score", None)
+         if reward_score is not None:
+-            rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
+-            rm_scores[-1] = reward_score
++            response_mask = output["response_mask"]
++            rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
++            idx = last_model_token_index(response_mask.unsqueeze(0))[0]
++            if idx >= 0:
++                rm_scores[idx] = reward_score
+             output["rm_scores"] = rm_scores
+ 
+         teacher_ids, teacher_logprobs = (
+@@ -561,6 +597,10 @@ class AgentLoopWorker:
+             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
+                 apply_greedy_sampling_params(sample_sampling_params)
+             kwargs["global_steps"] = batch.meta_info.get("global_steps", 0)
++            # Thread the train/val flag through so concrete agent loops can apply
++            # validation-specific settings (e.g. harbor retries / pod-startup / agent
++            # timeout). Forwarded the same way as global_steps above.
++            kwargs["validate"] = validate
+             tasks.append(
+                 asyncio.create_task(
+                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+@@ -606,6 +646,10 @@ class AgentLoopWorker:
+                 tools=ToolListWrap(self.tools),
+             )
+             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
++            # ``validate`` was injected into kwargs so concrete agent loops can pick
++            # val-specific settings; drop it before forwarding to postprocess, which
++            # already takes ``validate`` as a positional arg (else: duplicate kwarg).
++            kwargs.pop("validate", None)
+             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+ 
+     def _pad_token_ids(
+@@ -972,10 +1016,16 @@ class AgentLoopWorker:
+ 
+         scores = [input.reward_score for input in inputs]
+         if all(score is not None for score in scores):
+-            prompt_length = prompt_ids.size(1)
+-            response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
++            # The score must land on a token where response_mask is 1. It used to be
++            # written at `attention_mask[:, prompt_length:].sum(dim=1) - 1`, the last
++            # ATTENDED token -- which in multi-turn agentic rollouts is almost always a
++            # tool observation, i.e. response_mask == 0 there. See
++            # last_model_token_index() for what that silently costs.
++            idx = last_model_token_index(response_mask)
++            valid = idx >= 0
+             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+-            rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
++            score_tensor = torch.tensor(scores, dtype=torch.float32)
++            rm_scores[torch.arange(response_mask.size(0))[valid], idx[valid]] = score_tensor[valid]
+             batch["rm_scores"] = rm_scores
+ 
+         non_tensor_batch = {
+@@ -1146,6 +1196,28 @@ class AgentLoopManager:
+         timing = self._performance_metrics(metrics, output)
+ 
+         output.meta_info = {"timing": timing, **outputs[0].meta_info}
++
++        # Drop accounting: how many samples produced no usable trajectory (dropped /
++        # env_setup_failed) vs completed. Surfaces silent drops — notably validation,
++        # where the whole set is dispatched in one generate_sequences call.
++        try:
++            _reasons = output.non_tensor_batch.get("termination_reason")
++            if _reasons is not None:
++                from collections import Counter
++
++                _rc = Counter(str(r) for r in _reasons)
++                _dropped = _rc.get("env_setup_failed", 0)
++                _total = len(_reasons)
++                logger.info(
++                    "[agent_loop] generate_sequences: dispatched=%d completed=%d dropped=%d reasons=%s",
++                    _total,
++                    _total - _dropped,
++                    _dropped,
++                    dict(_rc),
++                )
++        except Exception as _e:
++            logger.warning("drop accounting failed: %s", _e)
++
+         return output
+ 
+     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
+diff --git a/verl/experimental/fully_async_policy/fully_async_trainer.py b/verl/experimental/fully_async_policy/fully_async_trainer.py
+index 5d5f4ebf..533401b9 100644
+--- a/verl/experimental/fully_async_policy/fully_async_trainer.py
++++ b/verl/experimental/fully_async_policy/fully_async_trainer.py
+@@ -352,7 +352,19 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
+     def _init_models(self):
+         if self.use_critic:
+             self.critic_wg = self.all_wg[str(Role.Critic)]
+-            self.critic_wg.init_model()
++            # reset(), not init_model(): Role.Critic maps to the unified TrainingWorker,
++            # whose entry point is reset(); init_model() belongs to DetachActorWorker,
++            # which is what the actor and ref below are. Both the sync trainer
++            # (ray_trainer.py) and the separation trainer call reset() here.
++            self.critic_wg.reset()
++            # This override drops the parent's critic-loss assignment, and
++            # TrainingWorker.train_batch asserts loss_fn is not None, so the critic
++            # update would die the first time it ran. Mirrors SeparateRayPPOTrainer.
++            from functools import partial
++
++            from verl.workers.utils.losses import value_loss
++
++            self.critic_wg.set_loss_fn(partial(value_loss, config=self.orig_critic_cfg))
+ 
+         if self.use_reference_policy and not self.ref_in_actor:
+             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
+diff --git a/verl/experimental/separation/ray_trainer.py b/verl/experimental/separation/ray_trainer.py
+index a422d27c..d64034a7 100644
+--- a/verl/experimental/separation/ray_trainer.py
++++ b/verl/experimental/separation/ray_trainer.py
+@@ -150,20 +150,50 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
+             critic_cfg = omega_conf_to_dataclass(self.config.critic)
+ 
+             # convert critic_cfg into TrainingWorkerConfig for the unified model engine worker
+-            from verl.workers.config import FSDPEngineConfig
+             from verl.workers.engine_workers import TrainingWorkerConfig
+ 
+             self.orig_critic_cfg = critic_cfg
+-            if self.orig_critic_cfg.strategy == "fsdp":
+-                engine_config: FSDPEngineConfig = self.orig_critic_cfg.model.fsdp_config
+-                engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+-                engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
+-            else:
+-                raise NotImplementedError(f"Unknown strategy {self.orig_critic_cfg.strategy=}")
++            # Every CriticConfig subclass aliases its backend block to `.engine` in
++            # __post_init__ (fsdp -> .fsdp, veomni -> .veomni, megatron -> .megatron,
++            # torchtitan -> .torchtitan), so this needs no per-strategy branch. The
++            # previous code allowed only strategy=="fsdp" and then read
++            # `critic_cfg.model.fsdp_config`, which HFModelConfig does not have -- a
++            # layout from before the engine refactor. Both halves were dead: every
++            # fully_async_* config in tree is critic-free GRPO, so nothing exercised it.
++            engine_config = self.orig_critic_cfg.engine
++            engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
++            engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
++            # `use_dynamic_bsz` and the micro-batch sizes were historically NOT copied
++            # here, so the critic engine kept EngineConfig's defaults
++            # (use_dynamic_bsz=True, micro_batch_size_per_gpu=None): the critic packed
++            # on every run and `critic.use_dynamic_bsz` was silently inert — the
++            # static branch it pretended to select would even crash on the None micro
++            # size. Mirror the actor wiring in engine_workers.py.
++            if not critic_cfg.use_dynamic_bsz:
++                assert critic_cfg.ppo_micro_batch_size_per_gpu is not None, (
++                    "critic.use_dynamic_bsz=False requires critic.ppo_micro_batch_size_per_gpu. "
++                    "The deprecated global critic.ppo_micro_batch_size is not copied onto the "
++                    "engine; set the per-GPU field (hydra users who only set the global field "
++                    "are already rejected by CriticConfig interpolation / mutual-exclusion)."
++                )
++            engine_config.use_dynamic_bsz = critic_cfg.use_dynamic_bsz
++            engine_config.micro_batch_size_per_gpu = critic_cfg.ppo_micro_batch_size_per_gpu
++            # Static values forward asserts per-rank batch % infer_micro == 0.
++            # That batch is train_bsz * n / dp, which is not guaranteed to be
++            # divisible by the *train* micro size — so do not fall back to it.
++            # Prefer the dedicated infer size, then FSDP's forward_micro (always
++            # present, default 1), then 1 (always divides).
++            infer_micro = critic_cfg.ppo_infer_micro_batch_size_per_gpu
++            if infer_micro is None:
++                infer_micro = getattr(critic_cfg, "forward_micro_batch_size_per_gpu", None)
++            engine_config.infer_micro_batch_size_per_gpu = 1 if infer_micro is None else infer_micro
+ 
+             critic_cfg = TrainingWorkerConfig(
+                 model_type="value_model",
+-                model_config=self.orig_critic_cfg.model_config,
++                # CriticConfig calls it `model` (an HFModelConfig); `model_config` is
++                # the TrainingWorkerConfig side of the same thing. Another leftover
++                # from the pre-engine-refactor layout, on the same dead code path.
++                model_config=self.orig_critic_cfg.model,
+                 engine_config=engine_config,
+                 optimizer_config=self.orig_critic_cfg.optim,
+                 checkpoint_config=self.orig_critic_cfg.checkpoint,
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index f7140974..0863af12 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -809,9 +809,18 @@ algorithm:
+     bypass_mode: false
+     loss_type: ppo_clip
+     rollout_is_batch_normalize: false
++    seq_dist_metrics: true
++  trajectory_filter:
++    enable: false
++    drop_reasons:
++    - timeout
++    - env_setup_failed
+   _target_: verl.trainer.config.AlgoConfig
+   gamma: 1.0
+   lam: 1.0
++  lam_critic: null
++  length_adaptive_lam_alpha: null
++  gae_whiten_advantages: true
+   adv_estimator: gae
+   norm_adv_by_std_in_grpo: true
+   use_kl_in_reward: false
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index b3f91527..d1ee2452 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -742,9 +742,18 @@ algorithm:
+     bypass_mode: false
+     loss_type: ppo_clip
+     rollout_is_batch_normalize: false
++    seq_dist_metrics: true
++  trajectory_filter:
++    enable: false
++    drop_reasons:
++    - timeout
++    - env_setup_failed
+   _target_: verl.trainer.config.AlgoConfig
+   gamma: 1.0
+   lam: 1.0
++  lam_critic: null
++  length_adaptive_lam_alpha: null
++  gae_whiten_advantages: true
+   adv_estimator: gae
+   norm_adv_by_std_in_grpo: true
+   use_kl_in_reward: false
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index ce4879e4..13fc4ee2 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -26,6 +26,7 @@ actor_rollout_ref:
+       override_optimizer_config: null
+     fsdp_config:
+       _target_: verl.workers.config.FSDPEngineConfig
++      freeze_param_patterns: null
+       wrap_policy:
+         min_num_params: 0
+       param_offload: false
+@@ -45,6 +46,9 @@ actor_rollout_ref:
+       forward_only: false
+       strategy: fsdp
+       dtype: bfloat16
++      router_replay:
++        _target_: verl.workers.config.EngineRouterReplayConfig
++        mode: disabled
+       qat:
+         _target_: verl.workers.config.QATEngineConfig
+         enable: false
+@@ -200,6 +204,7 @@ actor_rollout_ref:
+       replay_file: null
+     fsdp_config:
+       _target_: verl.workers.config.FSDPEngineConfig
++      freeze_param_patterns: null
+       wrap_policy:
+         min_num_params: 0
+       param_offload: false
+@@ -219,6 +224,9 @@ actor_rollout_ref:
+       forward_only: true
+       strategy: fsdp
+       dtype: bfloat16
++      router_replay:
++        _target_: verl.workers.config.EngineRouterReplayConfig
++        mode: disabled
+       qat:
+         _target_: verl.workers.config.QATEngineConfig
+         enable: false
+@@ -492,6 +500,7 @@ critic:
+     override_optimizer_config: null
+   fsdp:
+     _target_: verl.workers.config.FSDPEngineConfig
++    freeze_param_patterns: null
+     wrap_policy:
+       min_num_params: 0
+     param_offload: false
+@@ -511,6 +520,9 @@ critic:
+     forward_only: false
+     strategy: fsdp
+     dtype: bfloat16
++    router_replay:
++      _target_: verl.workers.config.EngineRouterReplayConfig
++      mode: disabled
+     qat:
+       _target_: verl.workers.config.QATEngineConfig
+       enable: false
+@@ -762,9 +774,18 @@ algorithm:
+     bypass_mode: false
+     loss_type: ppo_clip
+     rollout_is_batch_normalize: false
++    seq_dist_metrics: true
++  trajectory_filter:
++    enable: false
++    drop_reasons:
++    - timeout
++    - env_setup_failed
+   _target_: verl.trainer.config.AlgoConfig
+   gamma: 1.0
+   lam: 1.0
++  lam_critic: null
++  length_adaptive_lam_alpha: null
++  gae_whiten_advantages: true
+   adv_estimator: gae
+   norm_adv_by_std_in_grpo: true
+   use_kl_in_reward: false
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index bacf0617..588a9151 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -24,6 +24,7 @@ actor_rollout_ref:
+       override_optimizer_config: {}
+     veomni:
+       _target_: verl.workers.config.VeOmniEngineConfig
++      freeze_param_patterns: null
+       param_offload: false
+       optimizer_offload: false
+       fsdp_size: -1
+@@ -194,6 +195,7 @@ actor_rollout_ref:
+       replay_file: null
+     veomni:
+       _target_: verl.workers.config.VeOmniEngineConfig
++      freeze_param_patterns: null
+       param_offload: ${oc.select:actor_rollout_ref.actor.veomni.param_offload,False}
+       optimizer_offload: false
+       fsdp_size: ${oc.select:actor_rollout_ref.actor.veomni.fsdp_size,-1}
+@@ -481,6 +483,7 @@ critic:
+     override_optimizer_config: {}
+   veomni:
+     _target_: verl.workers.config.VeOmniEngineConfig
++    freeze_param_patterns: null
+     param_offload: false
+     optimizer_offload: false
+     fsdp_size: -1
+@@ -747,9 +750,18 @@ algorithm:
+     bypass_mode: false
+     loss_type: ppo_clip
+     rollout_is_batch_normalize: false
++    seq_dist_metrics: true
++  trajectory_filter:
++    enable: false
++    drop_reasons:
++    - timeout
++    - env_setup_failed
+   _target_: verl.trainer.config.AlgoConfig
+   gamma: 1.0
+   lam: 1.0
++  lam_critic: null
++  length_adaptive_lam_alpha: null
++  gae_whiten_advantages: true
+   adv_estimator: gae
+   norm_adv_by_std_in_grpo: true
+   use_kl_in_reward: false
+diff --git a/verl/trainer/config/algorithm.py b/verl/trainer/config/algorithm.py
+index aa867b02..78c2f0a2 100644
+--- a/verl/trainer/config/algorithm.py
++++ b/verl/trainer/config/algorithm.py
+@@ -64,47 +64,25 @@ class FilterGroupsConfig(BaseConfig):
+ 
+ @dataclass
+ class TrajectoryFilterConfig(BaseConfig):
+-    """Mask environment-corrupted trajectories out of the policy loss and group statistics.
++    """Exclude selected trajectory-termination categories from the policy loss and group stats.
+ 
+-    Agentic rollouts can fail for reasons unrelated to policy quality (sandbox/env setup
+-    failure, agent or verifier wall-clock timeout, context-length overflow, response-length
+-    truncation, turn-cap exhaustion). Such trajectories carry a reward that reflects the
+-    environment, not the policy; training on them injects noise into the advantage signal
+-    (especially with GRPO std-normalization, where a spurious 0 inflates sibling advantages).
+-
+-    When enabled, flagged trajectories are excluded from BOTH the policy loss (their
+-    advantages/returns are zeroed) and the GRPO group statistics (their uid is rewritten
+-    to a singleton group), without changing batch shapes. Per-reason counts are logged
+-    under ``trajectory_filter/``.
+-
+-    Flag sources (agent loop ``extra_fields`` propagated into ``non_tensor_batch``):
+-    ``is_env_failure``, ``is_timeout``, ``is_context_error``, ``is_overlong``,
+-    ``trajectory_token_source == "dummy"``, plus trainer-side fallbacks (response length
+-    below ``min_response_tokens``, response filling the whole window, ``__num_turns__``).
++    The agent loop tags every trajectory with exactly ONE mutually-exclusive ``termination_reason``
++    (see ``verl.trainer.ppo.trajectory_filter.TerminationReason``): ``agent_completed``,
++    ``overlong``, ``max_turns_reached``, ``timeout``, ``env_setup_failed``. The filter is a pure
++    policy table: rows whose reason is in ``drop_reasons`` are neutralized (advantages/returns
++    zeroed + uid rewritten to a singleton GRPO group), without changing batch shapes — no tensor
++    re-inference. Per-reason counts are logged under ``trajectory_filter/reason/<reason>``; the
++    dropped total under ``trajectory_filter/invalid_count`` / ``invalid_ratio``.
+ 
+     Args:
+         enable (bool): Master switch. Default False (no behavior change).
+-        filter_env_failures (bool): Drop env-failure/dummy trajectories (env setup failed,
+-            invalid proxy trajectory, response shorter than ``min_response_tokens``).
+-        filter_timeouts (bool): Drop trajectories flagged ``is_timeout`` (agent/verifier
+-            wall-clock timeout).
+-        filter_context_errors (bool): Drop trajectories flagged ``is_context_error``.
+-        filter_overlong (bool): DAPO-style overlong masking — drop trajectories flagged
+-            ``is_overlong`` or whose response fills the whole response window (truncated).
+-        filter_turn_capped (bool): Drop trajectories with ``__num_turns__ >= max_num_turns``.
+-        min_response_tokens (int): Responses with fewer valid tokens are treated as env
+-            failures. 0 disables the length check.
+-        max_num_turns (int): Turn cap used by ``filter_turn_capped``. 0 disables.
++        drop_reasons (list[str]): ``termination_reason`` values to drop. Default
++            ``["timeout", "env_setup_failed"]`` (reward reflects the environment, not the
++            policy); overlong / max_turns_reached are KEPT with their real truncated reward.
+     """
+ 
+     enable: bool = False
+-    filter_env_failures: bool = True
+-    filter_timeouts: bool = True
+-    filter_context_errors: bool = True
+-    filter_overlong: bool = True
+-    filter_turn_capped: bool = False
+-    min_response_tokens: int = 8
+-    max_num_turns: int = 0
++    drop_reasons: list[str] = field(default_factory=lambda: ["timeout", "env_setup_failed"])
+ 
+ 
+ @dataclass
+@@ -208,6 +186,12 @@ class RolloutCorrectionConfig(BaseConfig):
+         config = RolloutCorrectionConfig.bypass_pg_geo_rs_seq_tis()     # REINFORCE + Geo-RS + Seq-TIS
+         config = RolloutCorrectionConfig.bypass_pg_geo_rs_token_tis()   # REINFORCE + Geo-RS + Token-TIS
+ 
++        # SAO's DIS -- bypass + REINFORCE + token IcePop at the paper's trust region.
++        # NOTE: this one must also be written to actor.policy_loss.rollout_correction;
++        # see the Warning on sao_dis().
++        config = RolloutCorrectionConfig.sao_dis()                      # coding agent, "0.2_4.0"
++        config = RolloutCorrectionConfig.sao_dis(task="math")           # TIR / math, "0.7_6.0"
++
+         # Decoupled Geometric ratio presets (length-normalized IS ratio)
+         config = RolloutCorrectionConfig.decoupled_geo_rs_seq_tis()           # Decoupled Geo-RS + Seq-TIS
+         config = RolloutCorrectionConfig.decoupled_geo_rs_token_tis()         # Decoupled Geo-RS + Token-TIS
+@@ -221,6 +205,9 @@ class RolloutCorrectionConfig(BaseConfig):
+         Liu, Li, Fu, Wang, Liu, Shen (2025)
+         "When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch"
+         https://richardli.xyz/rl-collapse
++
++        "Single-Rollout Asynchronous Optimization for Agentic Reinforcement Learning"
++        arXiv 2607.07508 -- the sao_dis() preset, section 3.1
+     """
+ 
+     rollout_is: Optional[str] = "sequence"
+@@ -446,6 +433,66 @@ class RolloutCorrectionConfig(BaseConfig):
+             loss_type="reinforce",
+         )
+ 
++    # Trust regions from the SAO paper, keyed by task family. The stored value is
++    # [1 - eps_low, 1 + eps_high], NOT (eps_low, eps_high) -- see sao_dis().
++    _SAO_TRUST_REGIONS = {
++        "coding": (0.2, 4.0),  # eps_low=0.8, eps_high=3.0
++        "math": (0.7, 6.0),  # eps_low=0.3, eps_high=5.0
++        "tir": (0.7, 6.0),  # alias: the paper's TIR setting is the math one
++    }
++
++    @classmethod
++    def sao_dis(cls, task: str = "coding") -> "RolloutCorrectionConfig":
++        """SAO's DIS: double-sided token-level importance sampling.
++
++        This is the paper's eq. (1)-(3),
++
++            L    = -E_t[ f(r_t; eps_l, eps_h) * A_t * log pi_theta(a_t|s_t) ]   (1)
++            r_t  = pi_theta(a_t|s_t) / pi_rollout(a_t|s_t)                      (2)
++            f(x) = x if 1-eps_l < x < 1+eps_h else 0                            (3)
++
++        which needs no new machinery -- it is exactly bypass_pg_token_icepop():
++        ``bypass_mode`` drops the intractable pi_theta_old so old_log_prob becomes
++        rollout_log_prob, ``rollout_is="token"`` gives r_t, a ``"lower_upper"``
++        threshold selects the IcePop branch that ZEROES out-of-band weights instead
++        of clamping them (that is f, and clamping would not be), and
++        ``loss_type="reinforce"`` gives L.
++
++        What this method adds is the part that is easy to get wrong: the threshold is
++        the TRUST REGION [1-eps_l, 1+eps_h], not the epsilons.
++
++            coding agent: eps_l=0.8, eps_h=3.0 -> "0.2_4.0"   (default)
++            TIR / math:   eps_l=0.3, eps_h=5.0 -> "0.7_6.0"
++
++        Args:
++            task (str): Which trust region to use -- "coding" (default) or "math".
++                "tir" is accepted as an alias for "math".
++
++        Returns:
++            RolloutCorrectionConfig configured for SAO's DIS.
++
++        Warning:
++            Assigning this to ``algorithm.rollout_correction`` is NOT enough to make
++            the actor use it. compute_policy_loss_bypass_mode() reads
++            ``config.policy_loss.rollout_correction``, and PolicyLossConfig declares
++            that field with a ``default_factory``, so it always resolves -- to the
++            DEFAULTS -- and the "not configured" ValueError never fires.
++            apply_bypass_mode() does copy the algorithm block across, but it runs in
++            the trainer process while the loss runs in the actor's worker processes,
++            which froze their config at construction. Set
++            ``actor_rollout_ref.actor.policy_loss.rollout_correction`` as well, or the
++            run silently trains on rollout_is="sequence" / threshold=2.0 /
++            loss_type="ppo_clip" -- i.e. not DIS at all.
++
++        Reference:
++            "Single-Rollout Asynchronous Optimization for Agentic Reinforcement
++            Learning", arXiv 2607.07508, section 3.1.
++        """
++        if task not in cls._SAO_TRUST_REGIONS:
++            raise ValueError(f"Unknown task {task!r}. Expected one of {sorted(cls._SAO_TRUST_REGIONS)}.")
++        lower, upper = cls._SAO_TRUST_REGIONS[task]
++        return cls.bypass_pg_token_icepop(threshold=upper, threshold_lower=lower)
++
+     @classmethod
+     def bypass_pg_geo_rs(
+         cls,
+@@ -675,7 +722,19 @@ class AlgoConfig(BaseConfig):
+ 
+     Args:
+         gamma (float): Discount factor for future rewards.
+-        lam (float): Trade-off between bias and variance in the GAE estimator.
++        lam (float): Trade-off between bias and variance in the GAE estimator. Applied to the
++            advantages; see lam_critic for the critic's own target.
++        lam_critic (Optional[float]): GAE lambda for the returns (the critic's regression
++            target), decoupled from the policy's lam. None keeps the classic coupling
++            returns = advantages + values. VAPO/SAO set lam_critic=1.0 alongside a
++            bootstrapping policy lambda, so the critic regresses the true Monte-Carlo
++            return while the policy still gets variance reduction. GAE only.
++        length_adaptive_lam_alpha (Optional[float]): Enables VAPO's length-adaptive policy
++            lambda, lam = 1 - 1/(alpha * l), computed per sequence over generated tokens
++            and overriding lam. SAO uses alpha=1.5. None disables it. GAE only.
++        gae_whiten_advantages (bool): Whether to batch-whiten GAE advantages. Default True
++            (verl's historical behaviour). Set False for single-rollout/value-based runs,
++            where whitening turns the value-model baseline back into a batch-relative one.
+         adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
+         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
+@@ -704,6 +763,9 @@ class AlgoConfig(BaseConfig):
+ 
+     gamma: float = 1.0
+     lam: float = 1.0
++    lam_critic: Optional[float] = None
++    length_adaptive_lam_alpha: Optional[float] = None
++    gae_whiten_advantages: bool = True
+     adv_estimator: str = "gae"
+     norm_adv_by_std_in_grpo: bool = True
+     use_kl_in_reward: bool = False
+diff --git a/verl/trainer/config/algorithm/trajectory_filter.yaml b/verl/trainer/config/algorithm/trajectory_filter.yaml
+index 8379a226..bfb86b89 100644
+--- a/verl/trainer/config/algorithm/trajectory_filter.yaml
++++ b/verl/trainer/config/algorithm/trajectory_filter.yaml
+@@ -1,30 +1,20 @@
+-# Trajectory filter: mask environment-corrupted trajectories out of the policy loss
++# Trajectory filter: drop selected trajectory-termination categories from the policy loss
+ # and GRPO group statistics. See verl.trainer.config.TrajectoryFilterConfig.
+-# Flagged trajectories get zeroed token_level_rewards/advantages and a singleton uid;
+-# batch shapes are unchanged. Counts logged under trajectory_filter/.
++# Dropped trajectories get zeroed token_level_rewards/advantages and a singleton uid;
++# batch shapes are unchanged. Per-reason counts logged under trajectory_filter/reason/.
+ 
+ # Master switch (default off: no behavior change)
+ enable: false
+ 
+-# Drop env-failure/dummy trajectories (env setup failed, invalid proxy trajectory,
+-# response shorter than min_response_tokens)
+-filter_env_failures: true
+-
+-# Drop trajectories flagged is_timeout (agent/verifier wall-clock timeout)
+-filter_timeouts: true
+-
+-# Drop trajectories flagged is_context_error (context-length overflow)
+-filter_context_errors: true
+-
+-# DAPO-style overlong masking: drop trajectories flagged is_overlong or whose
+-# response fills the entire response window (truncated by max_response_length)
+-filter_overlong: true
+-
+-# Drop trajectories that exhausted the turn cap (__num_turns__ >= max_num_turns)
+-filter_turn_capped: false
+-
+-# Responses with fewer valid tokens are treated as env failures (0 disables)
+-min_response_tokens: 8
+-
+-# Turn cap used by filter_turn_capped (0 disables)
+-max_num_turns: 0
++# The agent loop tags every trajectory with one per-row `termination_reason`; drop the reasons
++# listed here. Valid reasons (verl.trainer.ppo.trajectory_filter.TerminationReason):
++#   agent_completed     - ran to a normal stop; verifier scored it
++#   overlong            - hit a length budget (context window or response window); truncated
++#   max_turns_reached   - exhausted the turn cap
++#   timeout             - agent/verifier wall-clock timeout
++#   env_setup_failed    - sandbox/env produced no usable trajectory (dummy 1-token row)
++# Default drops timeout + env_setup_failed (reward reflects the environment, not the policy);
++# overlong & max_turns_reached are KEPT with their real, truncated verifier reward.
++drop_reasons:
++  - timeout
++  - env_setup_failed
+diff --git a/verl/trainer/config/engine/fsdp.yaml b/verl/trainer/config/engine/fsdp.yaml
+index 17a0b1b4..28d62d15 100644
+--- a/verl/trainer/config/engine/fsdp.yaml
++++ b/verl/trainer/config/engine/fsdp.yaml
+@@ -1,6 +1,12 @@
+ # Target class for this configuration
+ _target_: verl.workers.config.FSDPEngineConfig
+ 
++# Freeze parameters whose name contains any of these substrings (applied before
++# sharding, and excluded from the optimizer). null trains everything. SAO's
++# frozen-attention value model is ["self_attn."] on critic.fsdp. A pattern that
++# matches no parameter raises rather than silently doing nothing.
++freeze_param_patterns: null
++
+ # policy for wrapping the model
+ wrap_policy:
+ 
+diff --git a/verl/trainer/config/engine/veomni.yaml b/verl/trainer/config/engine/veomni.yaml
+index 492b2f50..4273555a 100644
+--- a/verl/trainer/config/engine/veomni.yaml
++++ b/verl/trainer/config/engine/veomni.yaml
+@@ -1,6 +1,12 @@
+ # Target class for this configuration
+ _target_: verl.workers.config.VeOmniEngineConfig
+ 
++# Freeze parameters whose name contains any of these substrings (applied before
++# parallelization, and excluded from the optimizer). null trains everything. SAO's
++# frozen-attention value model is ["self_attn."] on critic.veomni. A pattern that
++# matches no parameter raises rather than silently doing nothing.
++freeze_param_patterns: null
++
+ # Whether to offload model parameters to CPU
+ param_offload: False
+ 
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index 29da0a2c..e641f4c6 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -67,9 +67,21 @@ algorithm:
+   # Discount factor for future rewards
+   gamma: 1.0
+ 
+-  # Trade-off between bias and variance in the GAE estimator
++  # Trade-off between bias and variance in the GAE estimator, applied to the advantages
+   lam: 1.0
+ 
++  # GAE lambda for the returns (the critic's target), decoupled from the policy's lam.
++  # null keeps the classic coupling returns = advantages + values. VAPO/SAO use 1.0.
++  lam_critic: null
++
++  # Enables VAPO length-adaptive policy lambda: lam = 1 - 1/(alpha * generated_tokens),
++  # computed per sequence and overriding lam. SAO uses 1.5; null disables. GAE only.
++  length_adaptive_lam_alpha: null
++
++  # Whether to batch-whiten GAE advantages. Set false for single-rollout/value-based
++  # runs, where whitening turns the value baseline back into a batch-relative one.
++  gae_whiten_advantages: True
++
+   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+   adv_estimator: gae
+ 
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index 5e6a19a1..e01d0447 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -212,6 +212,37 @@ def get_kl_controller(kl_ctrl):
+         raise NotImplementedError
+ 
+ 
++def compute_length_adaptive_lam(response_mask: torch.Tensor, alpha: float) -> torch.Tensor:
++    """VAPO's length-adaptive GAE lambda: ``lam = 1 - 1/(alpha * l)``.
++
++    See VAPO (https://arxiv.org/abs/2504.05118); SAO (https://arxiv.org/abs/2607.07508)
++    reuses it with alpha=1.5.
++
++    The point is that ``lam**l`` is then roughly ``exp(-1/alpha)`` no matter how long
++    the sequence is, i.e. the effective bootstrapping horizon scales with the
++    trajectory instead of being a fixed number of tokens. At verl's default lam=1 the
++    advantage is a pure Monte-Carlo estimate that never bootstraps off the value model
++    at all, which is the high-variance regime single-rollout RL cannot afford.
++
++    ``l`` counts *model-generated* tokens (``response_mask.sum(-1)``), not the padded
++    response width: those are exactly the tokens the skip-observation recursion in
++    :func:`compute_gae_advantage_return` walks, so they are what the decay applies over.
++
++    Args:
++        response_mask: `(torch.Tensor)` shape (bs, response_length), 1 on tokens the
++            policy generated.
++        alpha: length-scaling factor; larger means a longer effective horizon.
++
++    Returns:
++        `(torch.Tensor)` shape (bs,), a per-sequence lambda. The shape matters: a
++        (bs, 1) lambda broadcasts to (bs, bs) inside the GAE recursion and raises.
++    """
++    if alpha <= 0:
++        raise ValueError(f"length_adaptive_lam_alpha must be positive, got {alpha}.")
++    lengths = response_mask.sum(dim=-1).to(torch.float32).clamp(min=1.0)
++    return 1.0 - 1.0 / (alpha * lengths)
++
++
+ @register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
+ def compute_gae_advantage_return(
+     token_level_rewards: torch.Tensor,
+@@ -219,9 +250,18 @@ def compute_gae_advantage_return(
+     response_mask: torch.Tensor,
+     gamma: torch.Tensor,
+     lam: torch.Tensor,
++    lam_critic: Optional[torch.Tensor] = None,
++    whiten_advantages: bool = True,
+ ):
+     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
+ 
++    The recursion skips environment-feedback tokens: where ``response_mask == 0``
++    neither the bootstrapped value nor the running GAE term advances, so every
++    temporal difference is taken between two model-generated tokens and never across
++    an action/observation boundary. That is the "skip-observation GAE" of SAO
++    (https://arxiv.org/abs/2607.07508) eq. (4)-(5), and it is what makes this
++    estimator usable on multi-turn agent trajectories.
++
+     Args:
+         token_level_rewards: `(torch.Tensor)`
+             shape is (bs, response_length)
+@@ -231,8 +271,22 @@ def compute_gae_advantage_return(
+             shape is (bs, response_length). [EOS] mask. The token after [EOS] have mask zero.
+         gamma is `(float)`
+             discounted factor used in RL
+-        lam: `(float)`
+-            lambda value when computing Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
++        lam: `(float)` or `(torch.Tensor)` of shape (bs,)
++            lambda value when computing Generalized Advantage Estimation
++            (https://arxiv.org/abs/1506.02438), applied to the *advantages*. A
++            per-sequence tensor gives VAPO-style length-adaptive lambda; see
++            :func:`compute_length_adaptive_lam`.
++        lam_critic: `(float)` or `(torch.Tensor)` of shape (bs,), optional
++            Separate lambda for the *returns*, i.e. the critic's regression target.
++            None (default) keeps the classic coupling ``returns = advantages + values``
++            in which one lambda drives both. VAPO/SAO instead pair a bootstrapping
++            lam_policy with lam_critic=1 so the critic regresses the actual
++            Monte-Carlo return while the policy still gets the variance reduction.
++            Costs one extra O(response_length) no-grad pass.
++        whiten_advantages: `(bool)`
++            Whether to batch-whiten the advantages (verl's historical behaviour).
++            Worth turning off for single-rollout runs, where whitening quietly turns a
++            value-model baseline back into a batch-relative one. Never touches returns.
+ 
+     Returns:
+         advantages: `(torch.Tensor)`
+@@ -241,7 +295,8 @@ def compute_gae_advantage_return(
+             shape: (bs, response_length)
+ 
+     """
+-    with torch.no_grad():
++
++    def _gae(lam_):
+         nextvalues = 0
+         lastgaelam = 0
+         advantages_reversed = []
+@@ -249,17 +304,21 @@ def compute_gae_advantage_return(
+ 
+         for t in reversed(range(gen_len)):
+             delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
+-            lastgaelam_ = delta + gamma * lam * lastgaelam
++            lastgaelam_ = delta + gamma * lam_ * lastgaelam
+ 
+             # skip values and TD-error on observation tokens
+             nextvalues = values[:, t] * response_mask[:, t] + (1 - response_mask[:, t]) * nextvalues
+             lastgaelam = lastgaelam_ * response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
+ 
+             advantages_reversed.append(lastgaelam)
+-        advantages = torch.stack(advantages_reversed[::-1], dim=1)
++        return torch.stack(advantages_reversed[::-1], dim=1)
+ 
+-        returns = advantages + values
+-        advantages = verl_F.masked_whiten(advantages, response_mask)
++    with torch.no_grad():
++        advantages = _gae(lam)
++        # returns must be built from the RAW advantages, before any whitening
++        returns = (advantages if lam_critic is None else _gae(lam_critic)) + values
++        if whiten_advantages:
++            advantages = verl_F.masked_whiten(advantages, response_mask)
+     return advantages, returns
+ 
+ 
+@@ -2088,6 +2147,10 @@ def compute_value_loss(
+     response_mask: torch.Tensor,
+     cliprange_value: float,
+     loss_agg_mode: str = "token-mean",
++    dp_size: int = 1,
++    batch_num_tokens: Optional[int] = None,
++    global_batch_size: Optional[int] = None,
++    loss_scale_factor: Optional[int] = None,
+ ):
+     """
+     Compute the clipped value-function loss for PPO.
+@@ -2107,6 +2170,14 @@ def compute_value_loss(
+             Clip range for value prediction updates.
+         loss_agg_mode (str, optional):
+             Aggregation mode for `agg_loss`. Defaults to "token-mean".
++        dp_size / batch_num_tokens / global_batch_size / loss_scale_factor:
++            Global-batch normalization, forwarded to `agg_loss` — same contract as
++            the policy loss. When the caller's engine backwards each micro-batch
++            without dividing by the micro-batch count (FSDP/VeOmni
++            `forward_backward_batch`), these MUST be set so that summing the
++            per-micro-batch losses reproduces the global mean; with the defaults
++            the loss is normalized within the micro-batch only, and its gradient
++            scales with the number of micro-batches.
+ 
+     Returns:
+         vf_loss (torch.FloatTensor):
+@@ -2118,7 +2189,15 @@ def compute_value_loss(
+     vf_losses1 = (vpreds - returns) ** 2
+     vf_losses2 = (vpredclipped - returns) ** 2
+     clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+-    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
++    vf_loss = 0.5 * agg_loss(
++        loss_mat=clipped_vf_losses,
++        loss_mask=response_mask,
++        loss_agg_mode=loss_agg_mode,
++        dp_size=dp_size,
++        batch_num_tokens=batch_num_tokens,
++        global_batch_size=global_batch_size,
++        loss_scale_factor=loss_scale_factor,
++    )
+     vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
+     return vf_loss, vf_clipfrac
+ 
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 4f5d45ae..c36bab43 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -215,12 +215,19 @@ def compute_advantage(
+     # prepare response group
+     if adv_estimator == AdvantageEstimator.GAE:
+         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
++        response_mask = data.batch["response_mask"]
++        # VAPO/SAO: a per-sequence policy lambda, and a critic lambda decoupled from it.
++        # Both default to off, in which case this is the classic single-lambda GAE.
++        alpha = config.get("length_adaptive_lam_alpha", None) if config is not None else None
++        lam_policy = core_algos.compute_length_adaptive_lam(response_mask, alpha) if alpha is not None else lam
+         advantages, returns = core_algos.compute_gae_advantage_return(
+             token_level_rewards=data.batch["token_level_rewards"],
+             values=data.batch["values"],
+-            response_mask=data.batch["response_mask"],
++            response_mask=response_mask,
+             gamma=gamma,
+-            lam=lam,
++            lam=lam_policy,
++            lam_critic=config.get("lam_critic", None) if config is not None else None,
++            whiten_advantages=config.get("gae_whiten_advantages", True) if config is not None else True,
+         )
+         data.batch["advantages"] = advantages
+         data.batch["returns"] = returns
+diff --git a/verl/trainer/ppo/rollout_corr_helper.py b/verl/trainer/ppo/rollout_corr_helper.py
+index 809c4032..92f74937 100644
+--- a/verl/trainer/ppo/rollout_corr_helper.py
++++ b/verl/trainer/ppo/rollout_corr_helper.py
+@@ -63,6 +63,7 @@ tracking metrics to diagnose and correct off-policy issues.
+ import math
+ from typing import Any, Optional
+ 
++import numpy as np
+ import torch
+ 
+ import verl.utils.torch_functional as verl_F
+@@ -786,6 +787,7 @@ def compute_rollout_correction_and_rejection_mask(
+     rollout_rs: Optional[str] = None,
+     rollout_rs_threshold: Optional[str | float] = None,
+     seq_dist_metrics: bool = False,
++    valid_row_mask: Optional[torch.Tensor] = None,
+ ) -> tuple[Optional[DataProto], torch.Tensor, dict[str, float]]:
+     """Unified interface for computing IS weights and rejection masks.
+ 
+@@ -827,9 +829,55 @@ def compute_rollout_correction_and_rejection_mask(
+                 - Rejection sampling rates
+                 - Policy mismatch metrics (KL, PPL, etc.)
+     """
+-    # Validate input masks
++    # An all-masked micro-batch is degenerate but legitimate: every loss here is masked
++    # by response_mask, so it contributes exactly zero either way, and the standard PPO
++    # path already treats it that way. Raising instead would take down the whole step
++    # for a batch that cannot influence it -- which is reachable in agentic RL, where a
++    # trajectory can end up with no model-generated token at all and dynamic batching
++    # can pack such rows into a micro-batch of their own. Return zero IS weights rather
++    # than aborting; trajectory_filter separately neutralizes the reward and advantage
++    # of those rows.
++    #
++    # >>> The metrics dict must keep the SAME KEYS as the normal path. <<<
++    # Returning {} here used to be the obvious thing and it is a landmine, because
++    # Metric.aggregate_dp requires every dp rank to have accumulated the same number of
++    # values per key (verl/utils/metric/utils.py:139-147). One rank hitting this branch
++    # while its peers do not yields e.g. [2, 1, 2, 2] and kills the step -- from inside
++    # metric aggregation, with no hint that a masked trajectory caused it.
++    #   Seen 2026-08-11 on the 3-node SAO smoke: update_actor ->
++    #   "All Metric instances must have the same number of values for dp aggregation".
++    # It needs use_dynamic_bsz=False and ppo_micro_batch_size_per_gpu=1 to bite, since
++    # that is what puts a filtered trajectory in a micro-batch of its own -- exactly the
++    # veomni 30B configuration, where dynamic packing OOMs and micro_bsz must stay 1.
++    #
++    # So synthesise the key set by running the normal path on one synthetic token with
++    # log_ratio == 0. Values are then neutral by construction (IS weight 1.0, KL 0,
++    # chi2 0, every fraction 0) and, more importantly, the key set is produced by the
++    # real code and cannot drift out of sync with it. The all-ones mask means this
++    # recurses exactly one level.
++    # Caveat, deliberate: those neutral values DO enter the mean over micro-batches, so
++    # a batch with masked rows reports diagnostics very slightly closer to "perfect"
++    # than reality. That is cosmetic -- these metrics are logging only, never the loss.
+     if not response_mask.any():
+-        raise ValueError("response_mask must contain at least one valid token (1).")
++        empty_weights = None
++        if rollout_is is not None and rollout_is_threshold is not None:
++            empty_weights = DataProto.from_dict(
++                tensors={"rollout_is_weights": torch.zeros_like(response_mask, dtype=old_log_prob.dtype)}
++            )
++        neutral_log_prob = torch.zeros((1, 1), dtype=old_log_prob.dtype, device=old_log_prob.device)
++        _, _, neutral_metrics = compute_rollout_correction_and_rejection_mask(
++            old_log_prob=neutral_log_prob,
++            rollout_log_prob=neutral_log_prob,
++            response_mask=torch.ones((1, 1), dtype=response_mask.dtype, device=response_mask.device),
++            rollout_is=rollout_is,
++            rollout_is_threshold=rollout_is_threshold,
++            rollout_is_batch_normalize=rollout_is_batch_normalize,
++            rollout_rs=rollout_rs,
++            rollout_rs_threshold=rollout_rs_threshold,
++            seq_dist_metrics=seq_dist_metrics,
++            valid_row_mask=None,
++        )
++        return empty_weights, response_mask.clone(), neutral_metrics
+     if old_log_prob.shape != rollout_log_prob.shape:
+         raise ValueError(
+             f"old_log_prob shape {old_log_prob.shape} does not match rollout_log_prob shape {rollout_log_prob.shape}."
+@@ -877,6 +925,7 @@ def compute_rollout_correction_and_rejection_mask(
+         rollout_log_prob=rollout_log_prob,
+         response_mask=response_mask,
+         seq_dist=seq_dist_metrics,
++        valid_row_mask=valid_row_mask,
+     )
+     metrics.update(offpolicy_metrics)
+ 
+@@ -910,6 +959,7 @@ def compute_offpolicy_metrics(
+     rollout_log_prob: Optional[torch.Tensor],
+     response_mask: torch.Tensor,
+     seq_dist: bool = False,
++    valid_row_mask: Optional[torch.Tensor] = None,
+ ) -> dict[str, Any]:
+     """Compute off-policy diagnostic metrics (helper function).
+ 
+@@ -944,6 +994,20 @@ def compute_offpolicy_metrics(
+     Returns:
+         Dictionary of off-policy metrics (without prefix)
+     """
++    # Restrict diagnostics to valid rows: drop trajectory-filter-flagged trajectories
++    # (env-failure dummy 1-token rows, timeouts, overlong). Their reward/advantage are
++    # already zeroed by the filter, but their fixed dummy tokens otherwise dominate
++    # training_ppl / log_ppl_diff (a constant exp(~7.84) tail), making the metric track
++    # the env-failure RATE instead of the real rollout<->training gap. IS/RS weights are
++    # computed elsewhere over the full batch and are unaffected.
++    if valid_row_mask is not None:
++        keep = valid_row_mask.to(response_mask.device).bool()
++        if keep.any() and not bool(keep.all()):
++            old_log_prob = old_log_prob[keep]
++            if rollout_log_prob is not None:
++                rollout_log_prob = rollout_log_prob[keep]
++            response_mask = response_mask[keep]
++
+     # Validate that we have at least one valid token
+     assert response_mask.any(), "Expected at least one valid token in response_mask"
+ 
+@@ -1067,6 +1131,18 @@ def compute_rollout_correction_and_add_to_batch(
+     rollout_rs_threshold = rollout_corr_config.get("rollout_rs_threshold", None)
+     seq_dist_metrics = rollout_corr_config.get("seq_dist_metrics", True)
+ 
++    # Exclude trajectory-filter-flagged rows from the OFF-POLICY DIAGNOSTIC metrics only.
++    # apply_trajectory_filter (run earlier in the trainer) stores a per-row invalid mask
++    # under FILTER_MASK_KEY; those env-failure dummy / timeout / overlong rows already have
++    # zero reward+advantage, but their dummy tokens otherwise dominate training_ppl etc.
++    # IS/RS weights below are still computed over the full batch (shape-preserving).
++    from verl.trainer.ppo.trajectory_filter import FILTER_MASK_KEY
++
++    valid_row_mask: Optional[torch.Tensor] = None
++    if FILTER_MASK_KEY in batch.non_tensor_batch:
++        invalid = np.asarray(batch.non_tensor_batch[FILTER_MASK_KEY], dtype=bool)
++        valid_row_mask = torch.from_numpy(~invalid)
++
+     # Compute IS weights and get modified response_mask
+     rollout_is_weights, modified_response_mask, rollout_corr_metrics = compute_rollout_correction_and_rejection_mask(
+         old_log_prob=batch.batch["old_log_probs"],
+@@ -1078,6 +1154,7 @@ def compute_rollout_correction_and_add_to_batch(
+         rollout_rs=rollout_rs,
+         rollout_rs_threshold=rollout_rs_threshold,
+         seq_dist_metrics=seq_dist_metrics,
++        valid_row_mask=valid_row_mask,
+     )
+ 
+     # ALWAYS update response_mask with rejection applied
+diff --git a/verl/trainer/ppo/trajectory_filter.py b/verl/trainer/ppo/trajectory_filter.py
+index 1d4b09e9..ac069121 100644
+--- a/verl/trainer/ppo/trajectory_filter.py
++++ b/verl/trainer/ppo/trajectory_filter.py
+@@ -11,122 +11,166 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-"""Trajectory filter: mask environment-corrupted trajectories out of the loss and group stats.
++"""Trajectory termination taxonomy + filter.
+ 
+-Agentic rollouts can fail for reasons unrelated to policy quality: sandbox/env setup
+-failure (dummy 1-token trajectories), agent or verifier wall-clock timeout, context-length
+-overflow, response-length truncation (DAPO "overlong"), turn-cap exhaustion. Their reward
+-(usually a spurious 0) reflects the environment, not the policy. With GRPO
+-std-normalization a spurious 0 both trains AGAINST the (possibly fine) trajectory and
+-inflates the advantages of its group siblings.
++Single source of truth for how an agentic rollout terminated. The agent loop tags every
++trajectory with exactly ONE mutually-exclusive ``termination_reason`` (``TerminationReason``)
++in ``extra_fields`` -> ``non_tensor_batch[TERMINATION_REASON_KEY]``; downstream consumers
++(this filter, the off-policy diagnostics) only READ it — never re-infer from tensors. One
++classification point keeps the pipeline traceable: a trajectory's fate is decided once, with
++a descriptive name, where the signals actually live.
+ 
+-``apply_trajectory_filter`` neutralizes flagged trajectories without changing batch shapes:
++``apply_trajectory_filter`` is a pure policy table: rows whose reason is in
++``config.drop_reasons`` are neutralized without changing batch shapes:
+ 
+-1. ``token_level_rewards`` of flagged rows are zeroed (no reward signal can leak);
++1. ``token_level_rewards`` of dropped rows are zeroed (no reward signal can leak);
+ 2. their ``uid`` is rewritten to a singleton group, removing them from the GRPO group
+-   statistics of their siblings (singleton groups get mean=0/std=1, so with a zeroed
+-   reward the resulting advantage is exactly 0);
++   statistics of their siblings (singleton group -> mean=0/std=1, so with a zeroed reward
++   the resulting advantage is exactly 0);
+ 3. a boolean row mask is stored in ``non_tensor_batch[FILTER_MASK_KEY]`` so
+-   ``zero_filtered_advantages`` can zero advantages/returns after any advantage
+-   estimator ran (belt-and-braces for non-GRPO estimators).
+-
+-Flags come from the agent loop's ``extra_fields`` (propagated into ``non_tensor_batch``
+-by ``AgentLoopWorker._postprocess``), with trainer-side fallbacks computed from tensors.
++   ``zero_filtered_advantages`` can zero advantages/returns after any advantage estimator
++   ran (belt-and-braces for non-GRPO estimators).
+ 
+ Configured by ``algorithm.trajectory_filter`` (see TrajectoryFilterConfig); disabled by
+-default. Per-reason counts are logged under ``trajectory_filter/``.
++default. Per-reason counts are logged under ``trajectory_filter/reason/<reason>``.
+ """
+ 
++from typing import Optional
++
+ import numpy as np
+ import torch
+ 
+ from verl import DataProto
+ 
+ FILTER_MASK_KEY = "trajectory_filter_mask"
++TERMINATION_REASON_KEY = "termination_reason"
+ 
+ 
+-def _flag_array(batch: DataProto, key: str) -> np.ndarray:
+-    """Read a boolean per-row flag from non_tensor_batch; missing key/None entries -> False."""
+-    n = len(batch)
+-    if key not in batch.non_tensor_batch:
+-        return np.zeros(n, dtype=bool)
+-    return np.array([bool(x) for x in batch.non_tensor_batch[key]], dtype=bool)
++class TerminationReason:
++    """Canonical, mutually-exclusive outcome of one agentic trajectory.
++
++    Set ONCE by the agent loop. ``overlong`` covers both length budgets — the model context
++    window (prompt overflow mid-rollout) and the training response window (response sliced to
++    fit) — because both end with a truncated-but-real trajectory carrying a real verifier reward.
++    """
++
++    AGENT_COMPLETED = "agent_completed"      # ran to a normal stop; verifier scored it
++    OVERLONG = "overlong"                    # hit a length budget (context window or response window); truncated
++    MAX_TURNS_REACHED = "max_turns_reached"  # hit the turn cap
++    TIMEOUT = "timeout"                      # agent / verifier wall-clock timeout
++    ENV_SETUP_FAILED = "env_setup_failed"    # sandbox/env never produced a usable trajectory (dummy 1-token row)
++
+ 
++ALL_TERMINATION_REASONS = (
++    TerminationReason.AGENT_COMPLETED,
++    TerminationReason.OVERLONG,
++    TerminationReason.MAX_TURNS_REACHED,
++    TerminationReason.TIMEOUT,
++    TerminationReason.ENV_SETUP_FAILED,
++)
+ 
+-def _response_token_counts(batch: DataProto) -> torch.Tensor:
+-    """Number of attended tokens in the response window, shape (bs,)."""
+-    response_len = batch.batch["responses"].shape[1]
+-    return batch.batch["attention_mask"][:, -response_len:].sum(dim=-1)
++# Categories whose reward reflects the environment, not the policy -> excluded from training
++# by default. Overlong / max_turns_reached are KEPT (real, if truncated, learning signal).
++DEFAULT_DROP_REASONS = (TerminationReason.TIMEOUT, TerminationReason.ENV_SETUP_FAILED)
++
++
++def _rows_without_response_tokens(batch: DataProto) -> Optional[np.ndarray]:
++    """Rows whose ``response_mask`` has no valid token, i.e. no model-generated token.
++
++    Structurally unusable rather than a termination outcome: every policy loss is
++    masked by ``response_mask``, so such a row contributes no gradient no matter what
++    it is worth. Neutralizing it is therefore mathematically free, and it avoids two
++    real failures — ``compute_rollout_correction_and_rejection_mask`` raises
++    ``"response_mask must contain at least one valid token (1)."`` when a whole
++    micro-batch ends up empty, and any per-row mean over the mask divides by zero.
++
++    Returns None when the batch has no ``response_mask`` to inspect.
++    """
++    response_mask = batch.batch.get("response_mask")
++    if response_mask is None:
++        return None
++    if response_mask.is_nested:
++        counts = torch.tensor([m.sum() for m in response_mask.unbind()])
++    else:
++        counts = response_mask.sum(dim=-1)
++    return (counts == 0).cpu().numpy()
++
++
++def _neutralize(batch: DataProto, invalid: np.ndarray) -> None:
++    """Zero reward + singleton-uid the flagged rows and record them for advantage zeroing."""
++    if not invalid.any():
++        return
++    invalid_t = torch.from_numpy(invalid).to(batch.batch["token_level_rewards"].device)
++    # 1) no reward signal may leak through the singleton group
++    batch.batch["token_level_rewards"][invalid_t] = 0.0
++    # 2) remove from sibling GRPO group statistics via singleton uid
++    if "uid" in batch.non_tensor_batch:
++        uids = batch.non_tensor_batch["uid"]
++        for i in np.nonzero(invalid)[0]:
++            uids[i] = f"{uids[i]}__filtered_{i}"
++    # 3) remember rows for post-advantage zeroing
++    batch.non_tensor_batch[FILTER_MASK_KEY] = invalid
+ 
+ 
+ def apply_trajectory_filter(batch: DataProto, config) -> tuple[DataProto, dict]:
+-    """Flag env-corrupted trajectories and neutralize their reward/group contribution.
++    """Neutralize trajectories whose ``termination_reason`` is in ``config.drop_reasons``.
+ 
+     Must run AFTER ``token_level_rewards`` is set and BEFORE advantage computation.
+ 
+     Args:
+-        batch: training batch with ``responses``, ``attention_mask``,
+-            ``token_level_rewards`` and (for GRPO) ``non_tensor_batch["uid"]``.
++        batch: training batch with ``token_level_rewards``, ``non_tensor_batch["uid"]`` (GRPO),
++            and ``non_tensor_batch[TERMINATION_REASON_KEY]`` (per-row reason set by the agent loop).
+         config: ``algorithm.trajectory_filter`` (TrajectoryFilterConfig / DictConfig / None).
+ 
+     Returns:
+-        (batch, metrics): batch is modified in place; metrics carry per-reason counts.
++        (batch, metrics): batch is modified in place; metrics carry per-reason counts and the
++        dropped total.
+     """
++    # Structural check, deliberately outside the enable switch: a row with no
++    # model-generated token is unusable regardless of policy, and leaving it in
++    # crashes the rollout-correction path. Neutralizing it changes nothing for the
++    # losses, which are all masked by response_mask anyway.
++    empty = _rows_without_response_tokens(batch)
++    empty_count = int(empty.sum()) if empty is not None else 0
++
+     if config is None or not config.get("enable", False):
++        if empty_count:
++            _neutralize(batch, empty)
++            return batch, {"trajectory_filter/no_response_token_count": empty_count}
+         return batch, {}
+ 
+     n = len(batch)
+-    invalid = np.zeros(n, dtype=bool)
+-    reasons: dict[str, np.ndarray] = {}
+-
+-    if config.get("filter_env_failures", True):
+-        mask = _flag_array(batch, "is_env_failure")
+-        if "trajectory_token_source" in batch.non_tensor_batch:
+-            mask |= np.array(
+-                [x == "dummy" for x in batch.non_tensor_batch["trajectory_token_source"]], dtype=bool
+-            )
+-        min_tokens = int(config.get("min_response_tokens", 0))
+-        if min_tokens > 0:
+-            mask |= (_response_token_counts(batch) < min_tokens).cpu().numpy()
+-        reasons["env_failure"] = mask
+-
+-    if config.get("filter_timeouts", True):
+-        reasons["timeout"] = _flag_array(batch, "is_timeout")
+-
+-    if config.get("filter_context_errors", True):
+-        reasons["context_error"] = _flag_array(batch, "is_context_error")
+-
+-    if config.get("filter_overlong", True):
+-        mask = _flag_array(batch, "is_overlong")
+-        # Fallback: a response that fills the whole window was truncated by the cap.
+-        response_len = batch.batch["responses"].shape[1]
+-        mask |= (_response_token_counts(batch) >= response_len).cpu().numpy()
+-        reasons["overlong"] = mask
+-
+-    max_turns = int(config.get("max_num_turns", 0))
+-    if config.get("filter_turn_capped", False) and max_turns > 0 and "__num_turns__" in batch.non_tensor_batch:
+-        num_turns = np.asarray(batch.non_tensor_batch["__num_turns__"], dtype=np.int64)
+-        reasons["turn_capped"] = num_turns >= max_turns
+-
+-    for mask in reasons.values():
+-        invalid |= mask
+-
+-    metrics = {f"trajectory_filter/{name}_count": int(mask.sum()) for name, mask in reasons.items()}
++    drop_reasons = set(config.get("drop_reasons", DEFAULT_DROP_REASONS) or [])
++
++    # Per-row termination_reason set once by the agent loop. Rows missing it (should not happen
++    # now every loop emits it) default to agent_completed, i.e. never dropped — fail safe.
++    raw = batch.non_tensor_batch.get(TERMINATION_REASON_KEY)
++    if raw is None:
++        reasons = np.full(n, TerminationReason.AGENT_COMPLETED, dtype=object)
++    else:
++        reasons = np.array([str(x) for x in raw], dtype=object)
++
++    invalid = np.array([r in drop_reasons for r in reasons], dtype=bool)
++    if empty is not None:
++        invalid |= empty
++
++    # Visibility: count every reason seen (whether dropped or kept), plus the dropped total.
++    metrics: dict[str, float] = {}
++    seen: dict[str, int] = {}
++    for r in reasons:
++        seen[r] = seen.get(r, 0) + 1
++    for reason in ALL_TERMINATION_REASONS:
++        metrics[f"trajectory_filter/reason/{reason}"] = int(seen.get(reason, 0))
++    unknown = sum(c for r, c in seen.items() if r not in ALL_TERMINATION_REASONS)
++    if unknown:
++        metrics["trajectory_filter/reason/unknown"] = int(unknown)
++    # Counted separately from the reasons above: a row can be both agent_completed and
++    # empty, so this does not partition the batch the way termination_reason does.
++    metrics["trajectory_filter/no_response_token_count"] = empty_count
+     metrics["trajectory_filter/invalid_count"] = int(invalid.sum())
+     metrics["trajectory_filter/invalid_ratio"] = float(invalid.mean()) if n else 0.0
+ 
+-    if invalid.any():
+-        invalid_t = torch.from_numpy(invalid).to(batch.batch["token_level_rewards"].device)
+-        # 1) no reward signal may leak through the singleton group
+-        batch.batch["token_level_rewards"][invalid_t] = 0.0
+-        # 2) remove from sibling GRPO group statistics via singleton uid
+-        if "uid" in batch.non_tensor_batch:
+-            uids = batch.non_tensor_batch["uid"]
+-            for i in np.nonzero(invalid)[0]:
+-                uids[i] = f"{uids[i]}__filtered_{i}"
+-        # 3) remember rows for post-advantage zeroing
+-        batch.non_tensor_batch[FILTER_MASK_KEY] = invalid
+-
++    _neutralize(batch, invalid)
+     return batch, metrics
+ 
+ 
+diff --git a/verl/utils/distributed.py b/verl/utils/distributed.py
+index b0274452..a943355d 100644
+--- a/verl/utils/distributed.py
++++ b/verl/utils/distributed.py
+@@ -82,6 +82,12 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
+ 
+     import torch.distributed
+ 
++    # When no explicit timeout is passed, fall back to VERL_NCCL_TIMEOUT_SEC instead of torch's
++    # default 1800s watchdog. The fully-async weight-sync barrier (build_process_group +
++    # update_weights on default_pg / PG ID 0) can legitimately wait while in-flight rollout
++    # trajectories drain; 1800s is far too short and aborts the whole job. Default 72000s.
++    if timeout_second is None:
++        timeout_second = int(os.environ.get("VERL_NCCL_TIMEOUT_SEC", "72000"))
+     timeout = timedelta(seconds=timeout_second) if timeout_second is not None else None
+     backend = backend or f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"
+     if not torch.distributed.is_initialized():
+diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
+index 91d82b15..6c3a33f7 100644
+--- a/verl/utils/tensordict_utils.py
++++ b/verl/utils/tensordict_utils.py
+@@ -352,8 +352,26 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
+         nt = td[key]
+         try:
+             tensors = nt.unbind(dim=0)
+-        except RuntimeError:
+-            padded = nt.to_padded_tensor(0)
++        except RuntimeError as unbind_err:
++            try:
++                padded = nt.to_padded_tensor(0)
++            except RuntimeError as pad_err:
++                # Diagnostic enrichment only — the bare kernel error ("size of
++                # tensor a ... must match ...") names neither the key nor the
++                # NJT layout, which made the 2026-06-12 async crash undebuggable
++                # from logs alone. Re-raise with full structure info.
++                _off = nt.offsets()
++                raise RuntimeError(
++                    f"chunk_tensordict: nested key '{key}' failed BOTH unbind and to_padded. "
++                    f"unbind_err={unbind_err} | shape={tuple(nt.shape)} "
++                    f"ragged_idx={getattr(nt, '_ragged_idx', None)} "
++                    f"values={tuple(nt.values().shape)} "
++                    f"offsets_len={None if _off is None else int(_off.numel())} "
++                    f"offsets_last={None if _off is None else int(_off[-1])} "
++                    f"lengths_set={getattr(nt, '_lengths', None) is not None} "
++                    f"contiguous={nt.is_contiguous()} chunks={chunks} chunk_size={chunk_size} | "
++                    f"to_padded_err={pad_err}"
++                ) from pad_err
+             padded_chunks = padded.chunk(chunks, dim=0)
+             offsets = nt.offsets()
+             lengths = offsets.diff().tolist()
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index b5ad8e9c..b0522057 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -239,12 +239,17 @@ class FSDPEngineConfig(EngineConfig):
+         mixed_precision (Optional[dict[str, Any]]): Mixed precision configuration for FSDP, default None
+         dtype (str): Mixed precision training param dtype, default "bfloat16"
+         qat (QATEngineConfig): QAT configuration, default disabled
++        freeze_param_patterns (Optional[list[str]]): Freeze every parameter whose name contains
++            one of these substrings, applied before sharding and excluded from the optimizer.
++            None (default) trains everything. SAO's frozen-attention value model is
++            ["self_attn."] on critic.fsdp. A pattern that matches nothing raises.
+     """
+ 
+     # ulysses_sequence_parallel_size is mutable for backward compatibility
+     _mutable_fields = EngineConfig._mutable_fields | {"ulysses_sequence_parallel_size"}
+ 
+     # fsdp specific flags
++    freeze_param_patterns: Optional[list[str]] = None
+     wrap_policy: dict[str, Any] = field(default_factory=dict)
+     offload_policy: bool = False
+     reshard_after_forward: bool = True
+@@ -330,11 +335,16 @@ class VeOmniEngineConfig(EngineConfig):
+             in distributed training. Important: this will negatively impact performance, so only use it for
+             debugging.
+         mixed_precision (Optional[dict[str, Any]]): Mixed precision configuration for FSDP, default None
++        freeze_param_patterns (Optional[list[str]]): Freeze every parameter whose name contains
++            one of these substrings, applied before parallelization and excluded from the
++            optimizer. None (default) trains everything. SAO's frozen-attention value model is
++            ["self_attn."] on critic.veomni. A pattern that matches nothing raises.
+ 
+     """
+ 
+     _mutable_fields = EngineConfig._mutable_fields | {"attn_implementation"}
+ 
++    freeze_param_patterns: Optional[list[str]] = None
+     wrap_policy: dict[str, Any] = field(default_factory=dict)
+     offload_policy: bool = False
+     reshard_after_forward: bool = True
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index a696a00c..69fc6c20 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -73,7 +73,7 @@ from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelCo
+ from verl.workers.utils.padding import build_attention_mask_from_nested
+ 
+ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+-from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
++from ..utils import apply_param_freezing, enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+ from .utils import create_device_mesh, get_sharding_strategy
+ 
+ logger = logging.getLogger(__file__)
+@@ -473,7 +473,8 @@ class FSDPEngine(BaseEngine):
+     def _build_optimizer(self, module):
+         from verl.workers.config.optimizer import build_optimizer
+ 
+-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
++        # Frozen parameters (see apply_param_freezing) must not reach the optimizer.
++        optimizer = build_optimizer((p for p in module.parameters() if p.requires_grad), self.optimizer_config)
+ 
+         return optimizer
+ 
+@@ -575,6 +576,22 @@ class FSDPEngine(BaseEngine):
+         if self._qat_enabled and not self.engine_config.forward_only:
+             module = self._apply_qat(module)
+ 
++        # Freeze before sharding: parameter names are still unprefixed here, and FSDP2
++        # reads requires_grad when it builds its gradient-reduction groups.
++        if not self.engine_config.forward_only:
++            freeze_patterns = self.engine_config.get("freeze_param_patterns", None)
++            if freeze_patterns and self.engine_config.strategy == "fsdp" and not self.engine_config.use_orig_params:
++                # FSDP1 flattens each wrapped unit into one FlatParameter and refuses a unit
++                # whose members disagree on requires_grad, which is exactly what freezing
++                # produces. Its own error ("Must flatten tensors with uniform `requires_grad`
++                # when `use_orig_params=False`") names neither the freezing nor the fix, so
++                # fail here instead. FSDP2 has no such restriction.
++                raise ValueError(
++                    f"freeze_param_patterns={list(freeze_patterns)} needs either strategy='fsdp2' or "
++                    "use_orig_params=True: FSDP1 cannot flatten a unit with mixed requires_grad."
++                )
++            apply_param_freezing(module, freeze_patterns)
++
+         # Synchronize all distributed processes before proceeding
+         torch.distributed.barrier()
+         if self.rank == 0:
+diff --git a/verl/workers/engine/utils.py b/verl/workers/engine/utils.py
+index 47a35bcb..cd8f3c87 100644
+--- a/verl/workers/engine/utils.py
++++ b/verl/workers/engine/utils.py
+@@ -12,8 +12,11 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import itertools
++import logging
+ import os
+ import random
++from typing import Optional, Sequence
+ 
+ import numpy as np
+ import torch
+@@ -25,6 +28,94 @@ from verl.utils.device import is_npu_available
+ from verl.utils.py_functional import append_to_dict
+ from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+ 
++logger = logging.getLogger(__file__)
++
++
++def apply_param_freezing(module: torch.nn.Module, patterns: Optional[Sequence[str]]) -> Optional[dict]:
++    """Freeze parameters whose qualified name contains any of ``patterns``.
++
++    Motivated by SAO's "Frozen-Attention" value model (https://arxiv.org/abs/2607.07508,
++    section 3.2): critic gradient norms are dominated by the attention modules, and
++    restricting the value model's updates to the MoE/MLP projections regularises critic
++    optimisation. Pass ``["self_attn."]`` to reproduce that.
++
++    Matching is plain substring containment against ``named_parameters()`` keys, not
++    regex: predictable, and the parameter names differ enough between model families
++    (Qwen3-MoE vs Qwen3.5-MoE vs dense) that a pattern list is the honest interface.
++
++    Call this BEFORE the model is sharded/parallelised and before the optimizer is
++    built: names are unprefixed at that point, and both FSDP2 and VeOmni read
++    ``requires_grad`` when they set up gradient reduction and parameter groups.
++
++    Args:
++        module: the (unsharded) model.
++        patterns: substrings to match; None or empty disables freezing entirely.
++
++    Returns:
++        None when disabled, else a summary dict with frozen/trainable parameter and
++        tensor counts.
++
++    Raises:
++        ValueError: if a pattern matches nothing (almost always a typo that would
++            otherwise silently train the very module you meant to freeze), or if every
++            parameter ends up frozen.
++
++    Note:
++        Freezing whole modules interacts with reentrant gradient checkpointing: a
++        checkpointed block needs at least one input or parameter requiring grad.
++        Freezing attention inside a decoder layer leaves the MLP trainable, so the block
++        is fine; freezing an entire leading block would not be.
++    """
++    if not patterns:
++        return None
++
++    patterns = list(patterns)
++    matched_by_pattern = {p: 0 for p in patterns}
++    frozen_params = frozen_tensors = 0
++    trainable_params = trainable_tensors = 0
++
++    for name, param in module.named_parameters():
++        hit = next((p for p in patterns if p in name), None)
++        if hit is not None:
++            matched_by_pattern[hit] += 1
++            param.requires_grad_(False)
++            frozen_tensors += 1
++            frozen_params += param.numel()
++        elif param.requires_grad:
++            trainable_tensors += 1
++            trainable_params += param.numel()
++
++    unmatched = [p for p, n in matched_by_pattern.items() if n == 0]
++    if unmatched:
++        sample = [name for name, _ in itertools.islice(module.named_parameters(), 8)]
++        raise ValueError(
++            f"freeze_param_patterns {unmatched} matched no parameter. "
++            f"Parameter names in this model look like: {sample}"
++        )
++    if trainable_tensors == 0:
++        raise ValueError(
++            f"freeze_param_patterns {patterns} froze every parameter; there is nothing left to train."
++        )
++
++    summary = {
++        "frozen_tensors": frozen_tensors,
++        "frozen_params": frozen_params,
++        "trainable_tensors": trainable_tensors,
++        "trainable_params": trainable_params,
++        "matched_by_pattern": matched_by_pattern,
++    }
++    total = frozen_params + trainable_params
++    logger.info(
++        "param freezing: patterns=%s froze %d/%d params (%.1f%%) across %d tensors; %d tensors remain trainable",
++        patterns,
++        frozen_params,
++        total,
++        100.0 * frozen_params / max(total, 1),
++        frozen_tensors,
++        trainable_tensors,
++    )
++    return summary
++
+ 
+ def enable_full_determinism(seed: int):
+     """
+diff --git a/verl/workers/engine/veomni/transformer_impl.py b/verl/workers/engine/veomni/transformer_impl.py
+index b52829e7..b45605a2 100644
+--- a/verl/workers/engine/veomni/transformer_impl.py
++++ b/verl/workers/engine/veomni/transformer_impl.py
+@@ -46,7 +46,7 @@ from verl.workers.config import HFModelConfig, VeOmniEngineConfig, VeOmniOptimiz
+ 
+ from ..base import BaseEngineCtx, EngineRegistry
+ from ..fsdp.transformer_impl import FSDPEngine, FSDPEngineWithLMHead, FSDPEngineWithValueHead
+-from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
++from ..utils import apply_param_freezing, enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+ from .utils import (
+     MOE_PARAM_HANDERS,
+     VL_TYPE2INDEX,
+@@ -265,6 +265,9 @@ class VeOmniEngine(FSDPEngine):
+         """
+         return self.model_config.local_hf_config_path
+ 
++    def _assert_value_head_module(self, module):
++        """Hook for value-head engines to reject a CausalLM built as a critic."""
++
+     def _build_model_optimizer(self):
+         # build_foundation_model runs apply_ops_config(ops_implementation)
+         # before constructing the model, so per-model device_patch files see
+@@ -288,8 +291,14 @@ class VeOmniEngine(FSDPEngine):
+             ops_implementation=ops_implementation,
+             init_device=self.engine_config.init_device,
+         )
++        self._assert_value_head_module(module)
+         log_gpu_memory_usage("After load base model", logger=logger)
+ 
++        # Freeze before parallelizing: names are still unprefixed here, and VeOmni's
++        # build_optimizer filters on requires_grad when it forms parameter groups.
++        if not self.engine_config.forward_only:
++            apply_param_freezing(module, self.engine_config.get("freeze_param_patterns", None))
++
+         # Applies parallel strategies to the model.
+         log_gpu_memory_usage("Before parallelize model", logger=logger)
+         module = build_parallelize_model(
+@@ -1038,10 +1047,36 @@ class VeOmniEngineWithValueHead(VeOmniEngine, FSDPEngineWithValueHead):
+         config.tie_word_embeddings = False
+         token_cls = AutoModelForTokenClassification._model_mapping.get(type(config), None)
+         if token_cls is None:
+-            raise ValueError(f"No ForTokenClassification class in transformers for {type(config).__name__}.")
++            # Qwen3.5-MoE is ForConditionalGeneration and has no HF TokenClassification
++            # mapping. Rewrite the suffix so VeOmni's MODELING_REGISTRY can dispatch
++            # to the sidecar class instead of raising (or falling through to CausalLM).
++            # A checkpoint that is already *ForTokenClassification (e.g. a merged
++            # warm-start critic) passes through unchanged.
++            arch = (getattr(config, "architectures", None) or [type(config).__name__])[0]
++            if not arch.endswith("ForTokenClassification"):
++                for suffix in ("ForConditionalGeneration", "ForCausalLM"):
++                    if suffix in arch:
++                        arch = arch.replace(suffix, "ForTokenClassification")
++                        break
++                else:
++                    raise ValueError(
++                        f"No ForTokenClassification class in transformers for {type(config).__name__}."
++                    )
++            config.architectures = [arch]
++            return config
+         config.architectures = [token_cls.__name__]
+         return config
+ 
++    def _assert_value_head_module(self, module):
++        # Suffix rewrite without a VeOmni sidecar falls through to CausalLM:
++        # values become [T, vocab] and fail late (or train garbage). Fail here.
++        name = type(module).__name__
++        if not name.endswith("ForTokenClassification"):
++            raise ValueError(
++                f"VeOmni critic built {name}, not *ForTokenClassification. "
++                "Apply the veomni value-head patch (or register a sidecar) before launching."
++            )
++
+     def prepare_model_inputs(self, micro_batch: TensorDict):
+         model_inputs, output_args = super().prepare_model_inputs(micro_batch)
+         self._apply_veomni_input_transforms(model_inputs, micro_batch)
+diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
+index c865b9dd..1080e94e 100644
+--- a/verl/workers/utils/losses.py
++++ b/verl/workers/utils/losses.py
+@@ -158,6 +158,31 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
+     """
+     vpreds = no_padding_2_padding(model_output["values"], data)  # (bsz, response_length)
+ 
++    # Global batch info for loss aggregation — same contract as ppo_loss above.
++    # The engine backwards each micro-batch's loss WITHOUT dividing by the
++    # micro-batch count (FSDP/VeOmni `forward_backward_batch`), so the loss
++    # function itself must normalize by the global token count. Without this,
++    # the critic loss was the SUM of per-micro-batch token-means: its scale and
++    # gradient grew with the number of (packed) micro-batches, so a small critic
++    # packing budget silently multiplied critic/grad_norm and, under a fixed
++    # grad clip, divided the critic's effective learning rate.
++    dp_size = data["dp_size"]
++    batch_num_tokens = data["batch_num_tokens"]
++    global_batch_size = data["global_batch_size"]
++    # CriticConfig has no loss_scale_factor field (unlike ActorConfig). The
++    # partition-invariance contract below is for token-mean, which every
++    # in-tree critic config uses. seq-mean-token-sum-norm still divides by
++    # the micro-batch horizon when this is None — do not claim that mode.
++    loss_scale_factor = getattr(config, "loss_scale_factor", None)
++
++    # Mirrors ppo_loss: with global normalization each micro-batch's loss is a
++    # share of the global mean, so metric aggregation across micro-batches must
++    # be SUM to reflect the mean loss over the global batch.
++    if dp_size > 1 or batch_num_tokens is not None or global_batch_size is not None or loss_scale_factor is not None:
++        metric_aggregation = AggregationType.SUM
++    else:
++        metric_aggregation = AggregationType.MEAN
++
+     # select fields and convert to padded tensor
+     data = data.select("values", "returns", "response_mask").to_padded_tensor()
+     values = data["values"]
+@@ -171,15 +196,21 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
+         response_mask=response_mask,
+         cliprange_value=config.cliprange_value,
+         loss_agg_mode=config.loss_agg_mode,
++        dp_size=dp_size,
++        batch_num_tokens=batch_num_tokens,
++        global_batch_size=global_batch_size,
++        loss_scale_factor=loss_scale_factor,
+     )
+ 
+     metrics = {}
+ 
+     metrics.update(
+         {
+-            "critic/vf_loss": vf_loss.detach().item(),
+-            "critic/vf_clipfrac": vf_clipfrac.detach().item(),
+-            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
++            "critic/vf_loss": Metric(value=vf_loss.detach().item(), aggregation=metric_aggregation),
++            "critic/vf_clipfrac": Metric(value=vf_clipfrac.detach().item(), aggregation=AggregationType.MEAN),
++            "critic/vpred_mean": Metric(
++                value=masked_mean(vpreds, response_mask).detach().item(), aggregation=AggregationType.MEAN
++            ),
+         }
+     )
+ 
