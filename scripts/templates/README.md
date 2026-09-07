@@ -122,6 +122,7 @@ scripts/train/configs/fully_async_3nodes_qwen35_ohsdk_veomni.env
 | `scaffold/oh.env` | OpenHands agent identity and runtime image settings. |
 | `scaffold/cc.env` | Claude Code agent identity and runtime image settings. |
 | `scaffold/oc.env` | OpenCode agent identity and runtime image settings. |
+| `verl/sao.env` | Single-rollout Asynchronous Optimization: `N_RESP=1`, GAE with decoupled lambdas, a frozen-attention critic and the DIS bypass-mode loss. **Must be listed before `verl/common.env`** — every default is `: "${VAR:=…}"` and the first assignment wins, so after `common.env` this module is a silent no-op (preflight rule 10 blocks that). |
 | `verl/common.env` | Verl-native defaults shared by sync/async and VeOmni/FSDP: data, model, actor, rollout, ref, algorithm, topology, experiment/log defaults. |
 | `verl/async.env` | Fully-async entry/config selection and `async_training.*` defaults. |
 | `verl/sync.env` | Sync entry/config selection and sync-specific train batch defaults. |
@@ -159,6 +160,7 @@ Prefer adding defaults to the most specific module that owns the setting:
 | Agent scaffold identity/runtime | `scaffold/<scaffold>.env` |
 | Verl shared native config | `verl/common.env` |
 | Async vs sync training behavior | `verl/async.env` or `verl/sync.env` |
+| Value-based / SAO algorithm defaults (critic, GAE lambdas, DIS) | `verl/sao.env` (before `verl/common.env`) |
 | VeOmni vs FSDP engine behavior | `verl/veomni.env` or `verl/fsdp.env` |
 | Infer vLLM serving behavior | `infer/vllm.env` |
 | Infer rollout/data/log behavior | `infer/common.env` |
