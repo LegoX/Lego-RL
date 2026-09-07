@@ -4,6 +4,7 @@
         "eval",
         "infer",
         "scaling",
+        "sao",
         "---Operations---",
         "preflight",
         "backends",

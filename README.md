@@ -101,7 +101,8 @@ bash webui/start_dashboard.sh
 - **Faithful rollouts**: an [in-process proxy](https://lego-rl.pages.dev/docs/architecture/in-process-proxy)
   records token ids, masks, and log-probabilities at generation time. It also handles history
   rewrites and serves the OpenAI and Anthropic interfaces used by the supported agents.
-- **RL and scaling**: PPO, GRPO, and GSPO run on FSDP, VeOmni, or Megatron, either synchronously or
+- **RL and scaling**: PPO, GRPO, GSPO, and [SAO](https://lego-rl.pages.dev/docs/run-training/sao)
+  (single-rollout, critic-based) run on FSDP, VeOmni, or Megatron, either synchronously or
   fully asynchronously. MoE runs can use R3 routing replay, while trajectory filtering removes
   broken or over-long rollouts from the loss.
 - **Sandboxed rewards**: [Kubernetes or Docker](https://lego-rl.pages.dev/docs/training-run/sandbox-backends)
