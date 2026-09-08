@@ -32,7 +32,14 @@ HARBOR_DIR="${HARBOR_DIR:-$THIRD_PARTY_DIR/harbor}"
 VERL_DIR="${VERL_DIR:-$THIRD_PARTY_DIR/verl}"
 VLLM_DIR="${VLLM_DIR:-$THIRD_PARTY_DIR/vllm}"
 
-HARBOR_REPO_URL="${HARBOR_REPO_URL:-https://github.com/LegoX/harbor-internal.git}"
+# harbor: the ydu RL fork, NOT LegoX/harbor-internal. The fork is harbor-internal
+# plus a thin RL layer, and this repo depends on two things that exist only there:
+# HARBOR_ENV_START_MAX_ATTEMPTS (trial.py) and BaseEnvironment.restore_git_history()
+# (the verifier-phase hook the anti-reward-hacking path calls). Pointing this at
+# harbor-internal installs cleanly and then misbehaves at run time, which is worse
+# than failing loudly. The fork tracks harbor-internal main; re-merge it there
+# rather than switching this URL back.
+HARBOR_REPO_URL="${HARBOR_REPO_URL:-https://github.com/Elvin-Yiming-Du/harbor.git}"
 HARBOR_REF="${HARBOR_REF:-${HARBOR_COMMIT:-main}}"
 
 VERL_REPO_URL="${VERL_REPO_URL:-https://github.com/verl-project/verl.git}"
