@@ -7,7 +7,8 @@
 #   2. Create a virtualenv at $VENV_PATH with the requested Python version
 #   3. Install base dependencies from requirements.txt
 #   4. Clone + checkout harbor, verl & vllm into third_party
-#   5. Apply local monkey patches to harbor (optional), verl and vllm
+#   5. Apply local monkey patches to harbor (optional), verl (an ordered
+#      list: the base patch, then feature patches such as SAO) and vllm
 #   6. Install patched harbor (-e --no-deps), patched verl (-e --no-deps),
 #      patched vllm (-e --no-deps)
 #   7. Install this repo (-e --no-deps)
@@ -31,7 +32,14 @@ HARBOR_DIR="${HARBOR_DIR:-$THIRD_PARTY_DIR/harbor}"
 VERL_DIR="${VERL_DIR:-$THIRD_PARTY_DIR/verl}"
 VLLM_DIR="${VLLM_DIR:-$THIRD_PARTY_DIR/vllm}"
 
-HARBOR_REPO_URL="${HARBOR_REPO_URL:-https://github.com/LegoX/harbor-internal.git}"
+# harbor: the ydu RL fork, NOT LegoX/harbor-internal. The fork is harbor-internal
+# plus a thin RL layer, and this repo depends on two things that exist only there:
+# HARBOR_ENV_START_MAX_ATTEMPTS (trial.py) and BaseEnvironment.restore_git_history()
+# (the verifier-phase hook the anti-reward-hacking path calls). Pointing this at
+# harbor-internal installs cleanly and then misbehaves at run time, which is worse
+# than failing loudly. The fork tracks harbor-internal main; re-merge it there
+# rather than switching this URL back.
+HARBOR_REPO_URL="${HARBOR_REPO_URL:-https://github.com/Elvin-Yiming-Du/harbor.git}"
 HARBOR_REF="${HARBOR_REF:-${HARBOR_COMMIT:-main}}"
 
 VERL_REPO_URL="${VERL_REPO_URL:-https://github.com/verl-project/verl.git}"
@@ -43,7 +51,15 @@ VLLM_REF="${VLLM_REF:-${VLLM_COMMIT:-v0.19.0}}"
 # Harbor has no repo patch checked in today. Drop one at patches/harbor.patch or
 # export HARBOR_PATCH=/path/to/patch to enable the same monkey-patch step.
 HARBOR_PATCH="${HARBOR_PATCH:-$REPO_ROOT/patches/harbor.patch}"
-VERL_PATCH="${VERL_PATCH:-$REPO_ROOT/patches/verl_7aed6b23.patch}"
+# verl takes an ORDERED, whitespace-separated list. Each patch is generated
+# against the tree left by the previous one, so the order is part of the
+# contract: the base patch first, then feature patches. Removing a feature is
+# dropping its file from this list (or exporting VERL_PATCHES without it).
+#   verl_7aed6b23.patch      Lego-RL base: R3 router replay, agent loop, fully-async fixes
+#   verl_sao_7aed6b23.patch  SAO: decoupled GAE lambdas, frozen-attention critic,
+#                            DIS preset, reward placement, trajectory filter v6
+# VERL_PATCH (singular) is kept as an alias for a single-patch override.
+VERL_PATCHES="${VERL_PATCHES:-${VERL_PATCH:-$REPO_ROOT/patches/verl_7aed6b23.patch $REPO_ROOT/patches/verl_sao_7aed6b23.patch}}"
 VLLM_PATCH="${VLLM_PATCH:-$REPO_ROOT/patches/vllm_2a69949b.patch}"
 
 # Python / venv / base dependency lock
@@ -158,7 +174,11 @@ apply_repo_patch() {
         log "[$name] patch applied"
     elif git -C "$dir" apply -R --check "$patch_file" >/dev/null 2>&1; then
         log "[$name] patch already applied"
-    elif git -C "$dir" diff --quiet -- && clean_patch_created_untracked_files "$name" "$dir" "$patch_file" \
+    # No `git diff --quiet` guard here: with a stacked patch list the tree is
+    # legitimately dirty (earlier patches applied) by the time a later patch's
+    # stale created files are cleaned, and the files removed are only the ones
+    # this very patch creates, which `apply` recreates a line later.
+    elif clean_patch_created_untracked_files "$name" "$dir" "$patch_file" \
         && git -C "$dir" apply --check "$patch_file" >/dev/null 2>&1; then
         git -C "$dir" apply "$patch_file"
         log "[$name] patch applied"
@@ -167,8 +187,16 @@ apply_repo_patch() {
         git -C "$dir" apply --check "$patch_file" || true
         git -C "$dir" apply -R --check "$patch_file" || true
         git -C "$dir" apply --stat "$patch_file" || true
-        die "[$name] patch failed; check ${name^^}_REF and ${name^^}_PATCH"
+        die "[$name] patch failed; check ${name^^}_REF and ${name^^}_PATCH(ES)"
     fi
+}
+
+# Apply an ordered list of patches. Every element is required.
+apply_repo_patches() {
+    local name="$1" dir="$2" patch_list="$3" patch_file
+    for patch_file in $patch_list; do
+        apply_repo_patch "$name" "$dir" "$patch_file"
+    done
 }
 
 clean_patch_created_untracked_files() {
@@ -342,7 +370,7 @@ fi
 ensure_repo "harbor" "$HARBOR_DIR" "$HARBOR_REPO_URL" "$HARBOR_REF"
 apply_repo_patch "harbor" "$HARBOR_DIR" "$HARBOR_PATCH" 0
 ensure_repo "verl"   "$VERL_DIR"   "$VERL_REPO_URL"   "$VERL_REF"
-apply_repo_patch "verl" "$VERL_DIR" "$VERL_PATCH"
+apply_repo_patches "verl" "$VERL_DIR" "$VERL_PATCHES"
 ensure_repo "vllm"   "$VLLM_DIR"   "$VLLM_REPO_URL"   "$VLLM_REF"
 apply_repo_patch "vllm" "$VLLM_DIR" "$VLLM_PATCH"
 
@@ -418,6 +446,24 @@ case "$_resolved_vllm" in
     *) die "vllm resolves to $_resolved_vllm but was installed from $VLLM_DIR" ;;
 esac
 
+# ---------------- 8b. veomni value-head patch -------------------------------
+#
+# veomni is a wheel, so it cannot take a git patch like verl/vllm. Its per-family
+# model registry dispatches "<Family>ForTokenClassification" by substring and
+# falls through to the CausalLM class, i.e. a critic (SAO / PPO value model) is
+# silently built as a language model. utils/apply_veomni_valuehead_patch.py fixes
+# the registry in site-packages and installs the Qwen3.5-MoE token-classification
+# sidecar; it is idempotent and train.sh re-runs it before a critic launch.
+if [ "$SKIP_PATCHES" = "1" ]; then
+    warn "SKIP_PATCHES=1, leaving veomni's value-head dispatch unpatched"
+elif python -c 'import veomni' >/dev/null 2>&1; then
+    log "patching veomni value-head dispatch (utils/apply_veomni_valuehead_patch.py)"
+    python "$REPO_ROOT/utils/apply_veomni_valuehead_patch.py" \
+        || die "veomni value-head patch failed; a critic would be built as a language model"
+else
+    warn "veomni not importable; skipping the value-head patch (only critic runs need it)"
+fi
+
 # ---------------- 9. summary ------------------------------------------------
 
 log "======================================================================"
@@ -433,7 +479,9 @@ else
     else
         log "  harbor patch     : (none)"
     fi
-    log "  verl patch       : $VERL_PATCH"
+    for _p in $VERL_PATCHES; do
+        log "  verl patch       : $_p"
+    done
     log "  vllm patch       : $VLLM_PATCH"
 fi
 log "  Lego-RL: $REPO_ROOT"

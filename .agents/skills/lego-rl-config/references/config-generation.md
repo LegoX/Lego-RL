@@ -223,6 +223,9 @@ T2/T3 optional overrides:
 - context: `MAX_PROMPT`, `MAX_RESP`, `MAX_INPUT_TOKENS`,
   `MAX_OUTPUT_TOKENS`, `MAX_MODEL_LEN`
 - algorithm: advantage estimator, policy loss mode, learning rate, scheduler
+- SAO (single-rollout, critic-based): add `verl/sao.env` to `TEMPLATE_MODULES`
+  **above** `verl/common.env` (first assignment wins) and set `CRITIC_MODEL_PATH`;
+  see `scripts/train/configs/sao_async_3nodes_qwen35_ohsdk_veomni.env`
 - advanced behavior: R3, importance sampling, trajectory filters, GPU memory
   utilization, vLLM extra args
 

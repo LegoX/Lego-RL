@@ -12,6 +12,12 @@ add_plus() {
     hydra_args+=("+$1=$2")
 }
 
+# Set a key whether or not it already exists in the config tree. Plain `add`
+# fails on keys hydra has never seen, `add_plus` fails on keys it has.
+add_force() {
+    hydra_args+=("++$1=$2")
+}
+
 add_if_set() {
     local key="$1" name="$2"
     if var_is_set "$name"; then
@@ -34,6 +40,13 @@ append_common_hydra_args() {
     add actor_rollout_ref.actor.loss_agg_mode "$LOSS_AGG_MODE"
     add actor_rollout_ref.actor.optim.lr "$ACTOR_LR"
     add actor_rollout_ref.actor.optim.lr_scheduler_type "$LR_SCHEDULER"
+    # Resume restores optimizer + lr_scheduler state wholesale, so a config LR
+    # change is silently clobbered on restart (observed on the SAO r7 restart:
+    # critic/lr stayed 5e-6 despite CRITIC_LR=2.5e-6). Set this to
+    # [model,optimizer] to skip the 'extra' payload (lr_scheduler + rng): the
+    # freshly built scheduler then re-asserts the configured LR. Adam moments
+    # still load; only rng reproducibility is lost.
+    add_if_set actor_rollout_ref.actor.checkpoint.load_contents ACTOR_CKPT_LOAD_CONTENTS
     add actor_rollout_ref.actor.policy_loss.loss_mode "$POLICY_LOSS_MODE"
     add actor_rollout_ref.actor.ppo_max_token_len_per_gpu "$ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU"
     add actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu "$ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU"
@@ -58,6 +71,7 @@ append_common_hydra_args() {
     add actor_rollout_ref.rollout.calculate_log_probs "$CALCULATE_LOG_PROBS"
     add actor_rollout_ref.rollout.enforce_eager "$ENFORCE_EAGER"
     add actor_rollout_ref.rollout.enable_chunked_prefill "$ENABLE_CHUNKED_PREFILL"
+    add actor_rollout_ref.rollout.engine_kwargs.vllm.enable-expert-parallel "$VLLM_ENABLE_EXPERT_PARALLEL"
     add actor_rollout_ref.rollout.engine_kwargs.vllm.served-model-name "$SERVED_MODEL_NAME"
     add actor_rollout_ref.rollout.engine_kwargs.vllm.tool-call-parser "$TOOL_CALL_PARSER"
     add actor_rollout_ref.rollout.disable_log_stats "$DISABLE_LOG_STATS"
@@ -83,20 +97,47 @@ append_common_hydra_args() {
     add actor_rollout_ref.rollout.val_kwargs.top_p "$VAL_TOP_P"
 
     add algorithm.adv_estimator "$ADV_ESTIMATOR"
+    add algorithm.gae_whiten_advantages "$GAE_WHITEN_ADVANTAGES"
+    add algorithm.gamma "$GAMMA"
     add algorithm.kl_ctrl.kl_coef "$KL_COEF"
+    add algorithm.lam "$LAM"
+    add algorithm.lam_critic "$LAM_CRITIC"
+    add algorithm.length_adaptive_lam_alpha "$LENGTH_ADAPTIVE_LAM_ALPHA"
     add algorithm.rollout_correction.bypass_mode "$ROLLOUT_CORRECTION_BYPASS"
+    add algorithm.rollout_correction.loss_type "$ROLLOUT_CORRECTION_LOSS_TYPE"
     add algorithm.rollout_correction.rollout_is "$ROLLOUT_IS"
     add algorithm.rollout_correction.rollout_is_threshold "$ROLLOUT_IS_THRESHOLD"
     add algorithm.rollout_correction.seq_dist_metrics "$SEQ_DIST_METRICS"
+
+    # >>> LOAD-BEARING MIRROR. Do not delete as "redundant". <<<
+    # algorithm.rollout_correction is NOT what the policy loss reads. In the actor,
+    # compute_policy_loss_bypass_mode() (core_algos.py) does:
+    #     rollout_corr_config = config.policy_loss.get("rollout_correction", None)
+    # and PolicyLossConfig (workers/config/actor.py) declares
+    #     rollout_correction: RolloutCorrectionConfig = field(default_factory=...)
+    # so that key ALWAYS resolves and the "not configured" ValueError never fires.
+    # apply_bypass_mode() does copy algorithm.rollout_correction into
+    # actor.policy_loss.rollout_correction -- but it runs in the TRAINER process,
+    # while the loss runs inside the actor WorkerDict ray actors, which froze their
+    # config at construction and never see that mutation.
+    # Without these lines a bypass-mode run silently trains on
+    # RolloutCorrectionConfig's DEFAULTS -- rollout_is="sequence",
+    # rollout_is_threshold=2.0 (TIS, not IcePop), loss_type="ppo_clip" -- i.e. not
+    # SAO's DIS at all, with no error anywhere and metrics that look plausible
+    # because they describe the wrong quantity. Diagnosed 2026-08-09 on the 8B SAO
+    # smoke (rollout_is_mean 0.023 -> 0.9997 after the fix). `++` because these
+    # keys are absent from the yaml tree.
+    add_force actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode "$ROLLOUT_CORRECTION_BYPASS"
+    add_force actor_rollout_ref.actor.policy_loss.rollout_correction.loss_type "$ROLLOUT_CORRECTION_LOSS_TYPE"
+    add_force actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is "$ROLLOUT_IS"
+    add_force actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is_threshold "$ROLLOUT_IS_THRESHOLD"
+    add_force actor_rollout_ref.actor.policy_loss.rollout_correction.seq_dist_metrics "$SEQ_DIST_METRICS"
+
     add algorithm.trajectory_filter.enable "$TRAJ_FILTER_ENABLE"
-    # Two verl checkouts expose different trajectory_filter schemas: the older one takes
-    # per-reason booleans (filter_overlong, ...), the newer one a single drop_reasons list.
-    # Setting TRAJ_FILTER_DROP_REASONS selects the newer schema; unset keeps the old one.
-    if var_is_set TRAJ_FILTER_DROP_REASONS; then
-        add algorithm.trajectory_filter.drop_reasons "$TRAJ_FILTER_DROP_REASONS"
-    else
-        add algorithm.trajectory_filter.filter_overlong "$TRAJ_FILTER_FILTER_OVERLONG"
-    fi
+    # Trajectory filter v6 (patches/verl_sao_7aed6b23.patch): one drop_reasons
+    # list replaces the per-reason booleans (filter_overlong, ...) of the
+    # earlier schema. TRAJ_FILTER_FILTER_OVERLONG is no longer read.
+    add algorithm.trajectory_filter.drop_reasons "$TRAJ_FILTER_DROP_REASONS"
     add algorithm.use_kl_in_reward "$USE_KL_IN_REWARD"
 
     # data.gen_batch_size and the top-level rollout.* group exist only in
@@ -128,6 +169,8 @@ append_common_hydra_args() {
     add trainer.nnodes "$TRAINER_NNODES"
     add trainer.project_name "$project_name"
     add trainer.save_freq "$TRAINER_SAVE_FREQ"
+    add trainer.max_actor_ckpt_to_keep "$MAX_ACTOR_CKPT_TO_KEEP"
+    add trainer.max_critic_ckpt_to_keep "$MAX_CRITIC_CKPT_TO_KEEP"
     add trainer.test_freq "$TRAINER_TEST_FREQ"
     add trainer.total_epochs "$TRAINER_TOTAL_EPOCHS"
     add trainer.val_before_train "$TRAINER_VAL_BEFORE_TRAIN"
@@ -171,6 +214,84 @@ append_engine_hydra_args() {
     esac
 }
 
+# Critic (value model) overrides, for value-based runs such as SAO
+# (scripts/templates/verl/sao.env). Gated on CRITIC_ENABLE so GRPO-style runs --
+# which have no critic worker at all -- do not carry dead critic.* args.
+#
+# Cross-module derivations live here rather than in verl/sao.env: sao.env has to be
+# sourced BEFORE verl/common.env to win the `: "${VAR:=default}"` race, so it cannot
+# see common.env's derived values (ACTOR_PPO_*, SP_SIZE). By the time this function
+# runs, every template has been sourced.
+append_critic_hydra_args() {
+    is_true "${CRITIC_ENABLE:-False}" || return 0
+
+    add critic.enable True
+    # verl's default critic.model.path is ~/models/deepseek-llm-7b-chat, which
+    # loads without error and trains the wrong value model. Always be explicit.
+    add critic.model.path "${CRITIC_MODEL_PATH:-$MODEL_PATH}"
+    add critic.optim.lr "$CRITIC_LR"
+    add critic.optim.lr_scheduler_type "$LR_SCHEDULER"
+    add critic.optim.lr_warmup_steps "$CRITIC_LR_WARMUP_STEPS"
+    # Same clobber-on-resume story as ACTOR_CKPT_LOAD_CONTENTS above.
+    add_if_set critic.checkpoint.load_contents CRITIC_CKPT_LOAD_CONTENTS
+    add critic.ppo_epochs "$CRITIC_PPO_EPOCHS"
+    add critic.ppo_mini_batch_size "${CRITIC_PPO_MINI_BATCH_SIZE:-$ACTOR_PPO_MINI_BATCH_SIZE}"
+    add critic.ppo_micro_batch_size_per_gpu "$CRITIC_MICRO_BSZ_PER_GPU"
+    # This budget, not critic.use_dynamic_bsz, is what sets the critic's
+    # micro-batch memory and its grad_norm scale: a smaller pack budget means more
+    # micro-batches per mini-batch. (The value loss is globally normalized in the
+    # patched verl, so the loss itself no longer scales with the pack count.)
+    add critic.ppo_max_token_len_per_gpu "${CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU:-$ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU}"
+    add critic.use_dynamic_bsz "$CRITIC_USE_DYNAMIC_BSZ"
+    add critic.cliprange_value "$CRITIC_CLIPRANGE_VALUE"
+    # optim.clip_grad, NOT critic.grad_clip. Two separate reasons, either sufficient:
+    #   1. `grad_clip` is declared only in dp_critic.yaml, so on model_engine=veomni
+    #      hydra aborts composition with "Key 'grad_clip' is not in struct" before
+    #      anything launches. VeOmniCriticConfig has a grad_clip *field*, which is
+    #      what makes this look like it should work; the yaml group does not expose it.
+    #   2. Even where it composes, it is dead. Nothing in verl/workers/ reads
+    #      `.grad_clip` at runtime -- both engines clip with optimizer_config.clip_grad.
+    add critic.optim.clip_grad "$CRITIC_GRAD_CLIP"
+    add critic.loss_agg_mode "$CRITIC_LOSS_AGG_MODE"
+    add trainer.critic_warmup "$CRITIC_WARMUP"
+
+    case "$MODEL_ENGINE" in
+        veomni)
+            # veomni_critic.yaml already sets strategy=veomni; only engine knobs here.
+            add critic.veomni.param_offload "$CRITIC_VEOMNI_PARAM_OFFLOAD"
+            add critic.veomni.optimizer_offload "$CRITIC_VEOMNI_OPTIMIZER_OFFLOAD"
+            add critic.veomni.enable_full_shard "$CRITIC_VEOMNI_ENABLE_FULL_SHARD"
+            add critic.veomni.fsdp_size "$CRITIC_VEOMNI_FSDP_SIZE"
+            add critic.veomni.ulysses_parallel_size \
+                "${CRITIC_VEOMNI_ULYSSES_PARALLEL_SIZE:-$ACTOR_VEOMNI_ULYSSES_PARALLEL_SIZE}"
+            add critic.veomni.expert_parallel_size \
+                "${CRITIC_VEOMNI_EXPERT_PARALLEL_SIZE:-$ACTOR_VEOMNI_EXPERT_PARALLEL_SIZE}"
+            add critic.veomni.freeze_param_patterns "$CRITIC_FREEZE_PARAM_PATTERNS"
+            ;;
+        fsdp)
+            # The critic mounts the fsdp engine group at `fsdp`, NOT at
+            # `fsdp_config` like the actor does -- see dp_critic.yaml's
+            # `../engine@fsdp: fsdp` and FSDPCriticConfig.fsdp.
+            add critic.strategy "$CRITIC_FSDP_STRATEGY"
+            add critic.fsdp.strategy "$CRITIC_FSDP_STRATEGY"
+            add critic.fsdp.param_offload "$CRITIC_FSDP_PARAM_OFFLOAD"
+            add critic.fsdp.optimizer_offload "$CRITIC_FSDP_OPTIMIZER_OFFLOAD"
+            add critic.fsdp.fsdp_size "$CRITIC_FSDP_SIZE"
+            add critic.fsdp.freeze_param_patterns "$CRITIC_FREEZE_PARAM_PATTERNS"
+            add critic.fsdp.use_orig_params "$CRITIC_FSDP_USE_ORIG_PARAMS"
+            # BOTH keys, and the engine one is the load-bearing half. FSDPActorConfig
+            # forwards its deprecated top-level ulysses_sequence_parallel_size into the
+            # engine config (actor.py __post_init__); FSDPCriticConfig does NOT -- it
+            # only reads that field in validate(). Setting the top-level one alone
+            # silently leaves the critic engine at SP=1 while the actor runs SP=N, and
+            # the mismatched device meshes deadlock _compute_values with one rank never
+            # entering the dp all_reduce.
+            add critic.fsdp.ulysses_sequence_parallel_size "${CRITIC_SP_SIZE:-$SP_SIZE}"
+            add critic.ulysses_sequence_parallel_size "${CRITIC_SP_SIZE:-$SP_SIZE}"
+            ;;
+    esac
+}
+
 append_mode_hydra_args() {
     case "$TRAINING_MODE" in
         async)
@@ -193,6 +314,7 @@ build_hydra_args() {
     init_hydra_args
     append_common_hydra_args
     append_engine_hydra_args
+    append_critic_hydra_args
     append_mode_hydra_args
 }
 

@@ -18,6 +18,10 @@
 #   FUSED_KERNELS ACTIVATION_OFFLOAD LR_SCHEDULER VAL_TIMEOUT ROLLOUT_IS
 #   IMAGE_REGISTRY INLINE_BUILD NYDUS_MIRROR K8S_KUBECONFIG
 #   TRAIN_INDEX VAL_INDEX
+#   ADV_ESTIMATOR CRITIC_ENABLE TEMPLATE_MODULES_STR POLICY_LOSS_MODE ROLLOUT_CORRECTION_BYPASS
+#   N_RESP GAE_WHITEN_ADVANTAGES CRITIC_MODEL_PATH CRITIC_GRAD_CLIP CRITIC_FREEZE_PARAM_PATTERNS
+#   CRITIC_FSDP_STRATEGY CRITIC_FSDP_USE_ORIG_PARAMS ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU
+#   CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU
 # =============================================================================
 
 # Allow standalone run: if CONFIG is given, source it first.
@@ -38,6 +42,15 @@ _pf_warn()  { printf '  \033[33m⚠ WARN \033[0m  %s\n' "$*" >&2; _PF_WARN=$((_P
 _pf_ok()    { printf '  \033[32m✓ OK   \033[0m  %s\n' "$*"; }
 _pf_skip()  { printf '  \033[36m⊘ SKIP \033[0m  %s\n' "$*"; }
 _lc() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+# The SAO verl patch (patches/verl_sao_7aed6b23.patch) is what gives the imported
+# verl algorithm.lam_critic, critic freeze_param_patterns and the DIS preset.
+_pf_probe_verl_has_sao() {
+    "${PYTHON_BIN:-python3}" - <<'PY' >/dev/null 2>&1
+import verl.trainer.config.algorithm as a
+assert hasattr(a.RolloutCorrectionConfig, "sao_dis")
+assert "lam_critic" in a.AlgoConfig.__dataclass_fields__
+PY
+}
 _pf_probe_verl_has_router_replay() {
     local py="${PYTHON_BIN:-python3}" origin root
     origin="$("$py" -c 'import importlib.util as u; s=u.find_spec("verl"); print(s.origin or "")' 2>/dev/null || true)"
@@ -262,6 +275,130 @@ for _k in $_pf_path_vars; do
     fi
     [ -e "$_v" ] && _pf_ok "$_k exists: $_v" || _pf_fatal "$_k path does not exist: $_v"
 done
+
+# --- 10. SAO / critic ── value-based runs (scripts/templates/verl/sao.env) ───────────────
+# Every rule here is a way to get a run that LOOKS like SAO and is not: the config
+# layer is `: "${VAR:=default}"` first-wins, so a misplaced template or a lone knob
+# produces a GRPO run wearing an SAO name, and the actor's loss config is frozen at
+# construction, so nothing downstream can notice. (Postmortems: r6 collapse 2026-08-31,
+# DIS mirror 2026-08-09, _compute_values deadlock 2026-08-05.)
+if [ "${PF_KIND:-train}" = train ]; then
+    _adv="$(_lc "${ADV_ESTIMATOR:-}")"
+    _critic_on=0; [[ "$(_lc "${CRITIC_ENABLE:-false}")" =~ ^(1|true)$ ]] && _critic_on=1
+    _bypass_on=0; [[ "$(_lc "${ROLLOUT_CORRECTION_BYPASS:-false}")" =~ ^(1|true)$ ]] && _bypass_on=1
+
+    # 10a. gae <-> critic. GAE without a critic has no values to bootstrap from;
+    # a critic under grpo/… burns a training-pool's worth of memory for nothing.
+    if [ "$_adv" = gae ] && [ "$_critic_on" = 0 ]; then
+        _pf_fatal "ADV_ESTIMATOR=gae but CRITIC_ENABLE is off — GAE needs a value model; set CRITIC_ENABLE=True (or source verl/sao.env)"
+    elif [ "$_adv" != gae ] && [ "$_critic_on" = 1 ]; then
+        _pf_fatal "CRITIC_ENABLE=True but ADV_ESTIMATOR=${ADV_ESTIMATOR:-unset} — only gae reads the critic; it would train and be ignored"
+    elif [ "$_adv" = gae ]; then
+        _pf_ok "adv_estimator=gae × critic on ✓"
+    fi
+
+    # 10b. template ordering. sao.env sets its knobs with `:=`, so it only wins when
+    # sourced BEFORE verl/common.env; after it, every SAO default is a silent no-op.
+    if [ -n "${TEMPLATE_MODULES_STR:-}" ] && printf '%s' "$TEMPLATE_MODULES_STR" | grep -q 'verl/sao.env'; then
+        _sao_pos=0; _common_pos=0; _i=0
+        for _m in $TEMPLATE_MODULES_STR; do
+            _i=$((_i+1))
+            [ "$_m" = verl/sao.env ] && _sao_pos=$_i
+            [ "$_m" = verl/common.env ] && _common_pos=$_i
+        done
+        if [ "$_common_pos" -gt 0 ] && [ "$_sao_pos" -gt "$_common_pos" ]; then
+            _pf_fatal "verl/sao.env is listed AFTER verl/common.env in TEMPLATE_MODULES — first assignment wins, so every SAO default was ignored (this is a GRPO run). Move verl/sao.env above verl/common.env"
+        else
+            _pf_ok "verl/sao.env precedes verl/common.env in TEMPLATE_MODULES ✓"
+        fi
+        if [ "$_adv" != gae ] || [ "$_critic_on" = 0 ] || [ "${N_RESP:-}" != 1 ]; then
+            _pf_fatal "verl/sao.env is sourced but the resolved run is not SAO (adv=${ADV_ESTIMATOR:-?} critic=${CRITIC_ENABLE:-?} n=${N_RESP:-?}) — a config line is overriding it; SAO is single-rollout GAE with a critic"
+        fi
+    fi
+
+    # 10c. bypass mode must reach the actor's loss. The DIS knobs are mirrored onto
+    # actor.policy_loss.rollout_correction by hydra_args.sh, but loss_mode itself
+    # is a separate key: unset, the actor runs gspo and ignores the mirror.
+    if [ "$_bypass_on" = 1 ]; then
+        if [ "$(_lc "${POLICY_LOSS_MODE:-}")" = bypass_mode ]; then
+            _pf_ok "rollout_correction.bypass_mode × POLICY_LOSS_MODE=bypass_mode ✓"
+        else
+            _pf_fatal "ROLLOUT_CORRECTION_BYPASS=True but POLICY_LOSS_MODE=${POLICY_LOSS_MODE:-unset} — the actor's loss never enters bypass mode (no DIS, no token IS); set POLICY_LOSS_MODE=bypass_mode"
+        fi
+    fi
+
+    if [ "$_critic_on" = 1 ]; then
+        # 10d. the imported verl must carry the SAO patch. Structure-only runs have no venv.
+        if [ "$_PF_STRUCT" = "1" ]; then
+            _pf_skip "SAO verl probe: needs the venv's verl importable"
+        elif _pf_probe_verl_has_sao; then
+            _pf_ok "imported verl has sao_dis / lam_critic ✓ (patches/verl_sao_7aed6b23.patch applied)"
+        else
+            _pf_fatal "imported verl lacks RolloutCorrectionConfig.sao_dis / algorithm.lam_critic — patches/verl_sao_7aed6b23.patch is not applied (re-run scripts/setup_env.sh)"
+        fi
+
+        # 10e. token budget × SP. prepare_micro_batches multiplies the per-GPU budget
+        # back by sp_size and rearrange_micro_batches asserts it covers the longest
+        # sequence PER RANK; one rank failing leaves the others waiting in
+        # _compute_values until NCCL_TIMEOUT. common.env's default lands exactly on
+        # the window with zero margin.
+        _budget="${CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU:-${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-}}"
+        if [ -n "$_budget" ] && [ -n "${SP_SIZE:-}" ] && [ -n "${MAX_PROMPT:-}" ] && [ -n "${MAX_RESP:-}" ]; then
+            _cover=$(( _budget * SP_SIZE )); _need=$(( MAX_PROMPT + MAX_RESP ))
+            if [ "$_cover" -lt "$_need" ]; then
+                _pf_fatal "critic token budget ${_budget}×SP${SP_SIZE}=${_cover} < window ${_need}: a rank whose micro-batch reaches the window asserts in rearrange_micro_batches and the rest deadlock in _compute_values"
+            elif [ "$_cover" -eq "$_need" ]; then
+                _pf_warn "critic token budget ${_budget}×SP${SP_SIZE} equals the window ${_need} exactly — zero margin; the 8B smoke needed ${_budget}→$(( _budget + 4096 )) to stop hanging"
+            else
+                _pf_ok "critic token budget ${_budget}×SP${SP_SIZE}=${_cover} ≥ window ${_need} ✓"
+            fi
+        fi
+
+        # 10f. frozen attention × engine × model family. verl raises on a pattern that
+        # matches nothing, and FSDP1 cannot flatten mixed requires_grad.
+        _fp="${CRITIC_FREEZE_PARAM_PATTERNS:-null}"
+        if [ "$(_lc "$_fp")" != null ] && [ "$_fp" != "[]" ]; then
+            if [ "$(_lc "${ENGINE:-}")" = fsdp ] && [ "$(_lc "${CRITIC_FSDP_STRATEGY:-fsdp2}")" = fsdp ] \
+                && ! [[ "$(_lc "${CRITIC_FSDP_USE_ORIG_PARAMS:-false}")" =~ ^(1|true)$ ]]; then
+                _pf_fatal "CRITIC_FREEZE_PARAM_PATTERNS set with CRITIC_FSDP_STRATEGY=fsdp and use_orig_params=False — FSDP1 cannot flatten a unit with mixed requires_grad; use fsdp2 or CRITIC_FSDP_USE_ORIG_PARAMS=True"
+            fi
+            if [ "$_PF_STRUCT" = "1" ] || ! command -v model_attention_kinds >/dev/null 2>&1; then
+                _pf_skip "freeze patterns × model family: needs the checkpoint's config.json"
+            else
+                _kinds="$(model_attention_kinds "${MODEL_PATH:-}")"
+                if [ -z "$_kinds" ]; then
+                    _pf_warn "cannot read attention layout of ${MODEL_PATH:-?}; CRITIC_FREEZE_PARAM_PATTERNS=$_fp unverified (a pattern matching nothing raises in verl)"
+                else
+                    _fp_bad=""
+                    for _pat in linear_attn visual; do
+                        if printf '%s' "$_fp" | grep -q "$_pat" && ! printf '%s' "$_kinds" | grep -qw "$_pat"; then
+                            _fp_bad="$_fp_bad $_pat"
+                        fi
+                    done
+                    if [ -n "$_fp_bad" ]; then
+                        _pf_fatal "CRITIC_FREEZE_PARAM_PATTERNS=$_fp names [$_fp_bad ] but $MODEL_PATH has only [$_kinds] — verl raises on a pattern that matches no parameter"
+                    elif printf '%s' "$_kinds" | grep -qw linear_attn && ! printf '%s' "$_fp" | grep -q linear_attn; then
+                        _pf_warn "hybrid model ($_kinds) but CRITIC_FREEZE_PARAM_PATTERNS=$_fp freezes only the full-attention layers (~4% of tensors on Qwen3.5-35B-A3B); the validated 35B runs used '[self_attn.,linear_attn.,visual.]'"
+                    else
+                        _pf_ok "freeze patterns $_fp match the checkpoint's attention layout [$_kinds] ✓"
+                    fi
+                fi
+            fi
+        fi
+
+        # 10g. the two settings that starved / collapsed r6. WARN only: both are legal.
+        if [ -n "${CRITIC_GRAD_CLIP:-}" ] && awk "BEGIN{exit !(${CRITIC_GRAD_CLIP} <= 1.0)}" 2>/dev/null; then
+            _pf_warn "CRITIC_GRAD_CLIP=${CRITIC_GRAD_CLIP}: critic/grad_norm sits at 5-30 on 30B-35B models, so clip≤1 scales every update down 7-70× and the critic never converges (r6: vf_explained_var 0-0.3 for 130 steps). Validated: 10"
+        fi
+        if [ "$(_lc "${GAE_WHITEN_ADVANTAGES:-true}")" = false ] \
+            && { [ -z "${CRITIC_MODEL_PATH:-}" ] || [ "${CRITIC_MODEL_PATH:-}" = "${MODEL_PATH:-}" ]; }; then
+            _pf_warn "GAE_WHITEN_ADVANTAGES=False with a cold critic (CRITIC_MODEL_PATH = actor): un-whitened advantages drift ±0.25 while the critic is weak, and consecutive all-negative batches collapsed r6. Keep True until vf_explained_var > 0.4 for ~20 steps"
+        fi
+        if [ -n "${N_RESP:-}" ] && [ "${N_RESP}" -gt 1 ] 2>/dev/null; then
+            _pf_warn "critic on with N_RESP=${N_RESP}: legal (classic PPO), but not single-rollout SAO"
+        fi
+    fi
+fi
 
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$_PF_ERR" -gt 0 ]; then

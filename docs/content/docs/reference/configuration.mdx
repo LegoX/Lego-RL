@@ -45,7 +45,7 @@ Copy `lib/site.example.env` when onboarding a new cluster.
 | **T0 axes** | picked once, by choosing a template | `TRAIN_MODE` `SCAFFOLD` `BACKEND` `MODEL_ENGINE` | template filename + first lines |
 | **T1 required** | every run | `PROJECT_NAME` `EXP_TAG` `TRAIN_INDEX`/`VAL_INDEX` topology | the `CHANGEME` lines |
 | **T2 often tuned** | frequently | `SAVE_FREQ` `TOTAL_EPOCHS` `TRAIN_BSZ` `N_RESP` `MAX_RESP` `VAL_BEFORE_TRAIN` `N_CONCURRENT` | config, add a line |
-| **T3 advanced** | rarely, and know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `KL_LOSS_COEF` | config, overrides a default |
+| **T3 advanced** | rarely, and know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `KL_LOSS_COEF` `CRITIC_*` `LAM_CRITIC` | config, overrides a default |
 | **T4 site** | once per cluster | registry / nydus / mounts / kubeconfig / `MODEL_ROOT` / `DOCKER_HOST` | `lib/site.env` |
 | **T5 hidden** | basically never | ~80 harbor + hyperparameter defaults (loop config, offload, tail-kill, pod timeouts…) | `lib/*` + the runner |
 
@@ -201,6 +201,25 @@ TEMPERATURE=1.0
 ```
 
 The meaning of each symbol is defined in [Core Concepts](/docs/core-concepts).
+
+### SAO (single-rollout, value-based)
+
+[SAO](/docs/run-training/sao) is enabled by adding `verl/sao.env` to `TEMPLATE_MODULES`
+**above** `verl/common.env`. It flips the profile to `N_RESP=1`, `ADV_ESTIMATOR=gae`,
+`POLICY_LOSS_MODE=bypass_mode` and turns on a critic. Its knobs, all with defaults in
+`scripts/templates/verl/sao.env`:
+
+| Knob | Default | Maps to |
+| --- | --- | --- |
+| `LENGTH_ADAPTIVE_LAM_ALPHA` / `LAM_CRITIC` / `LAM` | `1.5` / `1.0` / `1.0` | `algorithm.length_adaptive_lam_alpha`, `algorithm.lam_critic`, `algorithm.lam` — decoupled GAE lambdas |
+| `GAE_WHITEN_ADVANTAGES` | `True` | `algorithm.gae_whiten_advantages` — batch-whiten actor advantages (returns are untouched) |
+| `ROLLOUT_IS` / `ROLLOUT_IS_THRESHOLD` / `ROLLOUT_CORRECTION_LOSS_TYPE` | `token` / `0.2_4.0` / `reinforce` | the DIS recipe, written to `algorithm.rollout_correction.*` **and** `actor.policy_loss.rollout_correction.*` |
+| `CRITIC_MODEL_PATH` | `$MODEL_PATH` | `critic.model.path` — the actor checkpoint gives a cold value head; a merged critic gives a warm start |
+| `CRITIC_LR` / `CRITIC_GRAD_CLIP` / `CRITIC_PPO_EPOCHS` / `CRITIC_WARMUP` | `5e-6` / `10` / `2` / `10` | `critic.optim.lr`, `critic.optim.clip_grad`, `critic.ppo_epochs`, `trainer.critic_warmup` |
+| `CRITIC_FREEZE_PARAM_PATTERNS` | `[self_attn.]` | `critic.<engine>.freeze_param_patterns` — Qwen3.5 hybrids need `[self_attn.,linear_attn.,visual.]` |
+| `CRITIC_USE_DYNAMIC_BSZ` / `CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU` | `True` / actor's budget | `critic.use_dynamic_bsz`, `critic.ppo_max_token_len_per_gpu` |
+| `MAX_ACTOR_CKPT_TO_KEEP` / `MAX_CRITIC_CKPT_TO_KEEP` | `null` | `trainer.max_{actor,critic}_ckpt_to_keep` — retention; an actor + critic checkpoint is hundreds of GB |
+| `ACTOR_CKPT_LOAD_CONTENTS` / `CRITIC_CKPT_LOAD_CONTENTS` | unset | `*.checkpoint.load_contents` — set `[model,optimizer]` when a resume changes the LR |
 
 ## wandb
 

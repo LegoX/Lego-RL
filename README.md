@@ -6,16 +6,21 @@
 
 **Online reinforcement learning for coding agents in their native harnesses and real repositories.**
 
-[![arXiv](https://img.shields.io/badge/arXiv-2608.17393-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.17393)
-[![Docs](https://img.shields.io/badge/docs-lego--rl.pages.dev-2563eb?logo=readthedocs&logoColor=white)](https://lego-rl.pages.dev)
-[![LegoX](https://img.shields.io/badge/LegoX-legox.net-b3431f)](https://legox.net/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![verl](https://img.shields.io/badge/verl-Elvin--Yiming--Du%2Fverl-orange)](https://github.com/Elvin-Yiming-Du/verl)
-[![Harbor](https://img.shields.io/badge/Harbor-Elvin--Yiming--Du%2Fharbor-8b5cf6)](https://github.com/Elvin-Yiming-Du/harbor)
-
-**[Documentation](https://lego-rl.pages.dev)** · **[Getting Started](https://lego-rl.pages.dev/docs/getting-started)** · **[Why Lego-RL](https://lego-rl.pages.dev/docs/why-lego-rl)** · **[LegoX](https://legox.net/)**
+<p align="center">
+  <a href="https://arxiv.org/abs/2608.17393"><img src="img/icon-paper.svg" height="15" alt=""> Paper</a>
+  &nbsp;·&nbsp;
+  <a href="https://lego-rl.pages.dev"><img src="img/icon-docs.svg" height="15" alt=""> Docs</a>
+  &nbsp;·&nbsp;
+  <a href="https://huggingface.co/collections/Lego-X/lego-rl"><img src="img/icon-huggingface.svg" height="15" alt=""> HuggingFace</a>
+  &nbsp;·&nbsp;
+  <a href="https://legox.net/"><img src="img/icon-legox.svg" height="15" alt=""> LegoX</a>
+  &nbsp;·&nbsp;
+  <a href="LICENSE"><img src="img/icon-license.svg" height="15" alt=""> License</a>
+</p>
 
 </div>
+
+---
 
 Lego-RL is an open-source framework for training coding agents with online reinforcement learning on
 real software-engineering tasks. It connects **Claude Code**, **OpenHands**, and **OpenCode** to
@@ -28,6 +33,47 @@ updates the policy from the captured trajectory.
 <div align="center">
  <img src="docs/public/framework.png" width="820" alt="Lego-RL architecture">
 </div>
+
+## Results
+
+`Qwen3.5-35B-A3B` trained for three epochs (126 steps) on a [2,699-task OpenSWE-derived index](https://huggingface.co/datasets/Lego-X/Lego-RL-2699),
+under three native harnesses, and evaluated on the held-out *SWE-bench Verified*:
+
+<div align="center">
+ <img src="docs/public/results_curves.png" width="900" alt="Training reward and SWE-bench Verified solve rate across three harnesses">
+</div>
+
+Verifier reward rises under every harness, and every run improves on the benchmark:
+**+6.4** points with OpenHands SDK, **+5.8** with Claude Code, **+9.4** with OpenCode.
+
+<table align="center">
+<thead>
+<tr><th>Coding agent</th><th>Model</th><th align="center">SWE-bench Verified (%)</th></tr>
+</thead>
+<tbody>
+<tr><td rowspan="4"><b>OpenHands SDK</b></td><td>Qwen3.5-35B-A3B</td><td align="center">64.0</td></tr>
+<tr><td>Qwen3.6-35B-A3B</td><td align="center">67.4</td></tr>
+<tr><td>KAT-Coder-V2.5-Dev</td><td align="center">67.0</td></tr>
+<tr><td><b>Lego-RL-Qwen3.5-35B-A3B</b></td><td align="center"><b>70.4 (+6.4)</b></td></tr>
+<tr><td rowspan="4"><b>Claude Code</b></td><td>Qwen3.5-35B-A3B</td><td align="center">62.4</td></tr>
+<tr><td>Qwen3.6-35B-A3B</td><td align="center">63.4</td></tr>
+<tr><td>KAT-Coder-V2.5-Dev</td><td align="center">66.8</td></tr>
+<tr><td><b>Lego-RL-Qwen3.5-35B-A3B</b></td><td align="center"><b>68.2 (+5.8)</b></td></tr>
+<tr><td rowspan="4"><b>OpenCode</b></td><td>Qwen3.5-35B-A3B</td><td align="center">57.2</td></tr>
+<tr><td>Qwen3.6-35B-A3B</td><td align="center">60.6</td></tr>
+<tr><td>KAT-Coder-V2.5-Dev</td><td align="center">61.2</td></tr>
+<tr><td><b>Lego-RL-Qwen3.5-35B-A3B</b></td><td align="center"><b>66.6 (+9.4)</b></td></tr>
+</tbody>
+</table>
+
+All numbers are measured by us under the same harness version and evaluation protocol
+(temperature 0.7, 200 turns, 200k context budget). RL on the 3.5-generation policy beats both the
+next base generation and KAT-Coder-V2.5-Dev, a model post-trained from it, in all three harnesses.
+The gains are also harness-specific — KAT-Coder gains 3.4 points under Claude Code, the harness its
+authors report, but 0.6 under OpenCode and -0.4 under OpenHands SDK — which is exactly why Lego-RL
+trains inside the harness the agent will actually run in.
+
+Full protocol, ablations, and failure analysis are in the [paper](https://arxiv.org/abs/2608.17393).
 
 ## Live Training Dashboard
 
@@ -55,7 +101,8 @@ bash webui/start_dashboard.sh
 - **Faithful rollouts**: an [in-process proxy](https://lego-rl.pages.dev/docs/architecture/in-process-proxy)
   records token ids, masks, and log-probabilities at generation time. It also handles history
   rewrites and serves the OpenAI and Anthropic interfaces used by the supported agents.
-- **RL and scaling**: PPO, GRPO, and GSPO run on FSDP, VeOmni, or Megatron, either synchronously or
+- **RL and scaling**: PPO, GRPO, GSPO, and [SAO](https://lego-rl.pages.dev/docs/run-training/sao)
+  (single-rollout, critic-based) run on FSDP, VeOmni, or Megatron, either synchronously or
   fully asynchronously. MoE runs can use R3 routing replay, while trajectory filtering removes
   broken or over-long rollouts from the loss.
 - **Sandboxed rewards**: [Kubernetes or Docker](https://lego-rl.pages.dev/docs/training-run/sandbox-backends)
@@ -96,7 +143,7 @@ The validate step launches nothing. In Claude Code the same run is `/rl:run scri
 Questions, run reports and contributions are welcome. Scan to join the WeChat group:
 
 <div align="center">
- <img src="docs/public/wechat-group.jpg" width="220" alt="Lego-RL WeChat group">
+ <img src="docs/public/wechat_group.png" width="220" alt="Lego-RL WeChat group">
 </div>
 
 ## License

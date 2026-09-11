@@ -126,6 +126,17 @@ initialize_runtime() {
             echo "[FATAL] 'veomni' not importable under $PYTHON_BIN" >&2
             exit 1
         }
+        # VeOmni resolves "<Family>ForTokenClassification" by substring and, unpatched,
+        # falls through to the CausalLM class: the critic is silently built as a
+        # language model and GAE sees vocab-sized "values". veomni is a wheel, not a
+        # managed checkout, so the fix is a site-packages patcher (idempotent, also
+        # run by setup_env.sh). Re-run here because a venv rebuild loses it.
+        if is_true "${CRITIC_ENABLE:-False}"; then
+            "$PYTHON_BIN" "$REPO_ROOT/utils/apply_veomni_valuehead_patch.py" || {
+                echo "[FATAL] veomni value-head patch failed; a critic would be built as a language model" >&2
+                exit 1
+            }
+        fi
     fi
 
     require_var TRAIN_LOG
@@ -197,6 +208,15 @@ run_preflight() {
     VERL_HAS_ROUTER_REPLAY="$verl_has_router_replay" ENABLE_R3="${ENABLE_R3:-}" \
     FUSED_KERNELS="${FUSED_KERNELS:-}" ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-}" \
     LR_SCHEDULER="${LR_SCHEDULER:-}" ROLLOUT_IS="${ROLLOUT_IS:-}" \
+    ADV_ESTIMATOR="${ADV_ESTIMATOR:-}" CRITIC_ENABLE="${CRITIC_ENABLE:-}" \
+    TEMPLATE_MODULES_STR="${TEMPLATE_MODULES[*]:-}" \
+    POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-}" ROLLOUT_CORRECTION_BYPASS="${ROLLOUT_CORRECTION_BYPASS:-}" \
+    N_RESP="${N_RESP:-}" GAE_WHITEN_ADVANTAGES="${GAE_WHITEN_ADVANTAGES:-}" \
+    CRITIC_MODEL_PATH="${CRITIC_MODEL_PATH:-}" CRITIC_GRAD_CLIP="${CRITIC_GRAD_CLIP:-}" \
+    CRITIC_FREEZE_PARAM_PATTERNS="${CRITIC_FREEZE_PARAM_PATTERNS:-}" \
+    CRITIC_FSDP_STRATEGY="${CRITIC_FSDP_STRATEGY:-}" CRITIC_FSDP_USE_ORIG_PARAMS="${CRITIC_FSDP_USE_ORIG_PARAMS:-}" \
+    ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-}" \
+    CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU="${CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU:-}" \
     VAL_TIMEOUT="${HARBOR_VAL_AGENT_MAX_TIMEOUT_SEC:-}" \
     IMAGE_REGISTRY="${HARBOR_OPENSWE_IMAGE_REGISTRY:-}" INLINE_BUILD="${HARBOR_K8S_INLINE_BUILD:-}" \
     NYDUS_MIRROR="${HARBOR_NYDUS_MIRROR:-}" K8S_KUBECONFIG="${K8S_KUBECONFIG:-}" \
@@ -252,7 +272,18 @@ print_run_configuration() {
     fi
     kv batch      "${TRAIN_BSZ:-?} prompts × ${N_RESP:-?} resp = $trials trials/step  mini=${TRAIN_MINI_BSZ:-?}  dynamic_bsz=${USE_DYNAMIC_BSZ:-?}"
     kv context    "prompt=${MAX_PROMPT:-?} + resp=${MAX_RESP:-?} = $window"
-    kv algorithm  "${ADV_ESTIMATOR:-?}  lr=${ACTOR_LR:-?}  lr_sched=${LR_SCHEDULER:-?}  kl_loss_coef=${KL_LOSS_COEF:-?}"
+    kv algorithm  "${ADV_ESTIMATOR:-?}  loss=${POLICY_LOSS_MODE:-?}  lr=${ACTOR_LR:-?}  lr_sched=${LR_SCHEDULER:-?}  kl_loss_coef=${KL_LOSS_COEF:-?}"
+    if [ "${ADV_ESTIMATOR:-}" = gae ]; then
+        kv ""     "gae: lam=${LAM:-?}  lam_critic=${LAM_CRITIC:-?}  len_adaptive_alpha=${LENGTH_ADAPTIVE_LAM_ALPHA:-?}  whiten=${GAE_WHITEN_ADVANTAGES:-?}"
+    fi
+    if is_true "${ROLLOUT_CORRECTION_BYPASS:-False}"; then
+        kv ""     "bypass: loss_type=${ROLLOUT_CORRECTION_LOSS_TYPE:-?}  rollout_is=${ROLLOUT_IS:-?}  threshold=${ROLLOUT_IS_THRESHOLD:-?}"
+    fi
+    if is_true "${CRITIC_ENABLE:-False}"; then
+        kv critic   "model=${CRITIC_MODEL_PATH:-${MODEL_PATH:-?}}"
+        kv ""       "lr=${CRITIC_LR:-?}  clip_grad=${CRITIC_GRAD_CLIP:-?}  epochs=${CRITIC_PPO_EPOCHS:-?}  warmup=${CRITIC_WARMUP:-?}  dynamic_bsz=${CRITIC_USE_DYNAMIC_BSZ:-?}"
+        kv ""       "freeze=${CRITIC_FREEZE_PARAM_PATTERNS:-?}  token_budget=${CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU:-${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-?}}"
+    fi
     kv rollout    "temp=${TEMPERATURE:-?} top_p=${TOP_P:-?}  val_temp=${VAL_TEMPERATURE:-?}  val_n=${VAL_N:-?}"
     kv ""         "R3=${ENABLE_R3:-?} (model is $moe)  rollout_is=${ROLLOUT_IS:-?}  max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-<verl default>}"
     kv schedule   "save_freq=${TRAINER_SAVE_FREQ:-?}  test_freq=${TRAINER_TEST_FREQ:-?}  val_before_train=${TRAINER_VAL_BEFORE_TRAIN:-?}  epochs=${TOTAL_EPOCHS:-?}"
