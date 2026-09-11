@@ -36,7 +36,7 @@ updates the policy from the captured trajectory.
   and Claude Code. Each trajectory resolves one harness from dataset metadata or a weighted policy,
   while validation stays pinned to one harness so its metrics remain comparable across steps.
 - [2026/09/07] **SAO.** Single-rollout, critic-based training with decoupled GAE lambdas, a
-  frozen-attention critic, and DIS. See the [SAO guide](https://lego-rl.pages.dev/docs/run-training/sao).
+  frozen-attention critic, and DIS.
 - [2026/08] **First public release.** Lego-RL brings Claude Code, OpenHands, and OpenCode into
   online RL on real repositories, with native harnesses, executable verifier rewards, synchronous
   or asynchronous training, and live run monitoring.
