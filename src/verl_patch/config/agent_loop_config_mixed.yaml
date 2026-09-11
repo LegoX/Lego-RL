@@ -1,0 +1,157 @@
+# Metadata-controlled mixed harness training. Task-level weighted selection is
+# deterministic; trajectory-level selection draws independently per rollout.
+# All definitions share worker-level controls and one tokenizer/parser/proxy;
+# each harness only carries its protocol-specific agent and runtime config.
+- name: builtin_swe_agent
+  _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
+  tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+  max_consecutive_no_tool: ${oc.decode:${oc.env:HARBOR_MAX_CONSECUTIVE_NO_TOOL,3}}
+  trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+  max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
+
+  harness_selection:
+    metadata_keys:
+      - agent_harness
+      - harness
+    default: ${oc.env:HARBOR_HARNESS_DEFAULT,openhands_sdk}
+    fallback: ${oc.env:HARBOR_HARNESS_FALLBACK,default}
+    # Validation uses one harness for every sample to keep val metrics
+    # comparable. Override with HARBOR_VAL_HARNESS (default: OpenHands SDK).
+    val_harness: ${oc.env:HARBOR_VAL_HARNESS,openhands_sdk}
+    # Used only by deterministic task-level selection.
+    random_seed: ${oc.decode:${oc.env:HARBOR_HARNESS_RANDOM_SEED,1234}}
+    granularity: ${oc.env:HARBOR_HARNESS_GRANULARITY,task}
+    weights:
+      openhands_sdk: ${oc.decode:${oc.env:HARBOR_HARNESS_WEIGHT_OHSDK,1.0}}
+      opencode: ${oc.decode:${oc.env:HARBOR_HARNESS_WEIGHT_OC,1.0}}
+      claude_code: ${oc.decode:${oc.env:HARBOR_HARNESS_WEIGHT_CC,1.0}}
+
+  harnesses:
+    openhands_sdk:
+      protocol: openai
+      harbor_cfg:
+        agent:
+          import_path: ${oc.env:HARBOR_MIXED_OHSDK_IMPORT_PATH,harbor.agents.custom.openhands_sdk:CustomOpenHandsSDK}
+          model_name: hosted_vllm/${oc.env:SERVED_MODEL_NAME,vllm_model}
+          max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,2400}}
+          override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,2400}}
+          kwargs:
+            max_iterations: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,200}}
+            max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,200}}
+            temperature: ${oc.decode:${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}}
+            top_p: ${oc.decode:${oc.env:HARBOR_AGENT_TOP_P,1.0}}
+            version: ${oc.env:HARBOR_MIXED_OHSDK_VERSION,1.33.0}
+            disable_tool_calls: ${oc.decode:${oc.env:HARBOR_AGENT_DISABLE_TOOL_CALLS,False}}
+            parser_name: ${oc.env:HARBOR_AGENT_PARSER_NAME,json}
+            model_info: ${oc.decode:${oc.env:HARBOR_AGENT_MODEL_INFO,null}}
+            interleaved_thinking: ${oc.decode:${oc.env:HARBOR_AGENT_INTERLEAVED_THINKING,False}}
+            enable_summarize: ${oc.decode:${oc.env:HARBOR_AGENT_ENABLE_SUMMARIZE,True}}
+            proactive_summarization_threshold: ${oc.decode:${oc.env:HARBOR_AGENT_PROACTIVE_SUMMARIZATION_THRESHOLD,8000}}
+            record_terminal_session: ${oc.decode:${oc.env:HARBOR_AGENT_RECORD_TERMINAL_SESSION,True}}
+            suppress_max_turns_warning: ${oc.decode:${oc.env:HARBOR_AGENT_SUPPRESS_MAX_TURNS_WARNING,True}}
+        verifier:
+          enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+        environment:
+          type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+          import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment}
+          force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,False}}
+          delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+          override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+          override_memory_mb: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB,8192}}
+          kwargs:
+            kubeconfig_path: ${oc.env:K8S_KUBECONFIG,$HOME/.kube/config}
+            namespace: ${oc.env:K8S_NAMESPACE,default}
+            pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,1200}}
+            pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
+            agent_runtime_image: ${oc.env:HARBOR_MIXED_OHSDK_RUNTIME_IMAGE,docker.io/jierun/c-oh-sdk-1.33.0:v0.1}
+            agent_runtime_mount_path: /opt/custom-agent-runtime/oh-sdk
+            agent_runtime_image_subpath: opt/custom-agent-runtime/oh-sdk
+            host_path_mounts: ${oc.env:HARBOR_HOSTPATH_MOUNTS,null}
+        environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+        agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+        agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,1.0}}
+        verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
+
+    opencode:
+      protocol: openai
+      harbor_cfg:
+        agent:
+          import_path: ${oc.env:HARBOR_MIXED_OC_IMPORT_PATH,harbor_patch.agents.image_mounted_opencode:OpenCode}
+          model_name: hosted_vllm/${oc.env:SERVED_MODEL_NAME,vllm_model}
+          max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,2400}}
+          override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,2400}}
+          kwargs:
+            max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,200}}
+            temperature: ${oc.decode:${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}}
+          env:
+            HOSTED_VLLM_BASE_URL: http://in-process-proxy/v1
+            HOSTED_VLLM_API_KEY: ${oc.env:HARBOR_OPENAI_API_KEY,sk-dummy}
+            OPENCODE_TEMPERATURE: ${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}
+            OPENCODE_CONFIG_CONTENT: ${oc.env:HARBOR_OPENCODE_CONFIG_CONTENT,dummy-config-for-local-vllm}
+            CUSTOM_AGENT_RUNTIME_ROOT: /opt/custom-agent-runtime/opencode
+            CUSTOM_AGENT_OPENCODE: /opt/custom-agent-runtime/opencode/bin/opencode
+            CUSTOM_AGENT_RUNTIME_ENV_SCRIPT: /opt/custom-agent-runtime/opencode/runtime-env.sh
+        verifier:
+          enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+        environment:
+          type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+          import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment}
+          force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,False}}
+          delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+          override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+          override_memory_mb: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB,8192}}
+          kwargs:
+            kubeconfig_path: ${oc.env:K8S_KUBECONFIG,$HOME/.kube/config}
+            namespace: ${oc.env:K8S_NAMESPACE,default}
+            pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,1200}}
+            pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
+            agent_runtime_image: ${oc.env:HARBOR_MIXED_OC_RUNTIME_IMAGE,docker.io/jierun/c-oc-1.14.22:v0.1}
+            agent_runtime_mount_path: /opt/custom-agent-runtime/opencode
+            agent_runtime_image_subpath: opt/custom-agent-runtime/opencode
+            host_path_mounts: ${oc.env:HARBOR_HOSTPATH_MOUNTS,null}
+        environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+        agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+        agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,1.0}}
+        verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
+
+    claude_code:
+      protocol: anthropic
+      harbor_cfg:
+        agent:
+          import_path: ${oc.env:HARBOR_MIXED_CC_IMPORT_PATH,harbor_patch.agents.image_mounted_claude_code:ClaudeCode}
+          model_name: ${oc.env:SERVED_MODEL_NAME,vllm_model}
+          max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,2400}}
+          override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,2400}}
+          kwargs:
+            max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,200}}
+            temperature: ${oc.decode:${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}}
+          env:
+            ANTHROPIC_BASE_URL: http://in-process-proxy
+            ANTHROPIC_API_KEY: ${oc.env:HARBOR_ANTHROPIC_API_KEY,sk-dummy}
+            ANTHROPIC_MODEL: ${oc.env:HARBOR_ANTHROPIC_MODEL,vllm_model}
+            CLAUDE_CODE_ATTRIBUTION_HEADER: ${oc.env:CLAUDE_CODE_ATTRIBUTION_HEADER,0}
+            CUSTOM_AGENT_RUNTIME_ROOT: /opt/custom-agent-runtime/claude-code
+            CUSTOM_AGENT_CLAUDE: /opt/custom-agent-runtime/claude-code/bin/claude
+            CUSTOM_AGENT_RUNTIME_ENV_SCRIPT: /opt/custom-agent-runtime/claude-code/runtime-env.sh
+        verifier:
+          enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+        environment:
+          type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+          import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment}
+          force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,False}}
+          delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+          override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+          override_memory_mb: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB,8192}}
+          kwargs:
+            kubeconfig_path: ${oc.env:K8S_KUBECONFIG,$HOME/.kube/config}
+            namespace: ${oc.env:K8S_NAMESPACE,default}
+            pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,1200}}
+            pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
+            agent_runtime_image: ${oc.env:HARBOR_MIXED_CC_RUNTIME_IMAGE,docker.io/jierun/c-cc-2.1.118:v0.1}
+            agent_runtime_mount_path: /opt/custom-agent-runtime/claude-code
+            agent_runtime_image_subpath: opt/custom-agent-runtime/claude-code
+            host_path_mounts: ${oc.env:HARBOR_HOSTPATH_MOUNTS,null}
+        environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+        agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+        agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,1.0}}
+        verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}

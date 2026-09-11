@@ -5,24 +5,27 @@
 #
 # Architecture (Design A):
 #   claude-code (inside remote docker container, mounted runtime)
-#     -> in-process vLLM chat-completion proxy (started by BuiltinCCAgentLoop,
+#     -> in-process vLLM chat-completion proxy (started by BuiltinSWEAgentLoop,
 #        serves Anthropic /v1/messages directly; ANTHROPIC_BASE_URL overridden
 #        per-trial with the proxy's per-session URL)
 #       -> vLLM (managed by verl, OpenAI API format)
 - name: builtin_swe_agent
-  _target_: verl_patch.agent_loop.BuiltinCCAgentLoop
+  _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
+  # Shared worker controls live at the loop level, not inside Harbor's
+  # per-harness TrialConfig.
+  tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+  max_consecutive_no_tool: ${oc.decode:${oc.env:HARBOR_MAX_CONSECUTIVE_NO_TOOL,3}}
+  trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+  max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
   harbor_cfg:
     agent:
       # Must match the model's chat_template tool-call format and the trainer
       # config's engine_kwargs.vllm.tool-call-parser. Default fallback "hermes"
       # (JSON) does not match Qwen3-Coder XML models -> 0 parsed tool calls.
-      tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
       import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_claude_code:ClaudeCode}
       model_name: ${oc.env:SERVED_MODEL_NAME,vllm_model}
       max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,1500}}
       override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,1500}}
-      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
-      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
       kwargs:
         max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
         temperature: ${oc.decode:${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}}
@@ -51,4 +54,3 @@
     agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
     agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
     verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
-    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}

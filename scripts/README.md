@@ -59,7 +59,7 @@ parameter or a default.
 |---|---|---|
 | `TRAIN_MODE` | `async` \| `sync` | entrypoint `fully_async_main`+`fully_async_fsdp.yaml` / `main_ppo`+`sync.yaml`; async splits train/rollout, sync is one colocated pool |
 | `ENGINE` | `veomni` \| `fsdp` | veomni: `model_engine=veomni`+`veomni.*` (required for hybrid GDN); fsdp: `strategy=fsdp2`+`fsdp_config.*` (R3 forces SP=1). **Chosen by the model preset** — usually leave it alone |
-| `SCAFFOLD` | `ohsdk` \| `oh` \| `cc` \| `oc` | agent class + runtime image + loop config. ohsdk = primary; cc = Claude-Code; oc = OpenCode (R3 off by default) |
+| `SCAFFOLD` | `ohsdk` \| `oh` \| `cc` \| `oc` \| `mixed` | agent class + runtime image + loop config. `mixed` selects a complete harness config per sample. |
 | `BACKEND` | `k8s` \| `docker` | task-env backend. k8s = pull prebuilt only (`force_build` ignored, never builds); docker = pull prebuilt (`force_build=False`) or build on a remote daemon. docker currently only has an oh loop config. See **Environment images** |
 | model | `MODEL_PATH` + `TOOL_PARSER` + `ENGINE` + `SP_SIZE` + `MAX_PROMPT`/`MAX_RESP` | set explicitly per model; the per-model values worth copying are tabulated in the docs under Configuration |
 | node count | `NNODES`/`N_NODES_TRAIN`/`N_NODES_ROLLOUT` | pure parameters, not a template axis |
@@ -148,7 +148,7 @@ failure modes (`No pre-built rootfs`, `KeyError: 'config'`, empty-`position_ids`
 | preflight (no cluster) | `PREFLIGHT_ONLY=1 bash scripts/train/train.sh <config>` |
 | print the final launch command | `DRY_RUN=1 bash scripts/train/train.sh <config>` |
 | swap model | change `MODEL_PATH` + `TOOL_PARSER` + `ENGINE`/`SP_SIZE` + the context window |
-| swap scaffold | change `SCAFFOLD=` (ohsdk/cc/oc) |
+| swap scaffold | change `SCAFFOLD=` (ohsdk/cc/oc/mixed) |
 | sync ↔ async | change `TRAIN_MODE=` and use the matching template |
 | change cluster | edit `lib/site.env` (or a one-off `K8S_KUBECONFIG=... bash ...`) |
 | smoke run | in the config: `TRAIN_BSZ=8 N_RESP=4` |

@@ -21,19 +21,21 @@ For each trial a worker:
    update.
 
 The core of the loop
-(`src/verl_patch/agent_loop/builtin_cc_agent_loop.py`, simplified):
+(`src/verl_patch/agent_loop/builtin_swe_agent_loop.py`, simplified):
 
 ```python
-class BuiltinCCAgentLoop(AgentLoopBase):
+class BuiltinSWEAgentLoop(AgentLoopBase):
     async def run(self, sampling_params, **kwargs) -> AgentLoopOutput:
         task_path = kwargs["extra_info"]["harbor_task_path"]
+        harness = self.harness_resolver.resolve(kwargs)
 
         # in-process proxy: one singleton per worker; a fresh session per attempt
         proxy = await _ensure_proxy_started(self)
 
         # sandboxed trial: env setup → agent execution → verifier (reward 0/1)
         reward, trial_reason, session_meta = await self._run_harbor_trial(
-            task_path=task_path, sampling_params=sampling_params, proxy=proxy)
+            task_path=task_path, sampling_params=sampling_params, proxy=proxy,
+            harness_selection=harness)
 
         # token source of truth = the proxy trajectory — never a re-tokenized
         # transcript; robust to crash/timeout trials (pre-failure tokens kept)
@@ -63,8 +65,40 @@ bottleneck.
 
 The worker's per-scaffold logic lives in an agent-loop class:
 
-- `BuiltinCCAgentLoop` — Claude Code (Anthropic protocol).
-- `BuiltinSWEAgentLoop` — OpenHands / OpenCode / Terminus (OpenAI protocol).
+- `BuiltinSWEAgentLoop` is the maintained implementation for OpenHands SDK,
+  OpenHands, OpenCode, and Claude Code. It selects a complete Harbor harness
+  definition per sample, then routes OpenAI-compatible clients through
+  `/v1/chat/completions` and Claude Code through Anthropic `/v1/messages`.
+- `BuiltinCCAgentLoop` remains only as a compatibility subclass with no
+  behavioral overrides while downstream configs migrate.
+
+Set `SCAFFOLD=mixed` to load `agent_loop_config_mixed.yaml`. A dataset row can
+select a harness explicitly:
+
+```json
+{
+  "extra_info": {
+    "harbor_task_path": "/data/tasks/example",
+    "instance_id": "example",
+    "agent_harness": "claude_code"
+  }
+}
+```
+
+Valid built-in mixed names are `openhands_sdk`, `opencode`, and `claude_code`.
+Missing metadata uses the configured fallback. The `mixed` scaffold preset
+defaults to equal-weight `weighted_random`; set
+`HARBOR_HARNESS_FALLBACK=default` to always use the configured default harness.
+Task-level selection is deterministic, while trajectory-level selection draws
+independently because fully-async worker shards do not carry a reliable sibling
+rollout ID.
+Validation is separate from training selection: mixed runs use
+`HARBOR_VAL_HARNESS` (default `openhands_sdk`) for every validation sample, so
+validation metrics stay comparable across steps. Explicit validation metadata is
+still checked and unknown harness names fail that trajectory.
+Unknown explicit names fail that trajectory instead of silently changing its
+harness. Selection defaults to task granularity, so sibling GRPO rollouts use
+the same harness.
 
 Four scaffolds — **Claude Code, OpenHands, OpenCode, Terminus** — are validated
 end to end and strictly adapted. Any other scaffold that speaks the OpenAI or

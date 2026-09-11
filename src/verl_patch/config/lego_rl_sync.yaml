@@ -1,4 +1,4 @@
-# Hydra config for Harbor × Claude Code × RLLM  *online RL*  training.
+# Hydra config for Harbor harness-native online RL training.
 
 hydra:
   searchpath:
@@ -9,7 +9,7 @@ defaults:
   - _self_
 
 # ---------------------------------------------------------------------------
-# vLLM HTTP endpoint — RLLM starts this; LiteLLM proxy forwards to it.
+# vLLM generation is reached through the shared in-process harness proxy.
 # ---------------------------------------------------------------------------
 actor_rollout_ref:
   rollout:
@@ -19,19 +19,18 @@ actor_rollout_ref:
       do_sample: True
     engine_kwargs:
       vllm:
-        # Must match SERVED_MODEL_NAME (what the agent/LiteLLM forwards
-        # to vLLM as openai/<name>). Keep env-driven to stay in sync.
+        # Must match SERVED_MODEL_NAME used by the selected harness.
         served-model-name: ${oc.env:SERVED_MODEL_NAME,vllm_model}
         enable-expert-parallel: True
         enable-auto-tool-choice: True
         # Single source of truth: TOOL_CALL_PARSER drives BOTH this vLLM
-        # serving parser and the agent-side harbor_cfg.agent.tool_parser.
+        # serving parser and the agent-loop config's top-level tool_parser.
         tool-call-parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
         attention-config.backend: FLASH_ATTN
     agent:
       num_workers: 8
       default_agent_loop: "builtin_swe_agent"
-      agent_loop_config_path: ${oc.env:LEGO_RL_ROOT,${oc.env:SWE_LEGO_RL_ROOT}}/src/verl_patch/config/agent_loop_config_${oc.env:AGENT_SCAFFOLD,oh}.yaml
+      agent_loop_config_path: ${oc.env:AGENT_LOOP_CONFIG_PATH,${oc.env:LEGO_RL_ROOT,${oc.env:SWE_LEGO_RL_ROOT}}/src/verl_patch/config/agent_loop_config_oh.yaml}
 
 fireworks:
   deployment_id: null

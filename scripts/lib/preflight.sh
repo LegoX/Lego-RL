@@ -198,15 +198,11 @@ fi
 # --- 6. AGENT_NAME × scaffold ── §4.2 env_setup avalanche / factory dispatch ───────────
 _an="$(_lc "${AGENT_NAME:-}")"
 case "$_sc" in
-    ohsdk|oh)   # must be null → uses import_path, no in-pod venv triggered (no-egress cluster will crash)
+    ohsdk|oh|cc|oc|mixed)   # null makes Harbor honor the patched import_path
         { [ -z "$_an" ] || [ "$_an" = null ]; } && _pf_ok "AGENT_NAME=null ✓ ($_sc uses import_path)" \
             || _pf_fatal "SCAFFOLD=$_sc but AGENT_NAME='$AGENT_NAME' non-null → uses in-pod venv install, no-egress cluster will fail → env_setup avalanche" ;;
-    cc)         [ "$_an" = claude-code ] && _pf_ok "AGENT_NAME=claude-code ✓ (cc)" \
-            || _pf_warn "SCAFFOLD=cc normally AGENT_NAME=claude-code, current='$AGENT_NAME'" ;;
-    oc)         [ "$_an" = opencode ] && _pf_ok "AGENT_NAME=opencode ✓ (oc)" \
-            || _pf_warn "SCAFFOLD=oc normally AGENT_NAME=opencode, current='$AGENT_NAME'" ;;
     "")         : ;;
-    *)          _pf_warn "unknown SCAFFOLD='$_sc' (supports ohsdk|oh|cc|oc)" ;;
+    *)          _pf_warn "unknown SCAFFOLD='$_sc' (supports ohsdk|oh|cc|oc|mixed)" ;;
 esac
 # backend=docker: currently only oh_docker loop config, cc/oc on docker not wired up
 if [ "$(_lc "${BACKEND:-k8s}")" = docker ]; then

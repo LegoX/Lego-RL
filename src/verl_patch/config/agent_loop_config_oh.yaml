@@ -1,20 +1,19 @@
 - name: builtin_swe_agent
   _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
+  # Shared worker controls live at the loop level, not inside a harness's
+  # Harbor TrialConfig. They apply equally to OH-SDK, OpenHands, and OpenCode.
+  tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+  max_consecutive_no_tool: ${oc.decode:${oc.env:HARBOR_MAX_CONSECUTIVE_NO_TOOL,3}}
+  trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+  max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
   harbor_cfg:
     agent:
       name: ${oc.decode:${oc.env:HARBOR_AGENT_NAME,null}}
       model_name: hosted_vllm/${oc.env:SERVED_MODEL_NAME,vllm_model}
-      # Tool-call parser BuiltinSWEAgentLoop uses to parse the model's tool calls (it reads
-      # agent.tool_parser, defaulting to "hermes" when absent). Qwen3.5 emits qwen3_coder
-      # format, so the missing field made OH fall back to hermes -> 100% tool-parse failures
-      # -> agents stopped after 1 turn (score 0). Mirrors agent_loop_config_cc.yaml.
-      tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
       # image_mounted variant (a11b504): detect+use the runtime pre-baked into the image
       # (agent_runtime_image below) instead of an in-pod venv that fails on no-egress pods.
       import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_openhands_ai.openhands:OpenHands}
       max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,null}}
-      trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
-      max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
       kwargs:
         max_iterations: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
         max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
@@ -75,4 +74,3 @@
     agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
     agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
     verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
-    max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}

@@ -20,9 +20,9 @@ for SWE-bench tasks and converts the results to verl's AgentLoopOutput format.
 
 Architecture:
     Harbor manages the entire agent loop:
-    - Calls vLLM via LiteLLM (OpenAI format) — but routed through an in-process
-      proxy (see ``_VLLMChatCompletionsProxy`` below) instead of hitting vLLM
-      directly. The proxy forwards every chat completion to
+    - OpenAI-compatible harnesses call ``/v1/chat/completions`` and Claude Code
+      calls the Anthropic ``/v1/messages`` surface of the same in-process proxy.
+      The proxy normalizes both protocols and forwards every generation to
       ``server_manager.generate(...)`` so partial-rollout abort/retry from
       ``FullyAsyncLLMServerManager`` becomes transparent to Harbor.
     - Executes tools (bash, file operations, docker interactions)
@@ -54,9 +54,9 @@ Integration points:
       trajectory built during chat completions (see ``vllm_chat_completion_proxy``)
 """
 
+import json
 import logging
 import os
-import json
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -84,13 +84,13 @@ _HARBOR_TIMING_KEYS = (
 # in extra_fields. Pre-populated alongside ``_HARBOR_TIMING_KEYS`` so empty
 # trials still aggregate cleanly.
 _PROXY_METRIC_KEYS = (
-    "proxy_num_calls",            # number of chat completion calls handled
-    "proxy_num_aborts",           # number of calls whose underlying vLLM request was aborted
-    "proxy_num_preempted",        # sum of per-call ``num_preempted`` reported by vLLM
+    "proxy_num_calls",  # number of chat completion calls handled
+    "proxy_num_aborts",  # number of calls whose underlying vLLM request was aborted
+    "proxy_num_preempted",  # sum of per-call ``num_preempted`` reported by vLLM
     "proxy_total_prompt_tokens",  # sum of prompt token counts across calls
     "proxy_total_completion_tokens",  # sum of completion token counts across calls
-    "proxy_model_inference",      # cumulative ``server_manager.generate`` wall time (seconds)
-    "proxy_tool_call",            # cumulative gap between completions and next request (seconds)
+    "proxy_model_inference",  # cumulative ``server_manager.generate`` wall time (seconds)
+    "proxy_tool_call",  # cumulative gap between completions and next request (seconds)
     # Per-turn version of proxy_tool_call: one gap per round of in-pod tool execution + reasoning,
     # summarized per trajectory. verl reports each as timing_s/agent_loop/<key>/{min,max,mean}, so
     # proxy_tool_gap_max/max is the slowest single tool round in the whole step (catches hangs).
@@ -108,6 +108,7 @@ from verl.utils.profiler import simple_timer
 try:
     from harbor.trial.trial import Trial
     from harbor.models.trial.config import TrialConfig
+
     HARBOR_AVAILABLE = True
 except ImportError:
     HARBOR_AVAILABLE = False
@@ -120,17 +121,22 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # Suppress urllib3 warnings for Harbor's HTTPS connections with verify=False
 try:
     import urllib3
+
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:
     pass
-
-# Maximum retries for Harbor trial execution
-MAX_RETRIES = 2
 
 import numpy as np
 
 from .vllm_chat_completion_proxy import (  # pyright: ignore[reportMissingImports]
     _ensure_proxy_started,
+)
+from .harness import (
+    HarnessResolver,
+    HarnessSelection,
+    inject_harness_endpoint,
+    normalize_sample_mapping,
+    normalize_harness_definitions,
 )
 
 # Canonical trajectory-termination taxonomy (single source of truth in verl). The string
@@ -139,6 +145,7 @@ from .vllm_chat_completion_proxy import (  # pyright: ignore[reportMissingImport
 try:
     from verl.trainer.ppo.trajectory_filter import TerminationReason
 except Exception:  # pragma: no cover - keeps rollout alive on old verl
+
     class TerminationReason:
         AGENT_COMPLETED = "agent_completed"
         OVERLONG = "overlong"
@@ -150,7 +157,8 @@ except Exception:  # pragma: no cover - keeps rollout alive on old verl
 def _termination_reason_flags(termination_reason: str) -> dict[str, bool]:
     """Map the single termination taxonomy to trajectory_filter legacy flags."""
     return {
-        "is_context_error": termination_reason in {"context_error", "context_length_exceeded"},
+        "is_context_error": termination_reason
+        in {"context_error", "context_length_exceeded"},
         "is_env_failure": termination_reason == TerminationReason.ENV_SETUP_FAILED,
         "is_timeout": termination_reason == TerminationReason.TIMEOUT,
         "is_overlong": termination_reason == TerminationReason.OVERLONG,
@@ -178,11 +186,11 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
     3. Reward extraction (verifier result)
     4. Proxy trajectory → AgentLoopOutput token fields
 
-    Key config (via rollout_config.agent):
-        harbor_cfg (dict): Harbor TrialConfig dict (default.yaml + overrides)
-        trials_dir (str): Base directory for Harbor trial outputs
-        max_retries (int): Max retry attempts for failed trials
-        agent_type (str): "claude-code" or other agent name
+    Single-harness runs pass ``harbor_cfg``; mixed runs pass a ``harnesses``
+    mapping plus ``harness_selection``. Exactly one selected Harbor config is
+    deep-copied and validated for each trajectory. Shared loop controls
+    (``tool_parser``, ``max_consecutive_no_tool``, ``trials_dir``, and
+    ``max_retries``) are configured at the loop-item level.
     """
 
     def __init__(self, *args, **kwargs):
@@ -194,23 +202,68 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 "pip install harbor"
             )
 
-        # Harbor configuration
-        # self.harbor_cfg = OmegaConf.to_container(self.rollout_config.agent.get("harbor_cfg", {}), resolve=True)
-        self.harbor_cfg = OmegaConf.to_container(kwargs.get("harbor_cfg", {}), resolve=True)
-        self.base_trials_dir = self.harbor_cfg.get("agent", {}).get("trials_dir", "./harbor_trials")
-        self.max_retries = self.harbor_cfg.get("agent", {}).get("max_retries", MAX_RETRIES)
+        def to_plain(value: Any) -> Any:
+            if value is None:
+                return None
+            if OmegaConf.is_config(value):
+                return OmegaConf.to_container(value, resolve=True)
+            return deepcopy(value)
+
+        raw_harbor_cfg = to_plain(kwargs.get("harbor_cfg"))
+        raw_harnesses = to_plain(kwargs.get("harnesses"))
+        raw_selection = to_plain(kwargs.get("harness_selection"))
+        definitions = normalize_harness_definitions(
+            harbor_cfg=raw_harbor_cfg,
+            harnesses=raw_harnesses,
+        )
+
+        # These are worker-level controls shared by every harness. They must be
+        # declared explicitly on the loop item; Harbor TrialConfig owns only the
+        # selected harness definition and must not receive these controls.
+        required_controls = (
+            "tool_parser",
+            "max_consecutive_no_tool",
+            "trials_dir",
+            "max_retries",
+        )
+        missing_controls = [
+            key for key in required_controls if kwargs.get(key) is None
+        ]
+        if missing_controls:
+            raise ValueError(
+                "BuiltinSWEAgentLoop requires top-level loop controls: "
+                f"{missing_controls}"
+            )
+        self._tool_parser_name = str(kwargs["tool_parser"])
+        self._max_consecutive_no_tool = int(kwargs["max_consecutive_no_tool"])
+        self.base_trials_dir = str(kwargs["trials_dir"])
+        self.max_retries = int(kwargs["max_retries"])
+
+        self.harnesses = definitions
+        self.harness_resolver = HarnessResolver(self.harnesses, raw_selection)
+        # Compatibility attributes for callers that introspect legacy loops.
+        first = next(iter(self.harnesses.values()))
+        self.harbor_cfg = first.harbor_cfg
 
         # Validation-specific overrides. Each defaults to the training value (or None =
-        # "leave harbor_cfg as-is") so behavior is UNCHANGED unless the env var is set.
+        # "leave the selected harness config as-is") so behavior is UNCHANGED unless the
+        # env var is set.
         # Lets validation use more retries / longer pod-startup / longer agent timeout
         # WITHOUT affecting per-step training latency.
-        self.val_max_retries = int(os.environ.get("HARBOR_VAL_MAX_RETRIES", self.max_retries))
+        _val_max_retries = os.environ.get("HARBOR_VAL_MAX_RETRIES")
+        self.val_max_retries = int(_val_max_retries) if _val_max_retries else None
         _val_pod_startup = os.environ.get("K8S_VAL_POD_STARTUP_TIMEOUT")
-        self.val_pod_startup_timeout = int(_val_pod_startup) if _val_pod_startup else None
+        self.val_pod_startup_timeout = (
+            int(_val_pod_startup) if _val_pod_startup else None
+        )
         _val_agent_timeout = os.environ.get("HARBOR_VAL_AGENT_MAX_TIMEOUT_SEC", 4800)
-        self.val_agent_max_timeout = int(_val_agent_timeout) if _val_agent_timeout else None
+        self.val_agent_max_timeout = (
+            int(_val_agent_timeout) if _val_agent_timeout else None
+        )
         _val_pod_deadline = os.environ.get("K8S_VAL_POD_ACTIVE_DEADLINE_SECONDS")
-        self.val_pod_active_deadline = int(_val_pod_deadline) if _val_pod_deadline else None
+        self.val_pod_active_deadline = (
+            int(_val_pod_deadline) if _val_pod_deadline else None
+        )
 
         # Prompt/response length limits
         self.prompt_length = self.rollout_config.prompt_length
@@ -220,32 +273,18 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         # exhausted it as termination_reason="max_turns_reached". 0 => unknown/disabled.
         self._max_turns = int(os.environ.get("HARBOR_AGENT_MAX_ITERATIONS", "0") or "0")
 
-        agent_name = self.harbor_cfg.get("agent", {}).get("name", "")
-        self._tool_parser_name = self.harbor_cfg.get("agent", {}).pop("tool_parser", "hermes")
-
-        # Early termination: stop a session after N consecutive assistant turns
-        # without any tool_calls. 0 = disabled (default).
-        self._max_consecutive_no_tool = int(
-            self.harbor_cfg.get("agent", {}).get(
-                "max_consecutive_no_tool",
-                os.getenv("HARBOR_MAX_CONSECUTIVE_NO_TOOL", "0"),
-            )
-        )
-
-        # Lazily started on first ``run()``; singleton per ``server_manager`` (Ray actor).
-        self._vllm_chat_proxy = None
-
         # Lazily started on first ``run()``; singleton per ``server_manager`` (Ray actor).
         self._vllm_chat_proxy = None
 
         # vLLM endpoint will be injected via server_manager at runtime
         logger.info(
-            "BuiltinSWEAgentLoop initialized. agent=%s  trials_dir=%s  max_retries=%d "
-            "tool_parser=%s",
-            agent_name,
+            "BuiltinSWEAgentLoop initialized. harnesses=%s trials_dir=%s max_retries=%d "
+            "tool_parser=%s max_consecutive_no_tool=%d",
+            sorted(self.harnesses),
             self.base_trials_dir,
             self.max_retries,
             self._tool_parser_name,
+            self._max_consecutive_no_tool,
         )
 
     async def _get_vllm_chat_proxy(self):
@@ -274,7 +313,41 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         """
         # Extract task data from kwargs
         raw_prompt = kwargs.get("raw_prompt", [])
-        extra_info = kwargs.get("extra_info", {})
+        # True during validation rollouts.  Mixed validation intentionally
+        # resolves one configured harness for every sample so metrics are
+        # comparable across validation steps.
+        is_val = bool(kwargs.get("validate", False))
+        try:
+            extra_info = normalize_sample_mapping(
+                kwargs.get("extra_info", {}), field="extra_info"
+            )
+        except ValueError as exc:
+            logger.error("Invalid extra_info: %s", exc)
+            try:
+                fallback_selection = self.harness_resolver.resolve(
+                    {key: value for key, value in kwargs.items() if key != "extra_info"},
+                    is_val=is_val,
+                )
+            except ValueError:
+                fallback_selection = None
+            return self._make_empty_output(
+                kwargs,
+                reason="invalid_extra_info",
+                harness_selection=fallback_selection,
+                selection_error=str(exc),
+            )
+
+        try:
+            harness_selection = self.harness_resolver.resolve(kwargs, is_val=is_val)
+        except ValueError as exc:
+            # Unknown explicit metadata is a sample configuration error.  Do
+            # not silently change the requested training distribution.
+            logger.error("Harness selection failed: %s", exc)
+            return self._make_empty_output(
+                kwargs,
+                reason="harness_selection_error",
+                selection_error=str(exc),
+            )
 
         # Get Harbor task path
         task_path = (
@@ -285,12 +358,14 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
 
         if not task_path:
             logger.error("No task_path found in kwargs")
-            return self._make_empty_output(kwargs, reason="no_task_path")
+            return self._make_empty_output(
+                kwargs,
+                reason="no_task_path",
+                harness_selection=harness_selection,
+            )
 
         # Get global step for trial directory organization
         global_steps = kwargs.get("global_steps", 0)
-        # True during validation rollouts; selects the val-specific retry/timeout knobs.
-        is_val = bool(kwargs.get("validate", False))
 
         # Timing metrics - pre-populate with harbor phase keys so aggregation is
         # stable across samples even when a trial ends early (e.g. empty output
@@ -300,6 +375,11 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         metrics: dict[str, float] = {k: 0.0 for k in _HARBOR_TIMING_KEYS}
         for k in _PROXY_METRIC_KEYS:
             metrics.setdefault(k, 0.0)
+        for name in self.harnesses:
+            metrics[f"harness_selected/{name}"] = float(
+                name == harness_selection.definition.name
+            )
+            metrics[f"harness_reward/{name}"] = 0.0
 
         # Proxy process binds once per worker; each Harbor retry uses a fresh session_id,
         # api_base path, trial_name, and trajectory dir (see ``_run_harbor_trial``).
@@ -313,6 +393,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 proxy=proxy,
                 metrics=metrics,
                 is_val=is_val,
+                harness_selection=harness_selection,
             )
 
         # Alias harbor_total into the standard ``generate_sequences`` key so verl's
@@ -346,7 +427,13 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 len(tail_lp),
                 session_meta.get("disable_proxy_trajectory"),
             )
-            return self._make_empty_output(kwargs, metrics=metrics, session_meta=session_meta, reason="invalid_trajectory")
+            return self._make_empty_output(
+                kwargs,
+                metrics=metrics,
+                session_meta=session_meta,
+                reason="invalid_trajectory",
+                harness_selection=harness_selection,
+            )
 
         prompt_ids = traj_acc[:prompt_token_len]
         response_ids = traj_acc[prompt_token_len:]
@@ -359,14 +446,25 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         if not prompt_ids or not response_ids:
             logger.warning(
                 "Empty proxy trajectory token ids (prompt=%d, response=%d), task=%s",
-                len(prompt_ids), len(response_ids), task_path,
+                len(prompt_ids),
+                len(response_ids),
+                task_path,
             )
-            return self._make_empty_output(kwargs, metrics=metrics, session_meta=session_meta, reason="empty_token_ids")
+            return self._make_empty_output(
+                kwargs,
+                metrics=metrics,
+                session_meta=session_meta,
+                reason="empty_token_ids",
+                harness_selection=harness_selection,
+            )
 
         # Real verifier reward for every kept trajectory (agent_completed / overlong /
         # max_turns_reached). Categories the trajectory filter drops (timeout,
         # env_setup_failed) get their reward+advantage zeroed there, so no force-0 here.
         reward_score = reward
+        metrics[f"harness_reward/{harness_selection.definition.name}"] = float(
+            reward_score
+        )
 
         # Resolve global_steps span. ``min/max_global_steps`` from the proxy's
         # session metadata reflects all weight versions actually observed
@@ -398,9 +496,9 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=response_ids[:self.response_length],
-            response_mask=response_mask[:self.response_length],
-            response_logprobs=response_logprobs[:self.response_length],
+            response_ids=response_ids[: self.response_length],
+            response_mask=response_mask[: self.response_length],
+            response_logprobs=response_logprobs[: self.response_length],
             # R3: full-length [prompt+response, layers, topk] routing tensor;
             # None when no routing was captured, so non-R3 runs are unaffected.
             routed_experts=self._build_routed_experts(
@@ -423,6 +521,10 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 "proxy_num_preempted": int(metrics.get("proxy_num_preempted", 0)),
                 "trajectory_token_source": "proxy_tokens",
                 "tool_parser": self._tool_parser_name,
+                "agent_harness": harness_selection.definition.name,
+                "harness_protocol": harness_selection.definition.protocol,
+                "harness_selection_source": harness_selection.source,
+                "harness_selection_error": "",
             },
         )
 
@@ -450,48 +552,48 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         """
         if results is None:
             return
-        metrics["harbor_env_setup"] = (
-            metrics.get("harbor_env_setup", 0.0)
-            + self._timing_duration(getattr(results, "environment_setup", None))
-        )
-        metrics["harbor_agent_setup"] = (
-            metrics.get("harbor_agent_setup", 0.0)
-            + self._timing_duration(getattr(results, "agent_setup", None))
-        )
-        metrics["harbor_agent_execute"] = (
-            metrics.get("harbor_agent_execute", 0.0)
-            + self._timing_duration(getattr(results, "agent_execution", None))
-        )
-        metrics["harbor_verifier"] = (
-            metrics.get("harbor_verifier", 0.0)
-            + self._timing_duration(getattr(results, "verifier", None))
-        )
+        metrics["harbor_env_setup"] = metrics.get(
+            "harbor_env_setup", 0.0
+        ) + self._timing_duration(getattr(results, "environment_setup", None))
+        metrics["harbor_agent_setup"] = metrics.get(
+            "harbor_agent_setup", 0.0
+        ) + self._timing_duration(getattr(results, "agent_setup", None))
+        metrics["harbor_agent_execute"] = metrics.get(
+            "harbor_agent_execute", 0.0
+        ) + self._timing_duration(getattr(results, "agent_execution", None))
+        metrics["harbor_verifier"] = metrics.get(
+            "harbor_verifier", 0.0
+        ) + self._timing_duration(getattr(results, "verifier", None))
         agent_metadata = (
             getattr(results, "agent_result", None).metadata
             if getattr(results, "agent_result", None) is not None
             else None
         )
         if isinstance(agent_metadata, dict):
-            metrics["harbor_agent_tool_call"] = (
-                metrics.get("harbor_agent_tool_call", 0.0)
-                + float(agent_metadata.get("harbor_agent_tool_call") or 0.0)
-            )
-            metrics["harbor_agent_model_inference"] = (
-                metrics.get("harbor_agent_model_inference", 0.0)
-                + float(agent_metadata.get("harbor_agent_model_inference") or 0.0)
-            )
+            metrics["harbor_agent_tool_call"] = metrics.get(
+                "harbor_agent_tool_call", 0.0
+            ) + float(agent_metadata.get("harbor_agent_tool_call") or 0.0)
+            metrics["harbor_agent_model_inference"] = metrics.get(
+                "harbor_agent_model_inference", 0.0
+            ) + float(agent_metadata.get("harbor_agent_model_inference") or 0.0)
 
     @staticmethod
-    def _assign_proxy_metrics_from_session(metrics: dict[str, float], meta: dict) -> None:
+    def _assign_proxy_metrics_from_session(
+        metrics: dict[str, float], meta: dict
+    ) -> None:
         """Overwrite proxy counters from a single completed proxy session (one Harbor attempt)."""
         metrics["proxy_num_calls"] = float(meta.get("num_calls") or 0)
         metrics["proxy_num_aborts"] = float(meta.get("num_aborts") or 0)
         metrics["proxy_num_preempted"] = float(meta.get("num_preempted") or 0)
-        metrics["proxy_total_prompt_tokens"] = float(meta.get("total_prompt_tokens") or 0)
+        metrics["proxy_total_prompt_tokens"] = float(
+            meta.get("total_prompt_tokens") or 0
+        )
         metrics["proxy_total_completion_tokens"] = float(
             meta.get("total_completion_tokens") or 0
         )
-        metrics["proxy_model_inference"] = float(meta.get("proxy_model_inference_sec") or 0.0)
+        metrics["proxy_model_inference"] = float(
+            meta.get("proxy_model_inference_sec") or 0.0
+        )
         metrics["proxy_tool_call"] = float(meta.get("proxy_tool_call_sec") or 0.0)
         # Per-turn tool/agent gap stats (sec) for this trajectory; in-pod tools are invisible,
         # so the inter-LLM-call gap is the closest verl-side signal (a hung tool round -> big max).
@@ -511,6 +613,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         proxy: Any,
         metrics: dict[str, float] | None = None,
         is_val: bool = False,
+        harness_selection: HarnessSelection | None = None,
     ) -> tuple[float, str, dict]:
         """
         Execute Harbor trial with retries. Each retry uses a new proxy ``session_id``,
@@ -525,16 +628,25 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         if metrics is None:
             metrics = {}
 
-        cfg = deepcopy(self.harbor_cfg)
-        cfg["trials_dir"] = f"{self.base_trials_dir}/step_{global_steps:04d}"
+        if harness_selection is None:
+            # ``run`` always passes its already-resolved selection. This
+            # fallback keeps direct helper callers backward compatible.
+            harness_selection = self.harness_resolver.resolve({}, is_val=is_val)
+        definition = harness_selection.definition
+
+        cfg = deepcopy(definition.harbor_cfg)
+        base_trials_dir = self.base_trials_dir
+        cfg["trials_dir"] = f"{base_trials_dir}/step_{global_steps:04d}"
         cfg["task"] = {"path": task_path}
 
-        # Validation-only overrides. Training trials keep the shared harbor_cfg values,
-        # so per-step training latency is unaffected. When the val env vars are unset
-        # these all fall back to the training values (no behavioral change).
+        # Validation-only overrides. Training trials keep the selected harness
+        # definition values, so per-step training latency is unaffected. When the val
+        # env vars are unset these all fall back to the training values (no behavioral
+        # change).
         max_retries = self.max_retries
         if is_val:
-            max_retries = self.val_max_retries
+            if self.val_max_retries is not None:
+                max_retries = self.val_max_retries
             if self.val_pod_startup_timeout is not None:
                 cfg.setdefault("environment", {}).setdefault("kwargs", {})[
                     "pod_startup_timeout_sec"
@@ -544,65 +656,87 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                     "pod_active_deadline_seconds"
                 ] = self.val_pod_active_deadline
             if self.val_agent_max_timeout is not None:
-                cfg.setdefault("agent", {})["max_timeout_sec"] = self.val_agent_max_timeout
+                cfg.setdefault("agent", {})["max_timeout_sec"] = (
+                    self.val_agent_max_timeout
+                )
 
         reward = 0.0
         trial_reason = TerminationReason.AGENT_COMPLETED
         session_meta: dict = {}
-
-        # NOTE: For Claude Code (Anthropic format) we still need a separate
-        # LiteLLM proxy that bridges Anthropic to OpenAI. The in-process proxy
-        # only speaks OpenAI Chat Completions for now; supporting Anthropic
-        # is tracked in TODO_http_proxy.md.
+        last_attempt_meta: dict = {}
 
         for attempt in range(max_retries):
             terminal_commit = False
-            prefix = f"[task={Path(task_path).name}] attempt {attempt + 1}/{max_retries}"
-            session_id = f"{_safe_session_slug(task_path)}-{uuid4().hex[:8]}"
+            prefix = (
+                f"[task={Path(task_path).name}] attempt {attempt + 1}/{max_retries}"
+            )
+            harness_prefix = {
+                "claude_code": "cc",
+                "opencode": "oc",
+                "openhands_sdk": "ohsdk",
+                "openhands": "oh",
+            }.get(definition.name, _safe_session_slug(definition.name)[:8])
+            session_id = (
+                f"{harness_prefix}-{_safe_session_slug(task_path)}-{uuid4().hex[:8]}"
+            )
             api_base = proxy.session_url(session_id)
-            trajectory_dir = Path(self.base_trials_dir) / f"step_{global_steps:04d}" / session_id
+            anthropic_base = proxy.session_anthropic_base(session_id)
+            trajectory_dir = (
+                Path(base_trials_dir) / f"step_{global_steps:04d}" / session_id
+            )
             await proxy.open_session(session_id, trajectory_dir=trajectory_dir)
 
-            cfg.setdefault("agent", {}).setdefault("kwargs", {})["api_base"] = api_base
-            agent_env = cfg.setdefault("agent", {}).setdefault("env", {})
-            agent_env["LLM_BASE_URL"] = api_base
-            agent_env.setdefault(
-                "LLM_API_KEY",
-                os.environ.get("LLM_API_KEY", "dummy-key-for-local-vllm"),
+            inject_harness_endpoint(
+                cfg,
+                definition,
+                openai_base=api_base,
+                anthropic_base=anthropic_base,
+                openai_api_key=os.environ.get(
+                    "LLM_API_KEY", "dummy-key-for-local-vllm"
+                ),
+                anthropic_api_key=os.environ.get(
+                    "ANTHROPIC_API_KEY", "dummy-key-for-local-vllm"
+                ),
             )
-            agent_name = cfg.get("agent", {}).get("name", "")
-            agent_import_path = cfg.get("agent", {}).get("import_path", "")
-            if (agent_name and "claude-code" in agent_name) or (agent_import_path and "ClaudeCode" in agent_import_path):
-                cfg.setdefault("agent", {})["model_name"] = cfg.get("agent", {}).get("model_name", "").split("/")[-1]
-                agent_env["ANTHROPIC_BASE_URL"] = api_base
-                agent_env.setdefault(
-                    "ANTHROPIC_API_KEY",
-                    os.environ.get("ANTHROPIC_API_KEY", "dummy-key-for-local-vllm"),
+            agent_env = cfg.setdefault("agent", {}).setdefault("env", {})
+            if definition.name == "opencode":
+                agent_env["OPENCODE_TEMPERATURE"] = os.environ.get(
+                    "OPENCODE_TEMPERATURE", "1.0"
                 )
-            if (agent_name and "opencode" in agent_name) or (agent_import_path and "OpenCode" in agent_import_path):
-                agent_env["HOSTED_VLLM_BASE_URL"] = api_base
-                agent_env.setdefault(
-                    "HOSTED_VLLM_API_KEY",
-                    os.environ.get("HOSTED_VLLM_API_KEY", "dummy-key-for-local-vllm"),
+                agent_env["OPENCODE_CONFIG_CONTENT"] = os.environ.get(
+                    "HARBOR_OPENCODE_CONFIG_CONTENT", "dummy-config-for-local-vllm"
                 )
-                agent_env["OPENCODE_TEMPERATURE"] = os.environ.get("OPENCODE_TEMPERATURE", "1.0")
-                agent_env["OPENCODE_CONFIG_CONTENT"] = os.environ.get("HARBOR_OPENCODE_CONFIG_CONTENT", "dummy-config-for-local-vllm")
             cfg["trial_name"] = session_id
-            # TODO: remove this later
-            # cfg.setdefault("agent", {}).setdefault("kwargs", {})["session_id"] = session_id
 
             if "temperature" in sampling_params:
-                cfg.setdefault("agent", {}).setdefault("kwargs", {})["temperature"] = sampling_params[
-                    "temperature"
-                ]
+                cfg.setdefault("agent", {}).setdefault("kwargs", {})["temperature"] = (
+                    sampling_params["temperature"]
+                )
             if "top_p" in sampling_params:
-                cfg.setdefault("agent", {}).setdefault("kwargs", {})["top_p"] = sampling_params["top_p"]
+                cfg.setdefault("agent", {}).setdefault("kwargs", {})["top_p"] = (
+                    sampling_params["top_p"]
+                )
 
             results = None
             try:
                 # Validate and create trial
                 trial_config = TrialConfig.model_validate(cfg)
                 trial = await Trial.create(trial_config)
+
+                trial_dir = Path(cfg["trials_dir"]) / session_id
+                trial_dir.mkdir(parents=True, exist_ok=True)
+                (trial_dir / "harness.json").write_text(
+                    json.dumps(
+                        {
+                            "agent_harness": definition.name,
+                            "harness_protocol": definition.protocol,
+                            "harness_selection_source": harness_selection.source,
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
 
                 results = await trial.run()
 
@@ -656,7 +790,9 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                     # trajectory is usable and KEPT with its real verifier reward.
                     reward = verifier_reward
                     trial_reason = TerminationReason.OVERLONG
-                    logger.debug("%s context overflow — committing reward=%.3f", prefix, reward)
+                    logger.debug(
+                        "%s context overflow — committing reward=%.3f", prefix, reward
+                    )
                     terminal_commit = True
                     break
 
@@ -664,7 +800,11 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                     # Non-zero agent exit with a real (partial) trajectory + verifier
                     # verdict: treat as completed; the proxy's context_overflow signal
                     # (consulted after the loop) upgrades it to overlong when applicable.
-                    logger.warning("%s agent exited non-zero (no retry). results=%s", prefix, results)
+                    logger.warning(
+                        "%s agent exited non-zero (no retry). results=%s",
+                        prefix,
+                        results,
+                    )
                     reward = verifier_reward
                     trial_reason = TerminationReason.AGENT_COMPLETED
                     terminal_commit = True
@@ -686,20 +826,30 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                     break
 
             except Exception as exc:
-                print(f"[DEBUG] {prefix} exception: {exc}, results={results}")
                 logger.warning("%s exception: %s  results=%s", prefix, exc, results)
                 continue
             finally:
                 attempt_meta = await proxy.pop_session(session_id)
+                last_attempt_meta = attempt_meta
+                self._collect_harbor_timings(results, metrics)
                 if terminal_commit:
-                    self._collect_harbor_timings(results, metrics)
                     self._assign_proxy_metrics_from_session(metrics, attempt_meta)
                     session_meta = attempt_meta
+
+        # If every attempt failed before reaching a terminal classification,
+        # retain the final attempt's counters/partial tokens for audit and the
+        # common empty-output path.
+        if not session_meta and last_attempt_meta:
+            self._assign_proxy_metrics_from_session(metrics, last_attempt_meta)
+            session_meta = last_attempt_meta
 
         # Authoritative overflow signal: the proxy sets ``context_overflow`` the moment a
         # generate call is refused for exceeding the model context, even when the error is
         # later swallowed/relabelled crossing the SDK boundary. Upgrade a plain completion.
-        if session_meta.get("context_overflow") and trial_reason == TerminationReason.AGENT_COMPLETED:
+        if (
+            session_meta.get("context_overflow")
+            and trial_reason == TerminationReason.AGENT_COMPLETED
+        ):
             trial_reason = TerminationReason.OVERLONG
 
         return reward, trial_reason, session_meta
@@ -710,11 +860,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         tensor expected by verl's agent-loop ``_pad`` (which places routed_experts at
         the real prompt start, unlike the response-only logprobs).
 
-        Local copy of ``BuiltinCCAgentLoop._build_routed_experts`` — kept
-        independent per loop on purpose, but the two MUST stay byte-identical:
-        the placement convention below is paired with the verl-side row-content
-        replay mask (verl commit 75b9ea70 / harbor commit 1439084); diverging
-        copies reintroduce the off-by-one this convention eliminated.
+        The placement convention below is paired with the verl-side row-content
+        replay mask (verl commit 75b9ea70 / harbor commit 1439084).
 
         ALIGNMENT CONVENTION: ``routed_experts[j]`` is the routing of the forward
         pass AT position j. vLLM's capturer reports, for each sampled token, the
@@ -751,6 +898,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         metrics: dict[str, float] | None = None,
         session_meta: dict | None = None,
         reason: str = "empty",
+        harness_selection: HarnessSelection | None = None,
+        selection_error: str = "",
     ) -> AgentLoopOutput:
         """
         Create empty AgentLoopOutput for failed trials.
@@ -772,7 +921,11 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         try:
             _rp = kwargs.get("raw_prompt", []) or []
             _ei = kwargs.get("extra_info", {}) or {}
-            _tp = _ei.get("harbor_task_path") or _ei.get("task_path") or (_rp[0].get("content") if _rp else "")
+            _tp = (
+                _ei.get("harbor_task_path")
+                or _ei.get("task_path")
+                or (_rp[0].get("content") if _rp else "")
+            )
             _rec = {
                 "ts": round(time.time(), 1),
                 "task": Path(_tp).name if _tp else "",
@@ -780,6 +933,13 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 "validate": bool(kwargs.get("validate", False)),
                 "global_steps": int(kwargs.get("global_steps", 0) or 0),
             }
+            selected_name = (
+                harness_selection.definition.name
+                if harness_selection is not None
+                else "unresolved"
+            )
+            _rec["agent_harness"] = selected_name
+            _rec["harness_selection_error"] = selection_error
             _dd = Path(self.base_trials_dir) / "_dropped"
             _dd.mkdir(parents=True, exist_ok=True)
             with open(_dd / f"dropped.{os.getpid()}.jsonl", "a") as _f:
@@ -796,6 +956,12 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             base_metrics.setdefault(key, 0.0)
         for key in _PROXY_METRIC_KEYS:
             base_metrics.setdefault(key, 0.0)
+        for name in self.harnesses:
+            base_metrics[f"harness_selected/{name}"] = float(
+                harness_selection is not None
+                and name == harness_selection.definition.name
+            )
+            base_metrics[f"harness_reward/{name}"] = 0.0
         if metrics:
             base_metrics.update(metrics)
         # Keep ``generate_sequences`` aligned with ``harbor_total`` so verl's
@@ -811,7 +977,15 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         return AgentLoopOutput(
             prompt_ids=[0],  # dummy token
             response_ids=[0],
-            response_mask=[0],
+            # Preserve the established SWE-loop zero mask by default. Opt into
+            # the CC-compatible valid dummy token only when an older
+            # rollout-correction path requires it for all-failed batches.
+            response_mask=[
+                int(
+                    os.environ.get("HARBOR_EMPTY_RESPONSE_MASK_ONE", "0").lower()
+                    in {"1", "true", "yes", "on"}
+                )
+            ],
             response_logprobs=[0],
             routed_experts=None,
             multi_modal_data=None,
@@ -832,7 +1006,23 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 "proxy_num_calls": int(base_metrics.get("proxy_num_calls", 0)),
                 "proxy_num_aborts": int(base_metrics.get("proxy_num_aborts", 0)),
                 "proxy_num_preempted": int(base_metrics.get("proxy_num_preempted", 0)),
-                "trajectory_token_source": "empty",
+                "trajectory_token_source": "dummy",
                 "tool_parser": self._tool_parser_name,
+                "agent_harness": (
+                    harness_selection.definition.name
+                    if harness_selection is not None
+                    else "unresolved"
+                ),
+                "harness_protocol": (
+                    harness_selection.definition.protocol
+                    if harness_selection is not None
+                    else "unknown"
+                ),
+                "harness_selection_source": (
+                    harness_selection.source
+                    if harness_selection is not None
+                    else "error"
+                ),
+                "harness_selection_error": selection_error,
             },
         )

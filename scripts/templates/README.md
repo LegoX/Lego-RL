@@ -47,7 +47,7 @@ The common train config shape is:
 ```bash
 # --- template selection -----------------------------------------------
 BACKEND=k8s              # k8s | docker
-SCAFFOLD=ohsdk           # ohsdk | oh | cc | oc
+SCAFFOLD=ohsdk           # ohsdk | oh | cc | oc | mixed
 TRAINING_MODE=async      # async | sync
 MODEL_ENGINE=veomni      # veomni | fsdp
 
@@ -58,6 +58,9 @@ EXP_NAME=...
 # --- runtime -----------------------------------------------------------
 VENV_PATH=/path/to/venv
 WANDB_API_KEY=...
+# Optional; defaults to eth0 and controls Ray node addresses + NCCL/GLOO/TP.
+# MASTER_ADDR remains the independent Ray head bootstrap address.
+TRAIN_NETWORK_INTERFACE=net0
 
 # Optional; defaults to ${REPO_ROOT}/logs when unset.
 HARBOR_LOG_DIR=...
@@ -114,7 +117,7 @@ scripts/train/configs/fully_async_3nodes_qwen35_ohsdk_veomni.env
 
 | Module | Owns |
 | --- | --- |
-| `runtime/process.env` | Process-level environment such as socket interfaces, NCCL/logging defaults, tokenizer/thread knobs, Ray ports, and Ray object store memory. |
+| `runtime/process.env` | Process-level environment such as the unified Ray/NCCL/GLOO/TP interface, logging defaults, tokenizer/thread knobs, Ray ports, and Ray object store memory. |
 | `backend/k8s.env` | Harbor Kubernetes backend defaults, including environment import/type and image strategy defaults. |
 | `backend/docker.env` | Harbor Docker backend selector. Site-specific Docker host values stay in configs or caller environment. |
 | `harbor/common.env` | Harbor agent, trial, validation, retry, resource, verifier, and timeout defaults shared across scaffolds/backends. |
@@ -122,6 +125,7 @@ scripts/train/configs/fully_async_3nodes_qwen35_ohsdk_veomni.env
 | `scaffold/oh.env` | OpenHands agent identity and runtime image settings. |
 | `scaffold/cc.env` | Claude Code agent identity and runtime image settings. |
 | `scaffold/oc.env` | OpenCode agent identity and runtime image settings. |
+| `scaffold/mixed.env` | Mixed-harness selection defaults (including fixed validation harness); per-harness Harbor/runtime definitions live in `agent_loop_config_mixed.yaml`. |
 | `verl/sao.env` | Single-rollout Asynchronous Optimization: `N_RESP=1`, GAE with decoupled lambdas, a frozen-attention critic and the DIS bypass-mode loss. **Must be listed before `verl/common.env`** — every default is `: "${VAR:=…}"` and the first assignment wins, so after `common.env` this module is a silent no-op (preflight rule 10 blocks that). |
 | `verl/common.env` | Verl-native defaults shared by sync/async and VeOmni/FSDP: data, model, actor, rollout, ref, algorithm, topology, experiment/log defaults. |
 | `verl/async.env` | Fully-async entry/config selection and `async_training.*` defaults. |

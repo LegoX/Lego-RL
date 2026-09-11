@@ -57,15 +57,15 @@ actor_rollout_ref:
       backend: "nccl"
     engine_kwargs:
       vllm:
-        # Must match SERVED_MODEL_NAME (what the agent/LiteLLM forwards
-        # to vLLM as openai/<name>). Hardcoding it here desyncs from the agent
+        # Must match SERVED_MODEL_NAME used by the selected harness. Hardcoding
+        # it here desyncs from the agent
         # side the moment SERVED_MODEL_NAME is overridden -> vLLM 404.
         served-model-name: ${oc.env:SERVED_MODEL_NAME,vllm_model}
         enable-expert-parallel: True
         enable-auto-tool-choice: True
         # Single source of truth: TOOL_CALL_PARSER drives BOTH this vLLM
-        # serving parser and the agent-side harbor_cfg.agent.tool_parser
-        # (agent_loop_config_cc*.yaml). Must match the model's chat_template
+        # serving parser and the agent-loop config's top-level tool_parser
+        # (all configured harnesses share this parser). Must match the model's chat_template
         # tool-call format. Keep the default in sync with those configs.
         tool-call-parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
         attention-config.backend: FLASH_ATTN
@@ -77,7 +77,7 @@ actor_rollout_ref:
     agent:
       num_workers: 8
       default_agent_loop: "builtin_swe_agent"
-      agent_loop_config_path: ${oc.env:LEGO_RL_ROOT,${oc.env:SWE_LEGO_RL_ROOT}}/src/verl_patch/config/agent_loop_config_${oc.env:AGENT_SCAFFOLD,oh}.yaml
+      agent_loop_config_path: ${oc.env:AGENT_LOOP_CONFIG_PATH,${oc.env:LEGO_RL_ROOT,${oc.env:SWE_LEGO_RL_ROOT}}/src/verl_patch/config/agent_loop_config_oh.yaml}
 
   actor:
     # Must use rollout log probs for training
