@@ -30,6 +30,17 @@ Each run follows the same loop: an agent works on a repository task in a fresh
 [Harbor](https://github.com/Elvin-Yiming-Du/harbor) sandbox, the task's verifier supplies the reward, and verl
 updates the policy from the captured trajectory.
 
+## News
+
+- [2026/09/11] **Mixed-harness training.** A single run can now interleave OpenHands SDK, OpenCode,
+  and Claude Code. Each trajectory resolves one harness from dataset metadata or a weighted policy,
+  while validation stays pinned to one harness so its metrics remain comparable across steps.
+- [2026/09/07] **SAO.** Single-rollout, critic-based training with decoupled GAE lambdas, a
+  frozen-attention critic, and DIS. See the [SAO guide](https://lego-rl.pages.dev/docs/run-training/sao).
+- [2026/08] **First public release.** Lego-RL brings Claude Code, OpenHands, and OpenCode into
+  online RL on real repositories, with native harnesses, executable verifier rewards, synchronous
+  or asynchronous training, and live run monitoring.
+
 <div align="center">
  <img src="docs/public/framework.png" width="820" alt="Lego-RL architecture">
 </div>
@@ -87,12 +98,6 @@ see the **[dashboard docs](https://lego-rl.pages.dev/docs/dashboard)**.
 ```bash
 bash webui/start_dashboard.sh
 ```
-
-## News
-
-- [2026/08] **First public release.** Lego-RL brings Claude Code, OpenHands, and OpenCode into
-  online RL on real repositories, with native harnesses, executable verifier rewards, synchronous
-  or asynchronous training, and live run monitoring.
 
 ## Key Features
 
