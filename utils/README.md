@@ -104,6 +104,167 @@ parquet (one directory per instance).
 
 Usage: `--output-dir ... --index-dir ...`
 
+### Setting up an official SWE-bench benchmark
+
+Both Multilingual and Pro are *pinned-image* benchmarks: nothing is built in-pod, everything is
+pulled. The order matters, and skipping a step produces `reward 0` on a correct patch rather than
+an error.
+
+```bash
+# 1. convert           -> Harbor task dirs + index parquet
+python utils/convert_swebench_multilingual.py --output-dir <ds> --index-path-prefix <as the training host sees it>
+
+# 2. offline grader    -> mounted at /opt/grading (Multilingual REQUIRES it, see below)
+OUT=<toolchain> bash utils/build_grading_toolchain_v2.sh
+
+# 3. mirror the images -> only if the sandbox nodes cannot reach Docker Hub
+sed -n 's/^docker_image = "\(.*\)"/\1/p' <ds>/*/task.toml | sort -u > images.txt
+LIST=images.txt LOGDIR=<logs> bash utils/populate_swebench_hub.sh    # then set HARBOR_NYDUS_MIRROR
+
+# 4. smoke-test        -> oracle must score 1, empty must score 0, on a few tasks per language
+GRADING_TOOLCHAIN=<toolchain> bash utils/oracle_smoke_task.sh <ds>/<instance> oracle
+
+# 5. run               -> scripts/eval/configs/qwen35-35b_official_{multilingual,pro}.env
+```
+
+**Multilingual cannot be scored without step 2.** Its verifier ends in `uv run parser.py`, which
+resolves swebench from PyPI; sandboxes have no egress, so `test.sh` takes its fallback branch and
+writes `reward 0` unconditionally — and most of these images ship no Python to run a grader with.
+
+**Pro has two subset-specific traps**, both covered by `convert_swebench_pro.py` /
+`build_pro_goproxy.sh` below: its 266 python tasks need the task image's own python in the agent's
+tool shell (`OH_SDK_RESTORE_TASK_ENV`, ~8 points on that subset), and 40 of its go tasks need an
+offline module proxy or they are unsolvable outright.
+
+> ⚠️ **Do not train on Pro as it stands.** The verifier restores exactly the pathspec of
+> `before_repo_set_cmd`'s last line, as the official harness does — but for **440 of the 731**
+> instances the test files it actually runs are a superset of that, and the extra ones are left as
+> the agent wrote them. Harmless for evaluation; as an RL reward signal it is an open
+> reward-hacking channel. Extend the gold checkout to cover `selected_test_files_to_run` first.
+
+**Using Multilingual as the validation set of a training run:**
+
+```bash
+VAL_FILES=<ds>_index.parquet
+HARBOR_HOSTPATH_MOUNTS='[{"host_path":"<toolchain>","mount_path":"/opt/grading","read_only":true}]'
+HARBOR_ENVIRONMENT_OVERRIDE_CPUS=2        # cargo / maven / go test starve at one core
+HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC=4800    # the BASE budget, shared by train and val
+HARBOR_VAL_AGENT_MAX_TIMEOUT_SEC=4800     # val-only cap, independent of the train cap
+```
+
+`min(override, max) * multiplier` is what harbor enforces, and val replaces only the cap — so a
+3600 s train cap and a 4800 s val cap coexist: rollouts stay short while validation is measured at
+the budget the benchmark needs (p99 of agent wall-clock over the 300 tasks is 4800 s; a 3600 s cap
+costs ~2 points of reported score). Note `agent_loop_config_oh.yaml` had no `override_timeout_sec`
+until recently, which made `HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC` inert for the ohsdk scaffold.
+
+### `convert_swebench_multilingual.py`
+
+Converts `SWE-bench/SWE-bench_Multilingual` (300 instances, 9 languages) into Harbor task
+directories in the same layout as the SWE-bench Verified val set, plus the index parquet. The
+verifier is the official `make_test_spec(datum).eval_script` from swebench 4.1.0 (with the three
+instance-specific fixes the upstream Harbor adapter carries), and grading goes
+**offline grader first, `uv run` online only as a fallback** — see
+`grading_toolchain_v2/` below for why that ordering is the whole point.
+
+Needs `swebench>=4.1,<5` **on the converter host** (5.x changed the `make_test_spec` API); the
+task images themselves need nothing.
+
+Usage:
+
+```bash
+python utils/convert_swebench_multilingual.py \
+    --output-dir /path/to/data/harbor_swebench_multilingual_300 \
+    --index-path-prefix /path/to/shared/harbor_swebench_multilingual_300   # path as the TRAINING host sees it
+```
+
+### `convert_swebench_pro.py`
+
+Converts `ScaleAI/SWE-bench_Pro` (731 public instances) plus the per-instance `run_script.sh` /
+`parser.py` from `scaleapi/SWE-bench_Pro-os` into Harbor task dirs and an index parquet. The repo
+lives at `/app`; the verifier reproduces the official
+`swe_bench_pro_eval.py::create_entryscript` (Dockerfile `ENV` exports → gold test-file checkout →
+`run_script.sh` → `parser.py` → resolved iff every `fail_to_pass` **and** `pass_to_pass` test
+passed). Gold test files are checked out by the verifier, so the agent never sees them.
+
+15 instances have an upstream gold patch that fails its own tests (oracle reward 0); they are
+written to `<output-dir>_known_invalid_gold_ids.txt`.
+
+Usage:
+
+```bash
+python utils/convert_swebench_pro.py \
+    --output-dir /path/to/data/harbor_swebench_pro_731 \
+    --index-path-prefix /path/to/shared/harbor_swebench_pro_731 \
+    [--pro-repo <SWE-bench_Pro-os checkout>]   # else cloned to a temp dir
+    [--goproxy-mount /opt/goproxy]             # see build_pro_goproxy.sh
+```
+
+### `build_pro_goproxy.sh`
+
+Builds one offline Go module proxy per Pro task whose **gold patch bumps `go.mod`** (40 of 731).
+Those tasks are otherwise unsolvable: the fix needs module versions the image's cache does not
+have, and the sandbox has no egress — while giving it egress would hand the agent the upstream
+repo and its fix. Each cache is a `GOMODCACHE` download tree consumed through
+`GOPROXY=file://…` + `GOSUMDB=off`, which `convert_swebench_pro.py --goproxy-mount` writes into
+the affected `task.toml`s. ~700 MB per instance, idempotent, resumable. The other ~240 go tasks
+need nothing.
+
+Usage: `bash utils/build_pro_goproxy.sh <dataset_dir> <out_dir> [instance_id ...]`
+
+### `grading_toolchain_v2/parser_offline_v2.py` + `build_grading_toolchain_v2.sh`
+
+A self-contained offline SWE-bench grader, mounted read-only at `/opt/grading` in the verifier
+pod. **Without it the multilingual set cannot be scored at all**: the upstream verifier ends in
+`uv run parser.py`, which resolves `swebench` from PyPI, and sandboxes have no egress — so
+`tests/test.sh` takes its fallback branch and writes `reward 0` unconditionally, a structural
+zero that reads as a bad model. Most of these images ship no Python at all, so the toolchain
+brings its own: python-build-standalone 3.11 + `swebench==4.1.0`.
+
+The parser uses only the log parser + `get_eval_tests_report` (no `make_test_spec`, no network),
+and prints the `SWEBench results ends here` marker **only on a valid verdict** — a crashed
+grader therefore falls back online instead of being recorded as a failed task.
+
+```bash
+OUT=/path/to/data/grading-toolchain-v2 bash utils/build_grading_toolchain_v2.sh
+# then, in the eval/train config (host_path is resolved NODE-side):
+# HARBOR_HOSTPATH_MOUNTS='[{"host_path":"/path/to/data/grading-toolchain-v2","mount_path":"/opt/grading","read_only":true}]'
+```
+
+### `harbor_image_env.py`
+
+Bakes each task image's own `ENV` (`PATH`, `CARGO_HOME`, `JAVA_HOME`, …) into
+`tests/image_env.sh` and makes `tests/test.sh` source it. The Kubernetes backend sets its own
+`PATH` on the pod spec, which **replaces** the image's `ENV PATH` for every exec. The agent
+survives (its shell is a login shell that sources `/root/.cargo/env` and friends), but the
+verifier runs `bash /tests/test.sh` non-login and loses every toolchain the image only exposes
+through `ENV` — `cargo: command not found`, scored as a legitimate 0. The converter calls this
+automatically; run it by hand to backfill an existing dataset (idempotent, and safe to run while
+an eval is in flight, since `tests/` is uploaded at verifier start).
+
+Usage: `python utils/harbor_image_env.py <dataset_dir> [more dirs] [--registry host:port]`
+
+### `populate_swebench_hub.sh`
+
+Mirrors the official per-instance images (`swebench/sweb.eval.x86_64.*` for Verified /
+Multilingual, `jefzda/sweap-images:*` for Pro) from Docker Hub into a
+local registry with `docker buildx imagetools create` (registry-to-registry, nothing staged on
+disk), so no-egress sandbox nodes can pull them. Images keep their Docker Hub names, which is
+what lets `HARBOR_NYDUS_MIRROR` rewrite them transparently. Guards the shared Docker Hub rate
+limit three ways (free ratelimit probe, local hourly ledger, 429 backoff) and is resumable.
+
+Usage: `LIST=<images.txt> LOGDIR=<logs> bash utils/populate_swebench_hub.sh`
+
+### `oracle_smoke_task.sh`
+
+Validates a converted task with plain `docker` — no harbor, no k8s. `oracle` applies
+`solution/solve.sh` then runs the verifier (expect `reward 1`); `empty` runs the verifier on the
+untouched checkout (expect `reward 0`). Run it on a handful of instances per language before
+spending a cluster on a new dataset: it separates "the model failed" from "the task is broken"
+in about a minute.
+
+Usage: `GRADING_TOOLCHAIN=<dir> bash utils/oracle_smoke_task.sh <task_dir> [oracle|empty]`
+
 ### `purge_infra_failed_trials.py`
 
 Removes trials that failed for infrastructure / verifier reasons but were recorded as
