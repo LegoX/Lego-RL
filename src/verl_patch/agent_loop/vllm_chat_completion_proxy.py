@@ -13,6 +13,7 @@ Kept as a standalone module to avoid bloating `builtin_swe_agent_loop.py`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -50,18 +51,6 @@ _RECOMPUTE_MISMATCH_LP = os.environ.get(
     "HARBOR_RECOMPUTE_MISMATCH_LOGPROBS", "1"
 ).strip().lower() not in ("0", "false", "no", "")
 
-# Claude Code Task-tool sub-agents (Explore, web-search, ...) inherit
-# ANTHROPIC_BASE_URL → the same proxy session_id as the main agent, but are
-# *distinct conversations with distinct system prompts*. A same-agent variation
-# (a dynamic <system-reminder>/<env> edit) keeps the whole identity preamble
-# identical → long common prefix; a different sub-agent diverges within the
-# first sentence. This threshold separates "reminder change on the main thread"
-# (kept, rebuild+recompute) from "different sub-agent" (routed to isolated,
-# non-archived state). Override via env.
-_MAIN_AGENT_PREFIX_MATCH = int(
-    os.environ.get("HARBOR_MAIN_AGENT_PREFIX_MATCH", "256")
-)
-
 _OPENCODE_HIDDEN_SYSTEM_PROMPT_PREFIXES = (
     "You are a title generator. You output ONLY a thread title.",
 )
@@ -81,15 +70,6 @@ def _is_opencode_hidden_system_prompt(sys_text: str) -> bool:
         sys_text.startswith(prefix)
         for prefix in _OPENCODE_HIDDEN_SYSTEM_PROMPT_PREFIXES
     )
-
-
-def _common_prefix_len(a: str, b: str) -> int:
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
 
 
 try:
@@ -402,6 +382,18 @@ def _messages_before_first_assistant(messages: list[dict]) -> list[dict]:
         if m.get("role") == "assistant":
             return messages[:i]
     return list(messages)
+
+
+def _messages_fingerprint(messages: list[dict]) -> str:
+    """Return a stable, compact fingerprint for a JSON-shaped message list."""
+    encoded = json.dumps(
+        messages,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return f"{len(encoded)}_{hashlib.sha256(encoded).hexdigest()[:16]}"
 
 
 def _normalize_openai_messages_for_template(messages: list[dict]) -> list[dict]:
@@ -1117,9 +1109,11 @@ class _VLLMChatCompletionsProxy:
         self._session_scheduler = _SessionLevelScheduler(self._server_manager)
         self._session_attempts: dict[str, _SessionAttempt] = {}
         self._session_attempt_seq = 0
-        # Sub-agent routing (see _route_subagent_session):
-        # base session_id -> the main agent's system prompt (first seen).
-        self._main_system: dict[str, str] = {}
+        # Sub-agent routing (see _route_subagent_session): base session_id ->
+        # the main conversation's complete prefix before its first assistant
+        # turn. OpenCode task sub-agents reuse the main system prompt, so the
+        # system prompt alone is not a conversation identity.
+        self._main_initial_messages: dict[str, list[dict]] = {}
         # base session_id -> derived sub-agent state keys, for cleanup on pop.
         self._sub_session_keys: dict[str, set] = {}
 
@@ -1214,10 +1208,10 @@ class _VLLMChatCompletionsProxy:
     async def pop_session(self, session_id: str) -> dict:
         async with self._sessions_lock:
             meta = self._sessions.pop(session_id, None) or self._fresh_session_state()
-            # Drop the main-system fingerprint and any isolated sub-agent threads
-            # (CC Task sub-agents) that shared this session; never trained, so
-            # just discard their state to avoid leaking across trials.
-            self._main_system.pop(session_id, None)
+            # Drop the main-conversation identity and any isolated sub-agent
+            # threads that shared this session; they are never trained, so just
+            # discard their state to avoid leaking across trials.
+            self._main_initial_messages.pop(session_id, None)
             self._session_generation_locks.pop(session_id, None)
             self._session_state_locks.pop(session_id, None)
             self._session_attempts.pop(session_id, None)
@@ -1302,28 +1296,25 @@ class _VLLMChatCompletionsProxy:
     ) -> tuple[str, bool]:
         """Map a request to its conversation thread's state key.
 
-        The main agent and every CC Task sub-agent (Explore, web-search, ...)
-        share one proxy ``session_id`` (inherited ANTHROPIC_BASE_URL) yet are
-        distinct conversations with distinct system prompts. Folding them onto
-        one state thrashes the main thread's prefix chain (full rebuilds on every
-        switch). So: the first system prompt seen on a session is the main thread
-        (keeps the bare ``session_id``); any request whose system prompt is
-        *substantially different* is a sub-agent, routed to an isolated
-        ``{session_id}::sub::{fp}`` key with archiving disabled — served so CC
-        works, but never folded into the trained trajectory.
+        The main agent and Task sub-agents share one proxy ``session_id``. In
+        particular, OpenCode task sub-agents also reuse the main agent's system
+        prompt, so system-prompt equality or similarity cannot distinguish the
+        conversations. The first non-hidden request establishes the main
+        conversation's complete message prefix before its first assistant turn.
+        Only requests with exactly that same initial prefix stay on the bare
+        ``session_id``; every other conversation gets an isolated, non-archived
+        ``{session_id}::sub::{fp}`` state.
 
-        A small same-agent variation (dynamic <system-reminder>/<env> edit) keeps
-        a long common prefix and stays on the main thread (handled there by
-        rebuild + recompute), so reminders are NOT mistaken for sub-agents.
         Returns ``(effective_session_key, is_subagent)``.
         """
         sys_text = _system_text(messages)
+        incoming_initial = _messages_before_first_assistant(messages)
         async with self._sessions_lock:
             if _is_opencode_hidden_system_prompt(sys_text):
                 # OpenCode may issue title/summary-style internal requests before
                 # the coding agent first turn. Serve them, but keep the bare
                 # session_id available for the real main thread.
-                fp = f"{len(sys_text)}_{abs(hash(sys_text)) & 0xffffffff:08x}"
+                fp = _messages_fingerprint(incoming_initial)
                 eff = f"{session_id}::hidden::{fp}"
                 st = self._sessions.get(eff)
                 if st is None:
@@ -1339,18 +1330,15 @@ class _VLLMChatCompletionsProxy:
                 self._sub_session_keys.setdefault(session_id, set()).add(eff)
                 return eff, True
 
-            main_sys = self._main_system.get(session_id)
-            if main_sys is None:
+            main_initial = self._main_initial_messages.get(session_id)
+            if main_initial is None:
                 # First request on this session establishes the main thread.
-                self._main_system[session_id] = sys_text
+                self._main_initial_messages[session_id] = deepcopy(incoming_initial)
                 return session_id, False
-            if (
-                sys_text == main_sys
-                or _common_prefix_len(sys_text, main_sys) >= _MAIN_AGENT_PREFIX_MATCH
-            ):
+            if incoming_initial == main_initial:
                 return session_id, False
             # Sub-agent: isolate on a derived key, never archive.
-            fp = f"{len(sys_text)}_{abs(hash(sys_text)) & 0xffffffff:08x}"
+            fp = _messages_fingerprint(incoming_initial)
             eff = f"{session_id}::sub::{fp}"
             st = self._sessions.get(eff)
             if st is None:
@@ -1360,8 +1348,9 @@ class _VLLMChatCompletionsProxy:
                 self._session_state_locks.setdefault(eff, asyncio.Lock())
                 logger.info(
                     "[Proxy] routed sub-agent conversation off main session "
-                    "(session=%s -> %s, sub_system_len=%d, main_system_len=%d)",
-                    session_id, eff, len(sys_text), len(main_sys),
+                    "(session=%s -> %s, sub_initial_messages=%d, "
+                    "main_initial_messages=%d)",
+                    session_id, eff, len(incoming_initial), len(main_initial),
                 )
             self._sub_session_keys.setdefault(session_id, set()).add(eff)
             return eff, True
