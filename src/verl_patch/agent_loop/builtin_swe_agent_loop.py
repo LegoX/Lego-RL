@@ -58,6 +58,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -316,7 +317,17 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         # True during validation rollouts.  Mixed validation intentionally
         # resolves one configured harness for every sample so metrics are
         # comparable across validation steps.
-        is_val = bool(kwargs.get("validate", False))
+        # ``validate`` is normally a batch-level flag.  The agent-loop manager
+        # also carries it inside ``trajectory_info``; accept that location as a
+        # fallback because concrete loop kwargs may not include the top-level
+        # field.
+        trajectory_info = kwargs.get("trajectory_info", {})
+        trajectory_validate = (
+            trajectory_info.get("validate", False)
+            if isinstance(trajectory_info, Mapping)
+            else False
+        )
+        is_val = bool(kwargs.get("validate", trajectory_validate))
         try:
             extra_info = normalize_sample_mapping(
                 kwargs.get("extra_info", {}), field="extra_info"
