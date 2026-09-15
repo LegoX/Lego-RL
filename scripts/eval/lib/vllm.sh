@@ -83,5 +83,11 @@ wait_for_vllm() {
 
 run_vllm_sanity() {
     echo "[vLLM] coherence sanity check:"
-    curl -s "http://127.0.0.1:${VLLM_PORT}/v1/chat/completions"         -H "Content-Type: application/json"         -d "{"model":"$SERVED_MODEL_NAME","messages":[{"role":"user","content":"Reverse a string in Python."}],"max_tokens":60,"temperature":0}" 2>/dev/null         | "$PYTHON_BIN" -c "import json,sys; print('  ', repr(json.load(sys.stdin)['choices'][0]['message']['content'][:120]))" 2>/dev/null         || echo "  (sanity query failed)"
+    curl -sf "http://127.0.0.1:${VLLM_PORT}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"$SERVED_MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Reverse a string in Python.\"}],\"max_tokens\":60,\"temperature\":0}" \
+        2>/dev/null \
+        | "$PYTHON_BIN" -c "import json,sys; print('  ', repr(json.load(sys.stdin)['choices'][0]['message']['content'][:120]))" \
+        2>/dev/null \
+        || echo "  (sanity query failed)"
 }
