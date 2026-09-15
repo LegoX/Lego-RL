@@ -73,6 +73,15 @@ here, and why they need no retuning as responses grow from 43k to 90k tokens.
 **PPO** ([Schulman et al., 2017](https://arxiv.org/abs/1707.06347)) uses the same
 clipped form on a per-token ratio instead, with a critic supplying the advantage.
 
+**SAO** ([Single-rollout Asynchronous Optimization](https://arxiv.org/abs/2607.07508))
+keeps the critic and drops the group entirely: one rollout per task, per-token GAE
+advantages from a value model (with a length-adaptive policy λ and `lam_critic = 1`, so
+the critic regresses the Monte-Carlo return), and a REINFORCE loss whose per-token
+importance weight $r_t = \pi_\theta(a_t)/\pi_{\text{rollout}}(a_t)$ is *zeroed* outside a trust
+region $[0.2, 4.0]$ rather than clipped. Because a trajectory enters training the moment
+it finishes, it suits fully-async runs with long, uneven agent episodes. See
+[SAO](/docs/run-training/sao).
+
 Both optimize over full multi-turn rollouts, not single completions.
 
 ## Rollout fidelity

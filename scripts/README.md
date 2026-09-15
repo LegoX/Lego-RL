@@ -77,7 +77,7 @@ SCAFFOLD automatically; preflight double-checks it.
 | **T0 axes** | picked when choosing a template | `TRAIN_MODE` `SCAFFOLD` `BACKEND` `MODEL_ENGINE` | template filename + first lines |
 | **T1 required** | every run | `PROJECT_NAME` `EXP_TAG` `TRAIN_INDEX`/`VAL_INDEX` (or `DATASET_PATH`, or `RESULTS_DIR`+`OUTPUT_INDEX`) `NNODES`+topology | the CHANGEME lines in the config |
 | **T2 often tuned** | frequently | `SAVE_FREQ` `TOTAL_EPOCHS` `TRAIN_BSZ` `N_RESP` `MAX_RESP` `VAL_BEFORE_TRAIN` `N_CONCURRENT` `EVAL_TEMPERATURE` | config, add as needed |
-| **T3 advanced** | rarely, know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `VAL_TIMEOUT` `KL_LOSS_COEF` `CLIP_*` | config, override the default |
+| **T3 advanced** | rarely, know why | `SP_SIZE` `ENABLE_R3` `ROLLOUT_IS` `TRAJ_FILTER_*` `GPU_MEM_UTIL` `VAL_TIMEOUT` `KL_LOSS_COEF` `CLIP_*` `CRITIC_*` (SAO: add `verl/sao.env` above `verl/common.env`) | config, override the default |
 | **T4 site** | once per cluster | registry/nydus/mounts/kubeconfig/`MODEL_ROOT`/`DOCKER_HOST` | **`lib/site.env`** |
 | **T5 hidden defaults** | basically never | ~80 harbor_env / hyperparameter defaults (loop name, offload, entropy chunking, tail-kill, pod timeouts…) | `lib/*` + runner |
 

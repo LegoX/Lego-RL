@@ -91,7 +91,9 @@ the config passed rules that never ran.
 
 Two things need follow-up:
 
-- the `run configuration (<kind>)` block → copy **verbatim** into the report;
+- the `run configuration (<kind>)` block → copy **verbatim** into the report; on an
+  SAO / critic run it carries extra `gae:`, `bypass:` and `critic` lines — quote
+  them too, they are what rule 10 (SAO / critic) of `preflight.sh` judged;
 - a non-zero `EXIT` with no `✗ FATAL` line → the runner died before preflight
   (bad config syntax, missing `PROJECT_NAME`/`EXP_TAG`, unreadable venv). Treat
   as a blocking failure and quote the error.

@@ -1,0 +1,15 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" color="#b3431f">
+  <title id="title">LegoX Parallel Pipeline</title>
+  <desc id="desc">Parallel horizontal execution lanes narrow into a checkpoint and expand into an X.</desc>
+  <g fill="currentColor">
+    <rect x="18" y="20" width="22" height="8" rx="4" opacity=".32"/>
+    <rect x="60" y="20" width="22" height="8" rx="4" opacity=".46"/>
+    <rect x="28" y="34" width="18" height="8" rx="4" opacity=".48"/>
+    <rect x="54" y="34" width="18" height="8" rx="4" opacity=".62"/>
+    <rect x="43" y="46" width="14" height="8" rx="4" opacity=".74"/>
+    <rect x="28" y="58" width="18" height="8" rx="4" opacity=".70"/>
+    <rect x="54" y="58" width="18" height="8" rx="4" opacity=".82"/>
+    <rect x="18" y="72" width="22" height="8" rx="4" opacity=".84"/>
+    <rect x="60" y="72" width="22" height="8" rx="4"/>
+  </g>
+</svg>

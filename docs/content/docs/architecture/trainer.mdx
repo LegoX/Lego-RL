@@ -15,6 +15,8 @@ Selected with `adv_estimator` / `policy_loss_mode` in the launch script:
 - **PPO** — actor + critic, clipped policy-gradient objective.
 - **GRPO** — group-relative advantages, no critic (`adv_estimator=grpo`).
 - **GSPO** — sequence-level policy optimization (`policy_loss_mode=gspo`).
+- **SAO** — single rollout per task, critic + decoupled-λ GAE, double-sided token IS
+  (`verl/sao.env`; see [SAO](/docs/run-training/sao)).
 
 The default profile runs GRPO advantages with a GSPO loss. All three optimize over
 **full multi-turn rollouts**, not single completions. See

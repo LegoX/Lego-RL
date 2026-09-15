@@ -1,0 +1,220 @@
+---
+title: SAO
+description: Single-rollout Asynchronous Optimization — one rollout per task, a value model instead of a group baseline
+---
+
+**SAO** ([Single-Rollout Asynchronous Optimization for Agentic Reinforcement Learning](https://arxiv.org/abs/2607.07508))
+replaces GRPO's group baseline with a learned value model, so each task needs **one**
+rollout per step instead of eight. A trajectory enters training the moment it finishes
+rather than waiting for the slowest member of its group, which is what makes it a good fit
+for fully-async runs with long, uneven agent episodes.
+
+Lego-RL ships SAO as a template module, `scripts/templates/verl/sao.env`, plus the verl
+changes it needs in `patches/verl_sao_7aed6b23.patch`. The recipe below is the one that
+trained Qwen3.5-35B-A3B from 0.640 to 0.682 on SWE-bench Verified over 180 steps.
+
+<Callout title="Ordering is load-bearing" type="warn">
+`verl/sao.env` must be listed **before** `verl/common.env` in `TEMPLATE_MODULES`.
+Templates assign with `: "${VAR:=default}"` and the first assignment wins; sourced after
+`common.env`, every SAO default is a silent no-op and you get a GRPO run wearing an SAO
+name. Preflight rule 10 refuses the wrong order.
+</Callout>
+
+## The six pieces
+
+| Piece | Where it lives | Knob |
+| --- | --- | --- |
+| **Single rollout** — `n=1`, GAE advantages from a critic instead of a group mean | config | `N_RESP=1`, `ADV_ESTIMATOR=gae`, `CRITIC_ENABLE=True` |
+| **Decoupled GAE λ** — VAPO's length-adaptive policy λ (`1 − 1/(α·len)`, α = 1.5) so the bootstrap horizon scales with the trajectory, while the critic regresses the true Monte-Carlo return (`lam_critic = 1`) | verl patch: `core_algos.compute_gae_advantage_return` | `LENGTH_ADAPTIVE_LAM_ALPHA`, `LAM_CRITIC` |
+| **DIS** — double-sided token-level importance sampling: bypass mode (`old_log_prob := rollout_log_prob`), per-token ratio `r_t = π_θ / π_rollout`, weights **zeroed** outside the trust region `[0.2, 4.0]`, REINFORCE loss `−E[w·A·log π]` | verl: `RolloutCorrectionConfig.sao_dis()`, `compute_policy_loss_bypass_mode` | `ROLLOUT_IS=token`, `ROLLOUT_IS_THRESHOLD=0.2_4.0`, `ROLLOUT_CORRECTION_LOSS_TYPE=reinforce`, `POLICY_LOSS_MODE=bypass_mode` |
+| **Faster value update** — two critic optimizer steps per actor step | config | `CRITIC_PPO_EPOCHS=2` |
+| **Skip-observation GAE** — tool outputs are not the policy's actions; TD errors propagate only across model-generated tokens | already how verl's GAE treats `response_mask` | nothing to set |
+| **Frozen-attention critic** — the value model trains only its MLP / expert projections; attention stays frozen | verl patch: `freeze_param_patterns` | `CRITIC_FREEZE_PARAM_PATTERNS` |
+
+No reference-KL term: the paper uses neither `use_kl_loss` nor a reward KL, and turning
+both off also means no reference-policy worker is created, which is roughly the memory
+the critic then spends on the same training pool. DIS bounds short-term drift from the
+rollout policy; it is not a substitute for a reference KL, so adding one back is a new
+ablation, not a fix.
+
+## Enabling it
+
+```bash
+cp scripts/train/configs/sao_async_3nodes_qwen35_ohsdk_veomni.env scripts/train/configs/my_sao.env
+$EDITOR scripts/train/configs/my_sao.env         # CHANGEME: critic init, paths, registry
+PREFLIGHT_ONLY=1 bash scripts/train/train.sh scripts/train/configs/my_sao.env
+bash scripts/train/train.sh scripts/train/configs/my_sao.env
+```
+
+The config's `TEMPLATE_MODULES` is the only structural difference from a GRPO run:
+
+```bash
+TEMPLATE_MODULES=(
+  runtime/process.env
+  "backend/${BACKEND}.env"
+  harbor/common.env
+  "scaffold/${SCAFFOLD}.env"
+  verl/sao.env          # <-- before common.env
+  verl/common.env
+  "verl/${TRAINING_MODE}.env"
+  "verl/${MODEL_ENGINE}.env"
+)
+```
+
+Two reference configs ship in `scripts/train/configs/`:
+
+| Config | What it is |
+| --- | --- |
+| `sao_async_3nodes_qwen35_ohsdk_veomni.env` | the validated production recipe: Qwen3.5-35B-A3B, 2 train + 1 rollout nodes, VeOmni, dynamic packing, warm critic |
+| `sao_sync_1node_qwen3_8b_ohsdk_fsdp.env` | a plumbing smoke on one 8-GPU box: proves the critic builds, the value head runs under Ulysses SP, DIS reaches the actor, and both `actor/` and `critic/` checkpoint. Not a learning run |
+
+Run the smoke once after `setup_env.sh`, before a multi-node MoE run.
+
+### Critic initialisation
+
+`CRITIC_MODEL_PATH` is the one value every run must decide:
+
+- **Cold start** — point it at `MODEL_PATH`. Only the value head is random; expect
+  10–20 steps of noisy advantages and keep `CRITIC_WARMUP ≥ 10` (the actor is frozen while
+  the critic calibrates). The paper names value cold start as the main bottleneck.
+- **Warm start** — merge an earlier run's critic with `utils/merge_critic_ckpt.sh` and point
+  at the result. On the 35B runs this was the single biggest stabiliser. A critic trained
+  on samples from *before* a policy pathology is "weak but not biased" and safe to reuse.
+
+### VeOmni and Qwen3.5-MoE
+
+VeOmni's model registry dispatches `<Family>ForTokenClassification` by substring and,
+unpatched, falls through to the CausalLM class: the critic is silently built as a language
+model and GAE sees vocab-sized "values". `utils/apply_veomni_valuehead_patch.py` fixes the
+registry in site-packages (veomni is a wheel, so it cannot take a git patch) and installs
+the Qwen3.5-MoE token-classification sidecar from `src/verl_patch/models/`. `setup_env.sh`
+runs it once; `train.sh` re-runs it before every `CRITIC_ENABLE=True` VeOmni launch.
+
+Qwen3.5-35B-A3B is a hybrid: 10 full-attention layers, 30 GatedDeltaNet (`linear_attn`)
+layers and a vision tower. `[self_attn.]` alone freezes 4 % of its tensors; the validated
+configs use `[self_attn.,linear_attn.,visual.]`. A pattern that matches nothing **raises**
+in verl rather than silently training the module you meant to freeze, and preflight checks
+the patterns against `config.json`.
+
+## Reading the metrics
+
+### What is not there
+
+Under bypass mode `old_log_probs == rollout_log_probs` by construction, so
+`training/rollout_actor_probs_pearson_corr` is **not produced** — forcing it would print
+1.000 and mean nothing. `actor/entropy` is also absent (the old-actor forward that computed
+it is skipped). Rollout correction runs inside the actor loss, so its metrics carry the
+`actor/` prefix:
+
+```
+actor/rollout_corr/kl                          <= ~1e-2
+actor/rollout_corr/chi2_token                  <= ~1e-1
+actor/rollout_corr/log_ppl_abs_diff            <= ~1e-2
+actor/rollout_corr/rollout_is_eff_sample_size  >= ~0.99
+actor/rollout_corr/rollout_is_ratio_fraction_{high,low}   share of tokens DIS zeroed
+```
+
+The thresholds are the 30B smoke's regression baseline (measured
+`8.7e-4 / 2.9e-3 / 1.1e-3 / 0.997`), not universal constants. Read them in that order:
+log-PPL gap first, then k3 KL, χ², ESS. Effective sample size is *relative* ESS,
+`(Σw)² / (N·Σw²)`, in `(0, 1]`: 1.0 means every token carries the same weight. A drop can
+come from policy staleness, a train/inference mismatch, or DIS zeroing many tokens — it says
+how much gradient survives, not which of those happened. Fully-async batches mix
+`lag = 0` and `lag ≥ 1` trajectories; do not read an online rise in these as a backend
+mismatch without a frozen-weight, same-version comparison.
+
+`actor/pg_clipfrac` disappears (the REINFORCE loss has no clip); `actor/ppo_kl` stays.
+
+### The critic namespace
+
+Everything under `critic/` is not critic output — the namespace is historical:
+
+| Key | Level | Meaning |
+| --- | --- | --- |
+| `critic/score/mean` | per trajectory | raw verifier score, before KL / filter — the batch's success rate |
+| `critic/rewards/mean` | per trajectory | what enters GAE; equals score unless a trajectory was filtered (reward zeroed) |
+| `critic/returns/*` | per valid token | the critic's regression target. With `γ = lam_critic = 1` and a terminal 0/1 reward every model token of a solved trajectory has return 1. **Token-weighted**, so long trajectories dominate; not comparable to `score/mean` |
+| `critic/values/*` | per valid token | the *old* critic's predictions, computed before this step's update. Unbounded; can sit below 0 or above 1 during cold start |
+| `critic/vf_explained_var` | batch | `1 − Var(return − value)/Var(return)`. Below 0 = worse than a constant; rising = the critic is learning which states succeed. Uses the pre-update values, so a step's critic update shows up in *later* steps. Degenerates to huge negatives when the batch has one return value (all 0) — ignore those steps |
+| `critic/vf_loss`, `critic/vf_clipfrac` | per update | clipped value MSE; a long-high clipfrac means the critic LR / epochs are too aggressive |
+| `critic/vpred_mean` | per update | predictions *during* the update (mixes both critic epochs); compare trends with `values/mean`, not values |
+| `critic/grad_norm`, `critic/lr` | per update | see below |
+
+With the patched verl the value loss is a **global** token-mean, so `critic/loss` no longer
+scales with the number of packed micro-batches (it used to grow ~6× between a 200k and a
+25k token budget while `vf_loss` looked unchanged).
+
+### Health checklist
+
+1. **Is the signal real?** `critic/score/mean` vs `rewards/mean` vs
+   `trajectory_filter/invalid_ratio`. Both near 0 from step 1 is infrastructure.
+2. **Is there something to learn?** `critic/returns/min` ≈ `max` means this step's
+   explained variance is meaningless.
+3. **Is the critic converging?** `vf_explained_var` should leave negative territory within
+   ~20 steps and sit at 0.2–0.5 (best seen: 0.64). Flat ≤ 0.3 for 50+ steps with
+   `critic/grad_norm` far above the clip is the r6 signature below.
+4. **Is the update sane?** `critic/grad_norm` median ~10 on 30B–35B models with
+   occasional 30–70 spikes; the alarm is *three consecutive steps* above 30, never one
+   spike. `vf_clipfrac` ~0.2 in the first steps, then ~0.
+5. **Is DIS on?** the four `actor/rollout_corr/*` gates above, and `actor/pg_clipfrac`
+   absent.
+
+## What went wrong on r6
+
+The run that preceded the validated recipe collapsed at step ~130. The causal chain, from
+the postmortem, is worth knowing because every link is a knob:
+
+1. **The critic was starved.** `CRITIC_GRAD_CLIP=1.0` while `critic/grad_norm` sat at
+   7–68: every update was scaled down 7–70×, so the configured critic LR was fiction and
+   `vf_explained_var` stayed in 0–0.3 for 130 steps.
+2. **No baseline ⇒ distorted advantages.** With `GAE_WHITEN_ADVANTAGES=False` (a choice
+   that assumed the critic would provide the baseline) the batch advantage mean drifted
+   ±0.25, and entire all-negative batches occurred.
+3. **The trigger.** Steps 119–121 were three consecutive all-negative batches. An
+   all-negative batch punishes everything, and the reward-neutral no-op — calling the
+   `think` tool again — is punished *least*, so it is relatively reinforced.
+4. **Superstition compounds.** `think` as a share of tool calls: 0.07 → 0.18 → 0.29 →
+   **0.73** at step 130. The policy stopped editing.
+
+The four deltas that separated r7 from r6, each cutting one link:
+
+| Knob | r6 | r7 | Why |
+| --- | --- | --- | --- |
+| `GAE_WHITEN_ADVANTAGES` | False | **True** | zero-mean batches structurally rule out all-negative updates; a fallback baseline while the critic is weak. Returns are built *before* whitening, so value learning is untouched. Expect `actor/grad_norm` 2–3× higher; that is scale, not signal |
+| `CRITIC_GRAD_CLIP` | 1.0 | **10** | typical gradients pass unclipped; the critic LR means what it says |
+| `CRITIC_MODEL_PATH` | actor (cold) | r6's critic @ step 100, merged | weak but not biased: trained on samples entirely before the spam |
+| `CRITIC_WARMUP` | 0 | **20** | the warm critic recalibrates on the base policy before the actor can move |
+
+The first two are now `verl/sao.env` defaults. Whitening can be handed back once
+`vf_explained_var > 0.4` holds for ~20 steps.
+
+Behaviourally, r7's model changed *density*, not length: edits per trajectory 4.7 → 8.0,
+inline `python -c` verification up sharply, full-suite `pytest` runs down, total code
+execution flat at ~95 %, turns and response length flat. GRPO on the same model inflates
+both turns and length (+30 % CoT); SAO's per-token GAE has no length bias, so "longer" is
+no longer free.
+
+## Traps
+
+- **Resume pins the old LR.** verl restores the optimizer *and* lr-scheduler state, so a
+  config LR change is silently ignored on restart (r7 ran 119 steps at 5e-6 believing it
+  was 2.5e-6). Set `ACTOR_CKPT_LOAD_CONTENTS='[model,optimizer]'` /
+  `CRITIC_CKPT_LOAD_CONTENTS='[model,optimizer]'` on such a resume.
+- **Timestamped `EXP_NAME` breaks resume.** `resume_mode=auto` looks for
+  `checkpoints/<project>/<exp>/`; a fresh name every launch restarts from step 0, and on
+  multi-node gives each node a different name.
+- **`TOTAL_ROLLOUT_STEPS` and `TOTAL_EPOCHS` are an AND.** The rollouter takes the min.
+- **Token budget × SP must cover the window with margin.** `common.env`'s default lands
+  exactly on it; one rank asserting in `rearrange_micro_batches` leaves the rest deadlocked
+  in `_compute_values` until `NCCL_TIMEOUT`. Preflight rule 10e checks this.
+- **The DIS mirror.** `algorithm.rollout_correction.*` is not what the actor loss reads;
+  `hydra_args.sh` force-writes the same keys to
+  `actor_rollout_ref.actor.policy_loss.rollout_correction.*`. Without that mirror the run
+  silently trains sequence-level TIS with a PPO-clip loss and plausible-looking metrics.
+- **Critic checkpoints are not loadable as saved.** `global_step_N/critic/` holds DTensor
+  shards and a `config.json` that claims `ForCausalLM`; `utils/merge_critic_ckpt.sh` fixes
+  both. The streaming merger refuses Qwen3.5-MoE (it would corrupt the fused experts).
+- **Reward placement.** The verl patch places the outcome reward on the last *model* token
+  rather than the last attended token (usually a tool observation, which `response_mask`
+  excludes). Before the fix ~0.6 % of the reward signal reached GAE. GRPO was unaffected
+  because it sums rewards over tokens.
