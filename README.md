@@ -151,6 +151,7 @@ Questions, run reports and contributions are welcome. Scan to join the WeChat gr
  <img src="docs/public/wechat_group.png" width="220" alt="Lego-RL WeChat group">
 </div>
 
+
 ## License
 
 [Apache License 2.0](LICENSE).
