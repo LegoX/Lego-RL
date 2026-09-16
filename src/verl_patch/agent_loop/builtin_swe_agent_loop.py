@@ -213,9 +213,11 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         raw_harbor_cfg = to_plain(kwargs.get("harbor_cfg"))
         raw_harnesses = to_plain(kwargs.get("harnesses"))
         raw_selection = to_plain(kwargs.get("harness_selection"))
+        raw_render_contract = to_plain(kwargs.get("render_contract"))
         definitions = normalize_harness_definitions(
             harbor_cfg=raw_harbor_cfg,
             harnesses=raw_harnesses,
+            render_contract=raw_render_contract,
         )
 
         # These are worker-level controls shared by every harness. They must be
@@ -709,14 +711,6 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                     "ANTHROPIC_API_KEY", "dummy-key-for-local-vllm"
                 ),
             )
-            agent_env = cfg.setdefault("agent", {}).setdefault("env", {})
-            if definition.name == "opencode":
-                agent_env["OPENCODE_TEMPERATURE"] = os.environ.get(
-                    "OPENCODE_TEMPERATURE", "1.0"
-                )
-                agent_env["OPENCODE_CONFIG_CONTENT"] = os.environ.get(
-                    "HARBOR_OPENCODE_CONFIG_CONTENT", "dummy-config-for-local-vllm"
-                )
             cfg["trial_name"] = session_id
 
             if "temperature" in sampling_params:

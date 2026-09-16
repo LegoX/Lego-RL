@@ -29,6 +29,7 @@
   harnesses:
     openhands_sdk:
       protocol: openai
+      render_contract: ${oc.env:HARBOR_MIXED_OHSDK_RENDER_CONTRACT}
       harbor_cfg:
         agent:
           import_path: ${oc.env:HARBOR_MIXED_OHSDK_IMPORT_PATH,harbor.agents.custom.openhands_sdk:CustomOpenHandsSDK}
@@ -74,6 +75,7 @@
 
     opencode:
       protocol: openai
+      render_contract: ${oc.env:HARBOR_MIXED_OC_RENDER_CONTRACT}
       harbor_cfg:
         agent:
           import_path: ${oc.env:HARBOR_MIXED_OC_IMPORT_PATH,harbor_patch.agents.image_mounted_opencode:OpenCode}
@@ -116,6 +118,7 @@
 
     claude_code:
       protocol: anthropic
+      render_contract: ${oc.env:HARBOR_MIXED_CC_RENDER_CONTRACT}
       harbor_cfg:
         agent:
           import_path: ${oc.env:HARBOR_MIXED_CC_IMPORT_PATH,harbor_patch.agents.image_mounted_claude_code:ClaudeCode}

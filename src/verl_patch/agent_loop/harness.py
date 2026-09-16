@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import re
 import secrets
 from collections.abc import Mapping
 from copy import deepcopy
@@ -62,6 +64,89 @@ class HarnessDefinition:
     name: str
     protocol: HarnessProtocol
     harbor_cfg: dict[str, Any]
+    render_contract: dict[str, Any] | None = None
+
+
+def render_harness_contract(
+    contract: Mapping[str, Any],
+    *,
+    openai_base: str,
+    anthropic_base: str,
+    openai_api_key: str,
+    anthropic_api_key: str,
+    served: str,
+    temperature: Any,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Render one declarative harness contract against a runtime endpoint."""
+
+    def without_v1(url: str) -> str:
+        value = url.rstrip("/")
+        return value[:-3] if value.endswith("/v1") else value
+
+    values: dict[str, Any] = {
+        "llm_base": openai_base,
+        "llm_base_no_v1": without_v1(anthropic_base),
+        "endpoint": openai_base,
+        "endpoint_no_v1": without_v1(anthropic_base),
+        "llm_key": openai_api_key,
+        "openai_key": openai_api_key,
+        "anthropic_key": anthropic_api_key,
+        "served": served,
+        "temperature": temperature,
+    }
+    env_values = dict(environment or os.environ)
+    token_pattern = re.compile(
+        r"\{(?:env:([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))\}"
+    )
+
+    def render(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        match = token_pattern.fullmatch(value)
+        if match:
+            env_name, value_name = match.groups()
+            if env_name:
+                return env_values.get(env_name, "")
+            if value_name not in values:
+                raise ValueError(f"Unknown harness contract token: {value_name}")
+            return values[value_name]
+
+        def replace(match: re.Match[str]) -> str:
+            env_name, value_name = match.groups()
+            if env_name:
+                return str(env_values.get(env_name, ""))
+            if value_name not in values:
+                raise ValueError(f"Unknown harness contract token: {value_name}")
+            return str(values[value_name])
+
+        return token_pattern.sub(replace, value)
+
+    endpoint = render(contract.get("endpoint_template", "{llm_base}"))
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError("Harness endpoint_template must render to a URL")
+    endpoint_host = urlsplit(endpoint).hostname
+    if not endpoint_host:
+        raise ValueError(f"Harness endpoint has no hostname: {endpoint!r}")
+    values["endpoint"] = endpoint
+    values["endpoint_no_v1"] = without_v1(endpoint)
+
+    def mapping(name: str) -> dict[str, Any]:
+        value = contract.get(name, {}) or {}
+        if not isinstance(value, Mapping):
+            raise ValueError(f"Harness contract {name} must be a mapping")
+        return {str(key): render(item) for key, item in value.items()}
+
+    model_name = render(contract.get("model_template", "{served}"))
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("Harness model_template must render to a model name")
+    return {
+        "model_name": model_name,
+        "kwargs": mapping("kwargs"),
+        "env": {key: str(value) for key, value in mapping("env").items()},
+        "endpoint_host": endpoint_host,
+        "allow_endpoint_host": bool(contract.get("allow_endpoint_host", True)),
+    }
 
 
 @dataclass(frozen=True)
@@ -151,8 +236,22 @@ def normalize_harness_definitions(
     *,
     harbor_cfg: Mapping[str, Any] | None,
     harnesses: Mapping[str, Any] | None,
+    render_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, HarnessDefinition]:
     """Normalize mixed or legacy single-harness configuration."""
+
+    def normalize_contract(value: Any, *, field: str) -> dict[str, Any] | None:
+        value = _plain_value(value, field=field)
+        if value in (None, ""):
+            return None
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{field} must be a mapping or JSON object") from exc
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{field} must be a mapping or JSON object")
+        return deepcopy(dict(value))
 
     if harnesses is None:
         cfg = deepcopy(dict(harbor_cfg or {}))
@@ -163,6 +262,9 @@ def normalize_harness_definitions(
                 name=name,
                 protocol=infer_harness_protocol(name, cfg),
                 harbor_cfg=cfg,
+                render_contract=normalize_contract(
+                    render_contract, field="render_contract"
+                ),
             )
         }
 
@@ -182,7 +284,7 @@ def normalize_harness_definitions(
             )
         name = raw_name.strip()
         definition = _mapping_value(raw_definition, field=f"harnesses.{name}")
-        unknown = set(definition) - {"protocol", "harbor_cfg"}
+        unknown = set(definition) - {"protocol", "harbor_cfg", "render_contract"}
         if unknown:
             raise ValueError(
                 f"Harness {name!r} has unsupported control fields: {sorted(unknown)}"
@@ -195,13 +297,20 @@ def normalize_harness_definitions(
             )
         )
         protocol = definition.get("protocol") or infer_harness_protocol(name, cfg)
+        raw_contract = normalize_contract(
+            definition.get("render_contract"),
+            field=f"harnesses.{name}.render_contract",
+        )
         if protocol not in ("openai", "anthropic"):
             raise ValueError(
                 f"Harness {name!r} protocol must be 'openai' or 'anthropic'; got {protocol!r}"
             )
         _validate_agent_factory_dispatch(name, cfg)
         definitions[name] = HarnessDefinition(
-            name=name, protocol=protocol, harbor_cfg=cfg
+            name=name,
+            protocol=protocol,
+            harbor_cfg=cfg,
+            render_contract=raw_contract,
         )
     return definitions
 
@@ -431,6 +540,25 @@ def inject_harness_endpoint(
     extra_allowed_hosts = agent_cfg.setdefault("extra_allowed_hosts", [])
     if not isinstance(extra_allowed_hosts, list):
         raise ValueError("agent.extra_allowed_hosts must be a list")
+    contract = definition.render_contract
+    if contract:
+        rendered = render_harness_contract(
+            contract,
+            openai_base=openai_base,
+            anthropic_base=anthropic_base,
+            openai_api_key=openai_api_key,
+            anthropic_api_key=anthropic_api_key,
+            served=os.environ.get("SERVED_MODEL_NAME", "vllm_model"),
+            temperature=float(os.environ.get("HARBOR_AGENT_TEMPERATURE", "1.0")),
+            environment=os.environ,
+        )
+        agent_cfg["model_name"] = rendered["model_name"]
+        agent_cfg.setdefault("kwargs", {}).update(rendered["kwargs"])
+        agent_cfg.setdefault("env", {}).update(rendered["env"])
+        if rendered["allow_endpoint_host"] and endpoint_host not in extra_allowed_hosts:
+            extra_allowed_hosts.append(endpoint_host)
+        return
+
     if endpoint_host not in extra_allowed_hosts:
         extra_allowed_hosts.append(endpoint_host)
 
