@@ -14,6 +14,16 @@
       # (agent_runtime_image below) instead of an in-pod venv that fails on no-egress pods.
       import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_openhands_ai.openhands:OpenHands}
       max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,null}}
+      # override_timeout_sec is the *base* budget harbor enforces:
+      #     min(override_timeout_sec or task.agent.timeout_sec, max_timeout_sec) * multiplier
+      # max_timeout_sec is only the CAP on top of it and can never raise the base. Without this
+      # line the base fell through to whatever the task declares, so HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC
+      # was INERT for the ohsdk scaffold while it worked for oc/cc. On a dataset whose tasks declare
+      # 600 s that pins every TRAINING rollout to 600 s against a median agent time of ~1700 s, and
+      # the trajectory filter drops the timeouts -- so the batch silently narrows to the easiest
+      # ~10% of tasks while validation (whose tasks declare 3000 s) still looks healthy.
+      # null, not a number: with the env var unset the task's own declaration still applies.
+      override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,null}}
       kwargs:
         max_iterations: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
         max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}

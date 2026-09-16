@@ -41,8 +41,13 @@ NYDUS_MIRROR_HOST = os.environ.get("HARBOR_NYDUS_MIRROR", "")
 NYDUS_MIRROR_PREFIXES = (
     "slimshetty/swebench-verified:",
     "docker.io/slimshetty/swebench-verified:",
+    # SWE-bench Verified + Multilingual: one official image per instance.
     "swebench/sweb.eval.x86_64.",
     "docker.io/swebench/sweb.eval.x86_64.",
+    # SWE-bench Pro: one repo, one tag per instance. Mirrored by the same
+    # utils/populate_swebench_hub.sh, which keeps the Docker Hub names.
+    "jefzda/sweap-images:",
+    "docker.io/jefzda/sweap-images:",
 )
 
 
@@ -2573,7 +2578,14 @@ true
         reraise=True,
     )
     async def download_dir(self, source_dir: str, target_dir: Path | str):
-        """Download directory from pod."""
+        """Download directory from pod.
+
+        A truncated exec stream can hand back a tar with ZERO entries even though the pod
+        did write the file (seen on /logs/verifier/reward.txt): nothing raises, the retry
+        above never fires, and the trial dies with RewardFileNotFoundError -- a false
+        reward=0 that looks like a model failure. A tar of an even empty directory still
+        carries the "./" entry, so "no members" always means a truncated stream.
+        """
         await self._ensure_client()
 
         target_dir = Path(target_dir)
@@ -2619,6 +2631,12 @@ true
         tar_buffer = io.BytesIO(tar_data)
         try:
             with tarfile.open(fileobj=tar_buffer, mode="r") as tar:
+                members = tar.getmembers()
+                if not members:
+                    raise RuntimeError(
+                        f"Empty tar stream ({len(tar_data)} bytes, no entries) when downloading "
+                        f"{source_dir} from pod {self.pod_name}; retrying."
+                    )
                 tar.extractall(path=str(target_dir))
         except tarfile.TarError as e:
             raise RuntimeError(
