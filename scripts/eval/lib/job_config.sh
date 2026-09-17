@@ -13,8 +13,16 @@ write_job_config() {
     export HARBOR_ENVIRONMENT_IMPORT_PATH HARBOR_ENVIRONMENT_FORCE_BUILD HARBOR_ENVIRONMENT_DELETE
     export HARBOR_ENVIRONMENT_OVERRIDE_CPUS HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB HARBOR_HOSTPATH_MOUNTS
     export HARBOR_AGENT_IMPORT_PATH HARBOR_AGENT_RUNTIME_IMAGE HARBOR_AGENT_RUNTIME_MOUNT_PATH HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH
-    export K8S_POD_ACTIVE_DEADLINE_SECONDS HARBOR_EXCLUDE_NODES
-    export HARBOR_AGENT_TIMEOUT_MULTIPLIER HARBOR_VERIFIER_TIMEOUT_MULTIPLIER HARBOR_AGENT_MAX_ITERATIONS
+    export K8S_KUBECONFIG K8S_NAMESPACE K8S_POD_STARTUP_TIMEOUT K8S_POD_ACTIVE_DEADLINE_SECONDS
+    export HARBOR_EXCLUDE_NODES HARBOR_ENVIRONMENT_TYPE
+    export HARBOR_AGENT_TIMEOUT_MULTIPLIER HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER
+    export HARBOR_VERIFIER_TIMEOUT_MULTIPLIER HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER
+    export HARBOR_AGENT_MAX_TIMEOUT_SEC HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC
+    export HARBOR_AGENT_OVERRIDE_SETUP_TIMEOUT_SEC HARBOR_AGENT_MAX_ITERATIONS
+    export HARBOR_AGENT_DISABLE_TOOL_CALLS HARBOR_AGENT_MODEL_INFO HARBOR_AGENT_VERSION
+    export HARBOR_AGENT_PARSER_NAME HARBOR_AGENT_INTERLEAVED_THINKING
+    export HARBOR_AGENT_ENABLE_SUMMARIZE HARBOR_AGENT_PROACTIVE_SUMMARIZATION_THRESHOLD
+    export HARBOR_AGENT_RECORD_TERMINAL_SESSION HARBOR_AGENT_SUPPRESS_MAX_TURNS_WARNING
     export LLM_TIMEOUT LLM_NUM_RETRIES EVAL_AGENT_EXTRA_ENV OH_SDK_PATCH_ROOT OH_SDK_RESTORE_TASK_ENV
 
     "$PYTHON_BIN" - "$JOB_CFG" <<'PYJOB'
@@ -27,6 +35,37 @@ served = os.environ["SERVED_MODEL_NAME"]
 
 def truthy(value):
     return str(value).lower() in {"1", "true", "yes", "on"}
+
+def optional_raw(name):
+    value = os.environ.get(name)
+    if value is None or not value.strip() or value.strip().lower() in {"null", "none"}:
+        return None
+    return value.strip()
+
+def optional_number(name):
+    value = optional_raw(name)
+    if value is None:
+        return None
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+def optional_bool(name):
+    value = optional_raw(name)
+    return None if value is None else truthy(value)
+
+def optional_struct(name):
+    """Parse JSON first, then the YAML-ish mapping used by .env templates."""
+    value = optional_raw(name)
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        import yaml
+        parsed = yaml.safe_load(value)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must decode to a mapping")
+    return parsed
 
 raw_mounts = os.environ.get("HARBOR_HOSTPATH_MOUNTS", "")
 host_path_mounts = None
@@ -45,6 +84,13 @@ env_kwargs = {
     "agent_runtime_image_pull_policy": os.environ.get("HARBOR_AGENT_RUNTIME_IMAGE_PULL_POLICY", "IfNotPresent"),
     "pod_active_deadline_seconds": int(os.environ.get("K8S_POD_ACTIVE_DEADLINE_SECONDS", "6000")),
 }
+if optional_raw("K8S_KUBECONFIG") is not None:
+    env_kwargs["kubeconfig_path"] = os.environ["K8S_KUBECONFIG"]
+if optional_raw("K8S_NAMESPACE") is not None:
+    env_kwargs["namespace"] = os.environ["K8S_NAMESPACE"]
+startup_timeout = optional_number("K8S_POD_STARTUP_TIMEOUT")
+if startup_timeout is not None:
+    env_kwargs["pod_startup_timeout_sec"] = startup_timeout
 if host_path_mounts is not None:
     env_kwargs["host_path_mounts"] = host_path_mounts
 # Same knob as the training agent loop (agent_loop_config_*.yaml -> kubernetes.py:exclude_nodes):
@@ -97,25 +143,60 @@ if extra_env_raw:
 # AgentTimeoutError at the task's declared 3000 s. Iterations: the custom agent only caps turns
 # when max_iterations is passed as an agent kwarg.
 agent_kwargs = {}
-if os.environ.get("HARBOR_AGENT_MAX_ITERATIONS"):
-    agent_kwargs["max_iterations"] = int(os.environ["HARBOR_AGENT_MAX_ITERATIONS"])
+max_iterations = optional_number("HARBOR_AGENT_MAX_ITERATIONS")
+if max_iterations is not None:
+    # Different installed harnesses use different names. Passing both is
+    # harmless for harnesses that do not declare one of them, and keeps eval
+    # aligned with the training-side agent_loop_config files.
+    agent_kwargs["max_iterations"] = max_iterations
+    agent_kwargs["max_turns"] = max_iterations
+for key, env_name in (
+    ("version", "HARBOR_AGENT_VERSION"),
+    ("parser_name", "HARBOR_AGENT_PARSER_NAME"),
+):
+    value = optional_raw(env_name)
+    if value is not None:
+        agent_kwargs[key] = value
+for key, env_name in (
+    ("disable_tool_calls", "HARBOR_AGENT_DISABLE_TOOL_CALLS"),
+    ("interleaved_thinking", "HARBOR_AGENT_INTERLEAVED_THINKING"),
+    ("enable_summarize", "HARBOR_AGENT_ENABLE_SUMMARIZE"),
+    ("record_terminal_session", "HARBOR_AGENT_RECORD_TERMINAL_SESSION"),
+    ("suppress_max_turns_warning", "HARBOR_AGENT_SUPPRESS_MAX_TURNS_WARNING"),
+):
+    value = optional_bool(env_name)
+    if value is not None:
+        agent_kwargs[key] = value
+summary_threshold = optional_number("HARBOR_AGENT_PROACTIVE_SUMMARIZATION_THRESHOLD")
+if summary_threshold is not None:
+    agent_kwargs["proactive_summarization_threshold"] = summary_threshold
+model_info = optional_struct("HARBOR_AGENT_MODEL_INFO")
+if model_info is not None:
+    agent_kwargs["model_info"] = model_info
+
+environment_cfg = {
+    "import_path": os.environ["HARBOR_ENVIRONMENT_IMPORT_PATH"],
+    "force_build": truthy(os.environ.get("HARBOR_ENVIRONMENT_FORCE_BUILD", "False")),
+    "delete": truthy(os.environ.get("HARBOR_ENVIRONMENT_DELETE", "True")),
+    "override_cpus": int(os.environ.get("HARBOR_ENVIRONMENT_OVERRIDE_CPUS", "1")),
+    "override_memory_mb": int(os.environ.get("HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB", "4096")),
+    "kwargs": {k: v for k, v in env_kwargs.items() if v not in (None, "")},
+}
+environment_type = optional_raw("HARBOR_ENVIRONMENT_TYPE")
+if environment_type is not None:
+    environment_cfg["type"] = environment_type
 
 cfg = {
     "job_name": os.environ["EXP_NAME"],
     "n_attempts": 1,
     "agent_timeout_multiplier": float(os.environ.get("HARBOR_AGENT_TIMEOUT_MULTIPLIER", "1.0")),
+    "agent_setup_timeout_multiplier": float(os.environ.get("HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER", "5.0")),
     "verifier_timeout_multiplier": float(os.environ.get("HARBOR_VERIFIER_TIMEOUT_MULTIPLIER", "1.0")),
+    "environment_build_timeout_multiplier": float(os.environ.get("HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER", "1.0")),
     "n_concurrent_trials": int(os.environ["N_CONCURRENT"]),
     "retry": {"max_retries": int(os.environ["MAX_RETRIES"])},
-    "environment": {
-        "import_path": os.environ["HARBOR_ENVIRONMENT_IMPORT_PATH"],
-        "force_build": truthy(os.environ.get("HARBOR_ENVIRONMENT_FORCE_BUILD", "False")),
-        "delete": truthy(os.environ.get("HARBOR_ENVIRONMENT_DELETE", "True")),
-        "override_cpus": int(os.environ.get("HARBOR_ENVIRONMENT_OVERRIDE_CPUS", "1")),
-        "override_memory_mb": int(os.environ.get("HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB", "4096")),
-        "kwargs": {k: v for k, v in env_kwargs.items() if v not in (None, "")},
-    },
-    "verifier": {"disable": False},
+    "environment": environment_cfg,
+    "verifier": {"disable": not truthy(os.environ.get("HARBOR_VERIFIER_ENABLED", "True"))},
     "agents": [],
     "datasets": [{k: v for k, v in {
         "path": os.environ.get("DATASET_PATH") or None,
@@ -170,11 +251,18 @@ agent_cfg = {
     "name": agent_name,
     "import_path": agent_import_path,
     "model_name": rendered["model_name"],
-    "kwargs": rendered["kwargs"],
-    "env": rendered["env"],
+    "kwargs": {**rendered["kwargs"], **agent_kwargs},
+    "env": {**rendered["env"], **agent_env},
     "extra_allowed_hosts": [],
 }
-
+for key, env_name in (
+    ("override_timeout_sec", "HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC"),
+    ("override_setup_timeout_sec", "HARBOR_AGENT_OVERRIDE_SETUP_TIMEOUT_SEC"),
+    ("max_timeout_sec", "HARBOR_AGENT_MAX_TIMEOUT_SEC"),
+):
+    value = optional_number(env_name)
+    if value is not None:
+        agent_cfg[key] = value
 allow_endpoint_host = os.environ.get(
     "HARBOR_HARNESS_ALLOW_ENDPOINT_HOST", "true"
 ).lower() in {"1", "true", "yes", "on"}
