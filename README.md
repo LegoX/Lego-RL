@@ -32,6 +32,16 @@ updates the policy from the captured trajectory.
 
 ## News
 
+- [2026/09/17] **Public training dashboards.** We are opening the live dashboards of six real
+  Lego-RL runs, all on Qwen3.5-35B-A3B: GSPO on OpenSWE with each harness natively —
+  [OpenHands SDK](https://rl-dashboard-openhands.legox.net),
+  [OpenCode](https://rl-dashboard-opencode.legox.net) and
+  [Claude Code](https://rl-dashboard-claudecode.legox.net); SAO (critic-based) on
+  [OpenSWE](https://rl-dashboard-sao.legox.net) and on a
+  [multilingual task set](https://rl-dashboard-multilingual.legox.net) validated on SWE-bench
+  Multilingual; and a [mixed-harness run](https://rl-dashboard-mixed.legox.net) that trains one
+  policy across all three harnesses at once. Every board shows the full reward and validation
+  curves plus per-trial analysis — see [Live Training Dashboard](#live-training-dashboard).
 - [2026/09/11] **Mixed-harness training.** A single run can now interleave OpenHands SDK, OpenCode,
   and Claude Code. Each trajectory resolves one harness from dataset metadata or a weighted policy,
   while validation stays pinned to one harness so its metrics remain comparable across steps.
@@ -92,8 +102,27 @@ Full protocol, ablations, and failure analysis are in the [paper](https://arxiv.
  <img src="docs/public/dashboard.png" width="900" alt="Lego-RL training dashboard — per-task solve-rate grid">
 </div>
 
-Every run is followed live, down to the individual trial —
-see the **[dashboard docs](https://lego-rl.pages.dev/docs/dashboard)**.
+<br>
+
+Six of our own runs are public, all training Qwen3.5-35B-A3B:
+
+| Run              | Harness                                | Data (train / val)                                 | Algorithm                  | Steps | Val (start → best)     | Dashboard                                                     |
+|:-----------------|:---------------------------------------|:---------------------------------------------------|:---------------------------|------:|:-----------------------|:--------------------------------------------------------------|
+| OpenHands SDK    | OpenHands SDK                          | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   126 | 64.0 → 70.4            | [rl-dashboard-openhands ↗](https://rl-dashboard-openhands.legox.net)       |
+| OpenCode         | OpenCode                               | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   127 | 57.2 → 66.6            | [rl-dashboard-opencode ↗](https://rl-dashboard-opencode.legox.net)         |
+| Claude Code      | Claude Code                            | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   130 | 62.4 → 68.2            | [rl-dashboard-claudecode ↗](https://rl-dashboard-claudecode.legox.net)     |
+| Mixed harness    | OpenHands SDK + OpenCode + Claude Code | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO with R3 router replay |   126 | 62.2 → 68.2            | [rl-dashboard-mixed ↗](https://rl-dashboard-mixed.legox.net)               |
+| SAO on OpenSWE   | OpenHands SDK                          | OpenSWE 2,699 / SWE-bench Verified 500             | SAO                        |   239 | 64.0 → 68.6            | [rl-dashboard-sao ↗](https://rl-dashboard-sao.legox.net)                   |
+| SAO multilingual | OpenHands SDK                          | Self-made multilingual 1,729 / SWE-bench Multilingual 300 | SAO                 |   110 | 51.7 → 57.0            | [rl-dashboard-multilingual ↗](https://rl-dashboard-multilingual.legox.net) |
+
+<br>
+
+These boards are our runs made public as they are: one run per board, followed live from the
+first step to the last, down to the individual trial. Val is the solve rate
+(`val-core/.../mean@1`, %) on the run's validation set, "best" is the best validation checkpoint,
+and all runs are fully asynchronous. See the
+**[dashboard docs](https://lego-rl.pages.dev/docs/dashboard)** for what each panel shows, or run
+the dashboard on your own logs:
 
 ```bash
 bash webui/start_dashboard.sh
