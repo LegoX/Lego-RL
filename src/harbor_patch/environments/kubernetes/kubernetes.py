@@ -214,9 +214,9 @@ class _GenericK8sClientManager:
         # the signal handler re-raise path.
         self._emergency_cleanup_done = False
 
-        # Pod creation is deliberately paced by the named Ray actor below.
-        # These values are only used to configure that cluster-wide actor;
-        # there is intentionally no process-local semaphore or pacing state.
+        # Pod creation is deliberately paced by the named Ray actor when this
+        # process belongs to a Ray worker. Direct ``harbor run`` evaluation
+        # does not initialize Ray, so it uses the process-local fallback below.
         try:
             self._pod_create_concurrency = max(
                 1,
@@ -232,6 +232,11 @@ class _GenericK8sClientManager:
         except ValueError:
             self._pod_create_interval_sec = 20.0
         self._ray_pod_scheduler = None
+        self._local_pod_create_semaphore = asyncio.Semaphore(
+            self._pod_create_concurrency
+        )
+        self._local_pod_create_pacing_lock = asyncio.Lock()
+        self._local_pod_create_next_at = 0.0
         self._ray_scheduler_name = os.environ.get(
             "HARBOR_K8S_POD_CREATE_SCHEDULER_NAME",
             "harbor_k8s_pod_create_scheduler",
@@ -331,8 +336,9 @@ class _GenericK8sClientManager:
         """Reserve a paced slot for one Kubernetes pod-create API request.
 
         The Ray actor limits in-flight requests and reserves a distinct start
-        time for each request. If Ray is unavailable, this is a no-op: there
-        is deliberately no process-local fallback limiter.
+        time for each request. Direct non-Ray evaluation uses an equivalent
+        process-local gate because all Harbor trials are launched in one
+        process. Ray workers still use the cluster-wide gate.
         """
         ray_scheduler = await self._get_ray_pod_scheduler()
         ray_token = None
@@ -340,11 +346,36 @@ class _GenericK8sClientManager:
             try:
                 ray_token = await ray_scheduler.acquire.remote(pod_name)
             except Exception as exc:
-                self._logger.warning("Ray pod creation scheduler request failed: %s", exc)
+                self._logger.warning(
+                    "Ray pod creation scheduler request failed; "
+                    "using process-local gate: %s", exc
+                )
                 ray_scheduler = None
+        local_gate = ray_scheduler is None
+        if local_gate:
+            await self._local_pod_create_semaphore.acquire()
         try:
+            if local_gate:
+                async with self._local_pod_create_pacing_lock:
+                    now = time.monotonic()
+                    delay = max(0.0, self._local_pod_create_next_at - now)
+                    if delay > 0:
+                        self._logger.info(
+                            "Local pod creation queue: delaying %s by %.2fs "
+                            "(concurrency=%d, interval=%.2fs)",
+                            pod_name,
+                            delay,
+                            self._pod_create_concurrency,
+                            self._pod_create_interval_sec,
+                        )
+                        await asyncio.sleep(delay)
+                    self._local_pod_create_next_at = (
+                        time.monotonic() + self._pod_create_interval_sec
+                    )
             yield
         finally:
+            if local_gate:
+                self._local_pod_create_semaphore.release()
             if ray_scheduler is not None and ray_token is not None:
                 try:
                     await ray_scheduler.release.remote(ray_token)
@@ -652,7 +683,9 @@ class KubernetesEnvironment(BaseEnvironment):
       HARBOR_K8S_POD_CREATE_INTERVAL_SEC
                                      Minimum spacing between create-request
                                      start times (default: ``20`` seconds).
-                                     Set to ``0`` to disable pacing while
+                                     Applies cluster-wide in Ray mode and
+                                     process-wide in direct Harbor eval. Set
+                                     to ``0`` to disable pacing while
                                      retaining the concurrency limit.
       HARBOR_K8S_POD_CREATE_SCHEDULER_NAME
                                      Ray named-actor name for the

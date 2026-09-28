@@ -125,3 +125,28 @@ def test_multiple_ray_workers_share_global_create_gate(monkeypatch):
             ray.shutdown()
 
     asyncio.run(run())
+
+
+def test_non_ray_process_gate_paces_concurrent_creates(monkeypatch):
+    """Direct Harbor evals are protected when Ray is not initialized."""
+
+    async def run():
+        monkeypatch.setenv("HARBOR_K8S_POD_CREATE_CONCURRENCY", "2")
+        monkeypatch.setenv("HARBOR_K8S_POD_CREATE_INTERVAL_SEC", "0.05")
+
+        if ray.is_initialized():
+            ray.shutdown()
+        manager = _GenericK8sClientManager()
+        assert await manager._get_ray_pod_scheduler() is None
+
+        async def simulated_trial(index: int):
+            async with manager.pod_creation_slot(f"direct-eval-pod-{index}"):
+                started = time.monotonic()
+                await asyncio.sleep(0.01)
+                return started
+
+        starts = sorted(await asyncio.gather(*(simulated_trial(i) for i in range(3))))
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        assert min(gaps) >= 0.035, gaps
+
+    asyncio.run(run())
