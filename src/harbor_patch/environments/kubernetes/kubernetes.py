@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import contextlib
 import hashlib
 import io
 import json
@@ -20,6 +21,11 @@ from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+try:  # Ray is optional; KubernetesEnvironment also runs outside Ray.
+    import ray as _ray
+except ImportError:  # pragma: no cover - exercised only in non-Ray installs
+    _ray = None
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.environment_type import EnvironmentType
@@ -49,6 +55,51 @@ NYDUS_MIRROR_PREFIXES = (
     "jefzda/sweap-images:",
     "docker.io/jefzda/sweap-images:",
 )
+
+
+if _ray is not None:
+
+    @_ray.remote(num_cpus=0)
+    class _RayPodCreationScheduler:
+        """Cluster-wide create gate shared by all Ray agent-loop actors.
+
+        Each worker acquires a short lease before issuing one create request
+        and releases it afterwards.  The actor is detached/named, so workers
+        in different Python processes converge on the same queue.  Expiring
+        leases prevent a crashed worker from permanently consuming the slot.
+        """
+
+        def __init__(
+            self,
+            concurrency: int,
+            interval_sec: float,
+            lease_sec: float,
+        ):
+            self.concurrency = max(1, int(concurrency))
+            self.interval_sec = max(0.0, float(interval_sec))
+            self.lease_sec = max(30.0, float(lease_sec))
+            self._active: dict[str, float] = {}
+            self._next_at = 0.0
+
+        def _reap_expired(self, now: float) -> None:
+            for token, expiry in tuple(self._active.items()):
+                if expiry <= now:
+                    self._active.pop(token, None)
+
+        async def acquire(self, pod_name: str) -> str:
+            token = f"{pod_name}:{time.monotonic_ns()}"
+            while True:
+                now = time.monotonic()
+                self._reap_expired(now)
+                if len(self._active) < self.concurrency and now >= self._next_at:
+                    self._active[token] = now + self.lease_sec
+                    self._next_at = now + self.interval_sec
+                    return token
+                wait_for_slot = max(0.05, self._next_at - now)
+                await asyncio.sleep(min(wait_for_slot, 1.0))
+
+        def release(self, token: str) -> None:
+            self._active.pop(token, None)
 
 
 def _maybe_rewrite_to_nydus_mirror(image: str) -> str:
@@ -163,6 +214,34 @@ class _GenericK8sClientManager:
         # the signal handler re-raise path.
         self._emergency_cleanup_done = False
 
+        # Pod creation is deliberately paced by the named Ray actor when this
+        # process belongs to a Ray worker. Direct ``harbor run`` evaluation
+        # does not initialize Ray, so it uses the process-local fallback below.
+        try:
+            self._pod_create_concurrency = max(
+                1,
+                int(os.environ.get("HARBOR_K8S_POD_CREATE_CONCURRENCY", "16")),
+            )
+        except ValueError:
+            self._pod_create_concurrency = 16
+        try:
+            self._pod_create_interval_sec = max(
+                0.0,
+                float(os.environ.get("HARBOR_K8S_POD_CREATE_INTERVAL_SEC", "20")),
+            )
+        except ValueError:
+            self._pod_create_interval_sec = 20.0
+        self._ray_pod_scheduler = None
+        self._local_pod_create_semaphore = asyncio.Semaphore(
+            self._pod_create_concurrency
+        )
+        self._local_pod_create_pacing_lock = asyncio.Lock()
+        self._local_pod_create_next_at = 0.0
+        self._ray_scheduler_name = os.environ.get(
+            "HARBOR_K8S_POD_CREATE_SCHEDULER_NAME",
+            "harbor_k8s_pod_create_scheduler",
+        ).strip()
+
     @classmethod
     async def get_instance(cls) -> "_GenericK8sClientManager":
         """Get or create the singleton instance."""
@@ -228,6 +307,81 @@ class _GenericK8sClientManager:
                 self._logger.debug(
                     f"Kubernetes client reference count decremented to {self._reference_count}"
                 )
+
+    async def _get_ray_pod_scheduler(self):
+        """Get the optional cluster-wide Ray pod creation scheduler."""
+        if self._ray_pod_scheduler is not None or _ray is None:
+            return self._ray_pod_scheduler
+        try:
+            if not _ray.is_initialized():
+                return None
+            actor_cls = _RayPodCreationScheduler
+            self._ray_pod_scheduler = actor_cls.options(
+                name=self._ray_scheduler_name,
+                namespace="harbor_k8s",
+                lifetime="detached",
+                get_if_exists=True,
+            ).remote(
+                self._pod_create_concurrency,
+                self._pod_create_interval_sec,
+                max(30.0, float(os.environ.get("HARBOR_K8S_POD_CREATE_LEASE_SEC", "300"))),
+            )
+        except Exception as exc:
+            self._logger.warning("Ray pod creation scheduler unavailable: %s", exc)
+            self._ray_pod_scheduler = None
+        return self._ray_pod_scheduler
+
+    @contextlib.asynccontextmanager
+    async def pod_creation_slot(self, pod_name: str):
+        """Reserve a paced slot for one Kubernetes pod-create API request.
+
+        The Ray actor limits in-flight requests and reserves a distinct start
+        time for each request. Direct non-Ray evaluation uses an equivalent
+        process-local gate because all Harbor trials are launched in one
+        process. Ray workers still use the cluster-wide gate.
+        """
+        ray_scheduler = await self._get_ray_pod_scheduler()
+        ray_token = None
+        if ray_scheduler is not None:
+            try:
+                ray_token = await ray_scheduler.acquire.remote(pod_name)
+            except Exception as exc:
+                self._logger.warning(
+                    "Ray pod creation scheduler request failed; "
+                    "using process-local gate: %s", exc
+                )
+                ray_scheduler = None
+        local_gate = ray_scheduler is None
+        if local_gate:
+            await self._local_pod_create_semaphore.acquire()
+        try:
+            if local_gate:
+                async with self._local_pod_create_pacing_lock:
+                    now = time.monotonic()
+                    delay = max(0.0, self._local_pod_create_next_at - now)
+                    if delay > 0:
+                        self._logger.info(
+                            "Local pod creation queue: delaying %s by %.2fs "
+                            "(concurrency=%d, interval=%.2fs)",
+                            pod_name,
+                            delay,
+                            self._pod_create_concurrency,
+                            self._pod_create_interval_sec,
+                        )
+                        await asyncio.sleep(delay)
+                    self._local_pod_create_next_at = (
+                        time.monotonic() + self._pod_create_interval_sec
+                    )
+            yield
+        finally:
+            if local_gate:
+                self._local_pod_create_semaphore.release()
+            if ray_scheduler is not None and ray_token is not None:
+                try:
+                    await ray_scheduler.release.remote(ray_token)
+                except Exception:
+                    # Lease expiry is the crash-safety fallback.
+                    pass
 
     def register_pod(
         self,
@@ -522,6 +676,27 @@ class KubernetesEnvironment(BaseEnvironment):
       agent_runtime_image_pull_policy  ``Always`` | ``Never`` | ``IfNotPresent``
                                      (default: ``IfNotPresent``).
       agent_runtime_volume_name      Kubernetes volume name (default: ``harbor-agent-runtime``).
+      HARBOR_K8S_POD_CREATE_CONCURRENCY
+                                     Ray cluster-wide maximum number of
+                                     in-flight pod-create requests (default:
+                                     ``16``).
+      HARBOR_K8S_POD_CREATE_INTERVAL_SEC
+                                     Minimum spacing between create-request
+                                     start times (default: ``20`` seconds).
+                                     Applies cluster-wide in Ray mode and
+                                     process-wide in direct Harbor eval. Set
+                                     to ``0`` to disable pacing while
+                                     retaining the concurrency limit.
+      HARBOR_K8S_POD_CREATE_SCHEDULER_NAME
+                                     Ray named-actor name for the
+                                     cluster-wide scheduler (default:
+                                     ``harbor_k8s_pod_create_scheduler``).
+      HARBOR_K8S_POD_CREATE_LEASE_SEC
+                                     Ray scheduler lease timeout for a worker
+                                     that dies while creating a pod (default:
+                                     ``300`` seconds). The lease is held only
+                                     around the create API request, not for the
+                                     lifetime of the running pod.
     """
 
     # Default hard cap on pod lifetime (K8s-side safety net that fires even if
@@ -1708,22 +1883,39 @@ class KubernetesEnvironment(BaseEnvironment):
 
         async def create_pod_with_retry():
             retry_delays = (10, 30, 90)
+            # Admission throttling and overloaded/temporarily unavailable API
+            # servers surface as more than just HTTP 500.  Treat these as
+            # transient so the paced queue can absorb a short control-plane
+            # spike instead of failing the rollout immediately.
+            transient_create_statuses = {408, 429, 500, 502, 503, 504}
             for attempt in range(len(retry_delays) + 1):
                 try:
-                    await asyncio.to_thread(
-                        self._api.create_namespaced_pod,
-                        namespace=self.namespace,
-                        body=pod,
-                    )
+                    # Serialize and pace the actual create request through the
+                    # cluster-wide Ray actor. This prevents a rollout burst
+                    # from overwhelming apiserver admission/scheduling while
+                    # unrelated pod startup/wait work proceeds concurrently.
+                    assert self._client_manager is not None
+                    async with self._client_manager.pod_creation_slot(
+                        self.pod_name
+                    ):
+                        await asyncio.to_thread(
+                            self._api.create_namespaced_pod,
+                            namespace=self.namespace,
+                            body=pod,
+                        )
                     return
                 except ApiException as e:
-                    if e.status != 500 or attempt == len(retry_delays):
+                    if (
+                        e.status not in transient_create_statuses
+                        or attempt == len(retry_delays)
+                    ):
                         raise
                     delay = retry_delays[attempt]
                     self.logger.warning(
-                        "Failed to create pod %s with Kubernetes API 500 "
+                        "Failed to create pod %s with transient Kubernetes API %s "
                         "(attempt %d/%d); retrying in %ss: %s",
                         self.pod_name,
+                        e.status,
                         attempt + 1,
                         len(retry_delays) + 1,
                         delay,
