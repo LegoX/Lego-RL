@@ -281,7 +281,7 @@ index 00000000..b848b977
 +    print(f"[router-replay tier1] {len(_TESTS) - failures}/{len(_TESTS)} passed")
 +    raise SystemExit(1 if failures else 0)
 diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
-index 268f8d5f..d2e7779b 100644
+index 268f8d5..e21b952 100644
 --- a/verl/experimental/agent_loop/agent_loop.py
 +++ b/verl/experimental/agent_loop/agent_loop.py
 @@ -77,7 +77,15 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
@@ -315,7 +315,24 @@ index 268f8d5f..d2e7779b 100644
              tasks.append(
                  asyncio.create_task(
                      self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-@@ -1108,13 +1123,28 @@ class AgentLoopManager:
+@@ -815,9 +830,14 @@ class AgentLoopWorker:
+             mm_token_type_ids = torch.zeros_like(input_ids)
+             image_token_id = get_processor_token_id(self.processor, "image")
+             video_token_id = get_processor_token_id(self.processor, "video")
+-            if image_token_id is not None:
++            # Tool output can contain literal vision tokens (e.g. tokenizer
++            # source code). Token IDs alone do not imply image/video inputs:
++            # without a corresponding grid these are ordinary text positions.
++            image_grid_thw = multi_modal_kwargs["image_grid_thw"]
++            video_grid_thw = multi_modal_kwargs["video_grid_thw"]
++            if image_token_id is not None and image_grid_thw is not None and image_grid_thw.numel() > 0:
+                 mm_token_type_ids[0][input_ids[0] == image_token_id] = 1
+-            if video_token_id is not None:
++            if video_token_id is not None and video_grid_thw is not None and video_grid_thw.numel() > 0:
+                 mm_token_type_ids[0][input_ids[0] == video_token_id] = 2
+             multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
+
+@@ -1108,13 +1128,28 @@ class AgentLoopManager:
          Returns:
              DataProto: Output batch.
          """
@@ -351,7 +368,7 @@ index 268f8d5f..d2e7779b 100644
          output = DataProto.concat(outputs)
  
          # calculate performance metrics
-@@ -1156,4 +1186,25 @@ class AgentLoopManager:
+@@ -1156,4 +1191,25 @@ class AgentLoopManager:
              timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
              timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
  
@@ -543,7 +560,7 @@ index f96ad910..7024d196 100644
      )
  
 diff --git a/verl/experimental/fully_async_policy/fully_async_rollouter.py b/verl/experimental/fully_async_policy/fully_async_rollouter.py
-index 1eb70754..389b9429 100644
+index 1eb7075..eec3da3 100644
 --- a/verl/experimental/fully_async_policy/fully_async_rollouter.py
 +++ b/verl/experimental/fully_async_policy/fully_async_rollouter.py
 @@ -15,8 +15,10 @@
@@ -786,6 +803,21 @@ index 1eb70754..389b9429 100644
              async with self.lock:
                  task = safe_create_task(
                      self._process_single_sample_streaming(rollout_sample),
+@@ -1030,10 +1160,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
+
+         try:
+-            # Run build and monitoring tasks concurrently
+-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
++            # Propagate failures to the task runner. Returning exceptions here
++            # made a failed rollouter look like successful dataset exhaustion.
++            await asyncio.gather(generation_task, monitor_task)
+         except Exception as e:
+             print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
++            raise
+         finally:
+             if not generation_task.done():
+                 generation_task.cancel()
 diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
 index e9571da5..675ee6d8 100644
 --- a/verl/experimental/separation/engine_workers.py
