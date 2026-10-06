@@ -39,11 +39,11 @@ class FakeProxy:
     async def pop_session(self, session_id):
         self.popped.append(session_id)
         return {
-            "traj_acc_ids": [11, 12, 21],
-            "initial_prompt_token_len": 2,
-            "traj_response_mask": [1],
-            "traj_response_logprobs": [-0.2],
-            "traj_response_routing": [],
+            "episode_id": session_id,
+            "trajectory_segments": [{
+                "prompt_ids": [11, 12], "response_ids": [21], "response_mask": [1],
+                "response_logprobs": [-0.2], "response_routing": [None], "num_turns": 1,
+            }],
             "messages_snapshot": [{"role": "assistant", "content": "ok"}],
             "num_calls": 1,
         }
@@ -93,6 +93,7 @@ def make_loop(tmp_path):
         "openhands_sdk": SimpleNamespace(
             name="openhands_sdk",
             protocol="openai",
+            render_contract=None,
             harbor_cfg={
                 "agent": {
                     "import_path": "example:OpenHandsSDK",
@@ -105,6 +106,7 @@ def make_loop(tmp_path):
         "claude_code": SimpleNamespace(
             name="claude_code",
             protocol="anthropic",
+            render_contract=None,
             harbor_cfg={
                 "agent": {"import_path": "example:ClaudeCode", "kwargs": {}, "env": {}},
                 "environment": {"kwargs": {}},
@@ -140,6 +142,9 @@ def test_mixed_yaml_uses_one_set_of_shared_worker_controls(tmp_path, monkeypatch
 
     monkeypatch.setattr(module, "HARBOR_AVAILABLE", True)
     config = OmegaConf.load("src/verl_patch/config/agent_loop_config_mixed.yaml")[0]
+    # This initializer test does not exercise the deployment render contract.
+    for definition in config.harnesses.values():
+        definition.render_contract = None
     loop = BuiltinSWEAgentLoop.__new__(BuiltinSWEAgentLoop)
     loop.rollout_config = SimpleNamespace(prompt_length=100, response_length=200)
 

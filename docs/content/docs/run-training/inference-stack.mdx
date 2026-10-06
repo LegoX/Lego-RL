@@ -61,4 +61,4 @@ watch -n 2 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv
 | vLLM never registers for >30 min | vLLM init error — check `logs/<exp>.log` and `logs/<exp>_vllm.log` |
 | GPU memory high, util 0% sustained during rollout | sandbox side stuck (no traffic from agent pods) — `kubectl get pods -l harbor-managed=true` |
 | `CUDA error: an illegal memory access` at first forward pass | `gen_tp` does not divide `num_key_value_heads` — see [Preflight](/docs/run-training/preflight) |
-| `proxy_trajectory.json` rows are zero-filled | sequence divergence forced a lossy rebuild — the proxy recomputes prefix logprobs via vLLM `prompt_logprobs` (kill-switch `HARBOR_RECOMPUTE_MISMATCH_LOGPROBS=0`) |
+| Multiple `trajectory_segments` in `proxy_trajectory.json` | the harness rewrote context; each segment retains its original sampling prefix. Inspect masks and `HARBOR_TRAJECTORY_SELECTION` |

@@ -30,40 +30,31 @@ ANTHROPIC_BASE_URL=http://<host>:<port>/sess/<id>   OPENAI_API_BASE=http://<host
 
 ## Trajectory capture
 
-The capture pipeline runs once per model call, in five steps:
+The proxy records the exact engine prompt, sampled tokens, behavior logprobs
+and routing metadata in context-preserving segments. Only sampled tokens have
+`response_mask=1`; tool observations, template tails and historical assistant
+messages in a new prompt have mask zero.
 
-1. **Tokenize** the incoming messages through the *same* `apply_chat_template`
-   path as verl — incremental, byte-equivalent to a one-shot render, so proxy
-   tokens and trainer tokens can never disagree.
-2. **Prefix-check** against the session's token accumulator. If the agent
-   rewrote earlier history (compaction, injected reminders), the rebuilt
-   prefix's log-probabilities are **recomputed via vLLM `prompt_logprobs`**
-   instead of being zero-filled
-   (kill-switch: `HARBOR_RECOMPUTE_MISMATCH_LOGPROBS=0`).
-3. **Generate** through `server_manager.generate(...)` — never vLLM directly —
-   so load balancing, admission control, and partial-rollout resume apply
-   transparently.
-4. **Append verbatim** the sampled token ids, response mask, per-token
-   log-probabilities, and (for MoE) expert-routing decisions to the session
-   state:
+An append extends the current segment. A rewritten engine prompt starts another
+segment after generation succeeds, retaining earlier actions under their original
+contexts. For example:
 
-```python
-# per-session accumulator — the token source of truth
-sess = {
-    "traj_acc_ids":            [],   # prompt + response token ids, turn by turn
-    "traj_response_mask":      [],   # 1 = policy token, 0 = tool/user token
-    "traj_response_logprobs":  [],   # behavior-policy logprobs, as sampled
-    "traj_response_routing":   [],   # MoE expert choices (consumed by R3)
-}
+```text
+segment 0: Q A1 O1 A2 O2 A3    train A1, A2, A3
+segment 1: Q A1 Z A3 O3 A4     train A4 only
 ```
 
-5. **Archive** — at trial end the agent loop builds its training output straight
-   from this accumulator (see
-   [AgentLoopWorkers](/docs/architecture/agent-loop-workers)) and a per-trial
-   `proxy_trajectory.json` is written under `harbor_trials/` for inspection.
+The previous prefix-logprob recomputation path is removed: scoring A3 under a
+rewritten prefix cannot recover its original sampling context. Exact retries or
+replacement of the latest assistant roll back that generation only when the
+replacement succeeds. Discarded generations are retained for inspection.
 
-There is no transcript re-tokenization anywhere in this path: what vLLM
-sampled is what the trainer scores.
+At trial end, `proxy_trajectory.json` stores all `trajectory_segments`, discarded
+retries, and the latest messages/tools. Training selection is described under
+[AgentLoopWorkers](/docs/architecture/agent-loop-workers#context-segment-selection).
+Existing subagent isolation still applies: changes to the initial conversation
+identity route to an untrained sub-session. Multimodal trajectory capture and
+arbitrary branch identity remain outside this path's scope.
 
 ## Admission control
 

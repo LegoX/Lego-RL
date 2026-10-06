@@ -8,6 +8,7 @@
   _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
   # Shared worker controls live at the loop level, not inside Harbor's
   # per-harness TrialConfig.
+  trajectory_selection: ${oc.env:HARBOR_TRAJECTORY_SELECTION,longest}
   tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
   max_consecutive_no_tool: ${oc.decode:${oc.env:HARBOR_MAX_CONSECUTIVE_NO_TOOL,3}}
   trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}

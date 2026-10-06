@@ -1,0 +1,573 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 073bbe0..3215d2d 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -627,7 +627,7 @@ class AgentLoopWorker:
+         agent_name: str,
+         trace: bool = True,
+         **kwargs,
+-    ) -> _InternalAgentLoopOutput:
++    ) -> _InternalAgentLoopOutput | list[_InternalAgentLoopOutput]:
+         with rollout_trace_attr(
+             step=trajectory["step"],
+             sample_index=trajectory["sample_index"],
+@@ -651,11 +651,15 @@ class AgentLoopWorker:
+                 data_config=DictConfigWrap(self.config.data),
+                 tools=ToolListWrap(self.tools),
+             )
+-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
++            output: AgentLoopOutput | list[AgentLoopOutput] = await agent_loop.run(sampling_params, **kwargs)
+             # ``validate`` was injected into kwargs so concrete agent loops can pick
+             # val-specific settings; drop it before forwarding to postprocess, which
+             # already takes ``validate`` as a positional arg (else: duplicate kwarg).
+             kwargs.pop("validate", None)
++            if isinstance(output, list):
++                if not output or any(o.reward_score is None for o in output):
++                    raise ValueError("Multi-segment loops must return nonempty outputs with episode rewards")
++                return [await self._agent_loop_postprocess(o, trajectory["validate"], **kwargs) for o in output]
+             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+ 
+     def _pad_token_ids(
+@@ -986,11 +990,23 @@ class AgentLoopWorker:
+ 
+     def _postprocess(
+         self,
+-        inputs: list[_InternalAgentLoopOutput],
++        inputs: list[_InternalAgentLoopOutput | list[_InternalAgentLoopOutput]],
+         input_non_tensor_batch: dict | None = None,
+         validate: bool = False,
+     ) -> DataProto:
+-        """Process the padded outputs from _run_agent_loop and combine them into a batch."""
++        """Keep one envelope per episode; training expands additional segments."""
++        from verl.utils.episode_segments import SEGMENTS_KEY
++
++        groups = [item if isinstance(item, list) else [item] for item in inputs]
++        inputs = [group[0] for group in groups]
++        envelopes = np.empty(len(groups), dtype=object)
++        envelopes[:] = None
++        for i, group in enumerate(groups):
++            if len(group) > 1:
++                extra = self._postprocess(group[1:], validate=validate)
++                extra.non_tensor_batch.pop(SEGMENTS_KEY, None)
++                extra.meta_info = {}
++                envelopes[i] = extra
+         # Convert lists back to tensors and stack them to create a batch.
+         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
+         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
+@@ -1032,6 +1048,10 @@ class AgentLoopWorker:
+             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+             score_tensor = torch.tensor(scores, dtype=torch.float32)
+             rm_scores[torch.arange(response_mask.size(0))[valid], idx[valid]] = score_tensor[valid]
++            if validate:
++                # Verifier outcomes remain valid even when no action fits the
++                # training budget. These rows are never expanded for training.
++                rm_scores[~valid, -1] = score_tensor[~valid]
+             batch["rm_scores"] = rm_scores
+ 
+         non_tensor_batch = {
+@@ -1069,6 +1089,7 @@ class AgentLoopWorker:
+             extra_fields[key] = temp_arr
+ 
+         non_tensor_batch.update(extra_fields)
++        non_tensor_batch[SEGMENTS_KEY] = envelopes
+ 
+         # Only include reward_extra_keys in meta_info if rm_scores is in batch
+         # This avoids conflicts when reward_tensor is merged later in ray_trainer.py
+diff --git a/verl/experimental/fully_async_policy/detach_utils.py b/verl/experimental/fully_async_policy/detach_utils.py
+index 7024d19..e5186eb 100644
+--- a/verl/experimental/fully_async_policy/detach_utils.py
++++ b/verl/experimental/fully_async_policy/detach_utils.py
+@@ -22,6 +22,7 @@ import torch
+ 
+ from verl import DataProto
+ from verl.trainer.ppo.ray_trainer import compute_response_mask
++from verl.utils.episode_segments import SEGMENTS_KEY, expand_episode_segments
+ 
+ 
+ @dataclass
+@@ -212,9 +213,6 @@ def assemble_batch_from_rollout_samples(
+     if "response_mask" not in final_batch.batch.keys():
+         final_batch.batch["response_mask"] = compute_response_mask(final_batch)
+ 
+-    if balance_batch:
+-        balance_batch(final_batch, metrics={})
+-
+     # Calculate the global valid token number
+     if "attention_mask" in final_batch.batch:
+         final_batch.meta_info["global_token_num"] = torch.sum(final_batch.batch["attention_mask"], dim=-1).tolist()
+@@ -239,8 +237,12 @@ def assemble_batch_from_rollout_samples(
+     for nk in ("compute_score_times", "num_preempted_vals"):
+         final_batch.non_tensor_batch.pop(nk, None)
+ 
+-    param_version_start = final_batch.non_tensor_batch["min_global_steps"]
+-    param_version_end = final_batch.non_tensor_batch["max_global_steps"]
++    param_version_start = final_batch.non_tensor_batch["min_global_steps"].copy()
++    param_version_end = final_batch.non_tensor_batch["max_global_steps"].copy()
++    for i, segments in enumerate(final_batch.non_tensor_batch.get(SEGMENTS_KEY, [])):
++        if segments is not None:
++            param_version_start[i] = min(param_version_start[i], min(segments.non_tensor_batch["min_global_steps"]))
++            param_version_end[i] = max(param_version_end[i], max(segments.non_tensor_batch["max_global_steps"]))
+     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
+     num_diff0 = param_version_diff.count(0)
+     partial_stats = {
+@@ -249,7 +251,7 @@ def assemble_batch_from_rollout_samples(
+         "fully_async/partial/max_partial_span": max(param_version_diff),
+     }
+     # add meta_info
+-    trajectory_param_versions = final_batch.non_tensor_batch["max_global_steps"]
++    trajectory_param_versions = param_version_end
+ 
+     final_batch.meta_info.update(
+         {
+@@ -264,6 +266,10 @@ def assemble_batch_from_rollout_samples(
+ 
+     print(f"[BatchUtils] Batch assembly completed in {time.time() - start_time:.2f}s")
+ 
++    final_batch = expand_episode_segments(final_batch, config)
++    if balance_batch:
++        balance_batch(final_batch, metrics={})
++    final_batch.meta_info["global_token_num"] = final_batch.batch["attention_mask"].sum(-1).tolist()
+     return final_batch
+ 
+ 
+diff --git a/verl/experimental/separation/ray_trainer.py b/verl/experimental/separation/ray_trainer.py
+index d64034a..db282d5 100644
+--- a/verl/experimental/separation/ray_trainer.py
++++ b/verl/experimental/separation/ray_trainer.py
+@@ -45,6 +45,7 @@ from verl.trainer.ppo.utils import Role, WorkerType
+ from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
+ from verl.utils.config import omega_conf_to_dataclass
+ from verl.utils.debug import marked_timer
++from verl.utils.episode_segments import expand_episode_segments
+ from verl.utils.import_utils import load_class_from_fqn
+ from verl.utils.metric import reduce_metrics
+ from verl.utils.rollout_skip import RolloutSkip
+@@ -491,6 +492,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
+         # repeat to align with repeated responses in rollout
+         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+         batch = batch.union(gen_batch_output)
++        batch = expand_episode_segments(batch, self.config)
+ 
+         if "response_mask" not in batch.batch.keys():
+             batch.batch["response_mask"] = compute_response_mask(batch)
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index e01d044..c883fb1 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -1202,6 +1202,7 @@ def agg_loss(
+     batch_num_tokens: Optional[int] = None,
+     global_batch_size: Optional[int] = None,
+     loss_scale_factor: Optional[int] = None,
++    episode_token_count: Optional[torch.Tensor] = None,
+ ):
+     """
+     Aggregate the loss across global batch to ensure the loss is invariant to fsdp/megatron parallelism.
+@@ -1217,6 +1218,8 @@ def agg_loss(
+         dp_size: data parallel size
+         batch_num_tokens: number of valid tokens in global batch
+         global_batch_size: global batch size
++        episode_token_count: optional whole-episode token count for each segment.
++            When provided, global_batch_size counts episodes, not segment rows.
+         loss_scale_factor: scale factor for "seq-mean-token-sum-norm" mode. If None, uses loss_mask.shape[-1].
+             Set this to a constant value to ensure consistent normalization throughout training.
+ 
+@@ -1245,11 +1248,12 @@ def agg_loss(
+             loss /= loss_scale_factor
+     elif loss_agg_mode == "seq-mean-token-mean":
+         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
+-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
++        token_count = seq_mask if episode_token_count is None else episode_token_count
++        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (token_count + 1e-8)
+         seq_mask = (seq_mask > 0).float()  # exclude fully masked sequences
+         if global_batch_size is None:
+-            if dp_size > 1:
+-                raise ValueError("global_batch_size is required when dp_size > 1")
++            if dp_size > 1 or episode_token_count is not None:
++                raise ValueError("global_batch_size is required for DP or episode normalization")
+             global_batch_size = seq_mask.sum()
+         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+     else:
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index c36bab4..e095167 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -61,6 +61,7 @@ from verl.utils import tensordict_utils as tu
+ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+ from verl.utils.config import omega_conf_to_dataclass
+ from verl.utils.debug import marked_timer
++from verl.utils.episode_segments import compute_episode_grpo, expand_episode_segments
+ from verl.utils.import_utils import deprecated, load_class_from_fqn
+ from verl.utils.metric import reduce_metrics
+ from verl.utils.py_functional import rename_dict
+@@ -241,13 +242,15 @@ def compute_advantage(
+         # Initialize the mask for GRPO calculation
+         grpo_calculation_mask = data.batch["response_mask"]
+ 
+-        # Call compute_grpo_outcome_advantage with parameters matching its definition
+-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+-            token_level_rewards=data.batch["token_level_rewards"],
+-            response_mask=grpo_calculation_mask,
+-            index=data.non_tensor_batch["uid"],
+-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+-        )
++        if data.meta_info.get("episode_segments_expanded"):
++            advantages, returns = compute_episode_grpo(data, norm_adv_by_std_in_grpo)
++        else:
++            advantages, returns = core_algos.compute_grpo_outcome_advantage(
++                token_level_rewards=data.batch["token_level_rewards"],
++                response_mask=grpo_calculation_mask,
++                index=data.non_tensor_batch["uid"],
++                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
++            )
+         data.batch["advantages"] = advantages
+         data.batch["returns"] = returns
+     else:
+@@ -1311,45 +1314,57 @@ class RayPPOTrainer:
+ 
+     def _update_actor(self, batch: DataProto) -> DataProto:
+         rollout_config = self.config.actor_rollout_ref.rollout
++        actor_config = self.config.actor_rollout_ref.actor
+         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+         # TODO: Make "temperature" single source of truth from generation.
+         batch.meta_info["temperature"] = rollout_config.temperature
+-        # update actor
+-        batch_td = batch.to_tensordict()
+-        # step 2: convert from padding to no-padding
+-        batch_td = left_right_2_no_padding(batch_td)
+-        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+-            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+-        )
++        calculate_entropy = actor_config.calculate_entropy or actor_config.entropy_coeff != 0.0
+         distillation_use_topk = (
+             self.distillation_config.distillation_loss.loss_settings.use_topk
+             if is_distillation_enabled(self.config.get("distillation"))
+             else False
+         )
+-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+-        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+-        seed = self.config.actor_rollout_ref.actor.data_loader_seed
+-        shuffle = self.config.actor_rollout_ref.actor.shuffle
+-        tu.assign_non_tensor(
+-            batch_td,
+-            calculate_entropy=calculate_entropy,
+-            distillation_use_topk=distillation_use_topk,
+-            global_batch_size=ppo_mini_batch_size,
+-            mini_batch_size=ppo_mini_batch_size,
+-            epochs=ppo_epochs,
+-            seed=seed,
+-            dataloader_kwargs={"shuffle": shuffle},
+-            compute_loss=True,
+-        )
+-        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+-        actor_output = tu.get(actor_output, "metrics")
+-        actor_output = rename_dict(actor_output, "actor/")
+-        # modify key name
+-        actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
+-        actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
++        episode_training = batch.meta_info.get("episode_segments_expanded", False)
++        if episode_training:
++            from verl.utils.episode_segments import iter_episode_minibatches
+ 
+-        return actor_output
++            updates = iter_episode_minibatches(
++                batch, actor_config, rollout_config.n, self._get_dp_size(self.actor_rollout_wg, "actor")
++            )
++        else:
++            updates = [batch]
++
++        metrics = {}
++        optimizer_steps = 0
++        for update in updates:
++            # The ordinary path leaves mini-batching/epochs to the worker. An
++            # episode update already contains all its segments, so the worker
++            # performs exactly one step, with no local row shuffle.
++            mini_batch_size = len(update) if episode_training else actor_config.ppo_mini_batch_size * rollout_config.n
++            batch_td = left_right_2_no_padding(update.to_tensordict())
++            tu.assign_non_tensor(
++                batch_td,
++                calculate_entropy=calculate_entropy,
++                distillation_use_topk=distillation_use_topk,
++                global_batch_size=update.meta_info.get("num_update_episodes", mini_batch_size),
++                mini_batch_size=mini_batch_size,
++                epochs=1 if episode_training else actor_config.ppo_epochs,
++                seed=actor_config.data_loader_seed,
++                dataloader_kwargs={"shuffle": False if episode_training else actor_config.shuffle},
++                update_lr_scheduler=update.meta_info.get("update_lr_scheduler", True),
++                compute_loss=True,
++            )
++            output = tu.get(self.actor_rollout_wg.update_actor(batch_td), "metrics")
++            for key, value in output.items():
++                metrics.setdefault(key, []).extend(value if isinstance(value, list) else [value])
++            optimizer_steps += 1
++
++        metrics = rename_dict(metrics, "actor/")
++        if "actor/mfu" in metrics:
++            metrics["perf/mfu/actor"] = metrics.pop("actor/mfu")
++        if episode_training:
++            metrics["actor/episode_optimizer_steps"] = optimizer_steps
++        return DataProto.from_single_dict(data={}, meta_info={"metrics": metrics})
+ 
+     def _update_critic(self, batch: DataProto) -> DataProto:
+         batch_td = batch.to_tensordict()
+@@ -1515,6 +1530,7 @@ class RayPPOTrainer:
+                     # repeat to align with repeated responses in rollout
+                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                     batch = batch.union(gen_batch_output)
++                    batch = expand_episode_segments(batch, self.config)
+ 
+                     if "response_mask" not in batch.batch.keys():
+                         batch.batch["response_mask"] = compute_response_mask(batch)
+diff --git a/verl/utils/episode_segments.py b/verl/utils/episode_segments.py
+new file mode 100644
+index 0000000..805e346
+--- /dev/null
++++ b/verl/utils/episode_segments.py
+@@ -0,0 +1,212 @@
++"""Episode envelopes for context-preserving, multi-segment agent rollouts.
++
++Rollout/validation keep one row per task execution. Only training expands the
++segments. Query ids define GRPO groups; episode ids deduplicate outcomes within
++those groups. Updates and sequence-loss normalization count original episodes;
++GSPO importance ratios and clipping still operate on individual segments.
++"""
++
++from math import lcm
++from uuid import uuid4
++
++import numpy as np
++import torch
++
++from verl import DataProto
++from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
++
++SEGMENTS_KEY = "_episode_segments"
++PADDING_KEY = "segment_padding"
++EPISODE_INDEX = "episode_index"
++TOKEN_COUNT = "episode_token_count"
++
++
++def validate_episode_training(config):
++    """Fail explicitly for training paths that do not honor episode boundaries."""
++    actor = config.actor_rollout_ref.actor
++    if config.algorithm.adv_estimator != "grpo" or config.algorithm.get("use_kl_in_reward", False):
++        raise ValueError("trajectory_selection=all requires GRPO and use_kl_in_reward=false")
++    if actor.strategy not in {"fsdp", "fsdp2", "veomni"}:
++        raise ValueError("trajectory_selection=all currently supports the FSDP and VeOmni engines")
++    if actor.get("use_prefix_grouper", False):
++        raise ValueError("Multi-segment episodes do not support prefix-group batch balancing")
++    if config.trainer.get("use_legacy_worker_impl", "disable") != "disable":
++        raise ValueError("trajectory_selection=all requires trainer.use_legacy_worker_impl=disable")
++    if (config.get("distillation") or {}).get("enabled", False):
++        raise ValueError("Multi-segment episodes do not support distillation")
++
++
++def pad_segments(data: DataProto, divisor: int) -> DataProto:
++    """Pad dispatch rows without creating outcomes, loss tokens or episodes."""
++    n_pad = (-len(data)) % divisor
++    if not n_pad:
++        return data
++    # Reuse the shortest forward input. A masked row still participates in DP
++    # collectives, including on ranks with no real segments in this update.
++    shortest = int(data.batch["attention_mask"].sum(-1).argmin())
++    pad = data.select_idxs(np.full(n_pad, shortest, dtype=np.int64))
++    pad.batch = pad.batch.clone()
++    pad.batch[PADDING_KEY].fill_(True)
++    for key in ("response_mask", "rm_scores", "token_level_scores", "token_level_rewards", "advantages", "returns"):
++        if key in pad.batch:
++            pad.batch[key].zero_()
++    # concat merges metadata; it must not concatenate rollout metrics again.
++    metadata = dict(data.meta_info)
++    data.meta_info = {}
++    pad.meta_info = {}
++    result = DataProto.concat([data, pad])
++    data.meta_info = metadata
++    result.meta_info = metadata
++    return result
++
++
++def _forward_batch_divisor(config):
++    # The actual DP size can be smaller than world size (e.g. Ulysses SP).
++    # This conservative multiple also supports fixed-size inference batches.
++    divisor = int(config.trainer.nnodes * config.trainer.n_gpus_per_node)
++    micro_sizes = [1]
++    for name in ("rollout", "ref"):
++        cfg = config.actor_rollout_ref.get(name, {})
++        if not cfg.get("log_prob_use_dynamic_bsz", True):
++            size = cfg.get("log_prob_micro_batch_size_per_gpu")
++            if size is None or size < 1:
++                raise ValueError(f"{name}.log_prob_micro_batch_size_per_gpu must be positive for fixed batching")
++            micro_sizes.append(int(size))
++    return divisor * lcm(*micro_sizes)
++
++
++def expand_episode_segments(data: DataProto, config) -> DataProto:
++    envelopes = data.non_tensor_batch.pop(SEGMENTS_KEY, None)
++    selections = data.non_tensor_batch.get("trajectory_selection", [])
++    has_segments = envelopes is not None and any(e is not None for e in envelopes)
++    if not has_segments and not any(s == "all" for s in selections):
++        return data
++    validate_episode_training(config)
++
++    rows = []
++    for i in range(len(data)):
++        parent = data[i : i + 1]
++        episode_id = parent.non_tensor_batch.get("episode_id", [None])[0] or f"empty-{uuid4().hex}"
++        parent.non_tensor_batch["episode_id"] = np.array([episode_id], dtype=object)
++        parent.batch[EPISODE_INDEX] = torch.tensor([i], dtype=torch.long)
++        parent.meta_info = {}
++        rows.append(parent)
++        extra = envelopes[i] if envelopes is not None else None
++        if extra is None:
++            continue
++        for j in range(len(extra)):
++            child = extra[j : j + 1]
++            # Keep input metadata assigned after rollout (notably async uid).
++            # Child tensor fields and generated metadata describe its own context.
++            tensors = parent.batch.clone()
++            tensors.update(child.batch)
++            metadata = dict(parent.non_tensor_batch)
++            metadata.update(child.non_tensor_batch)
++            metadata.pop(SEGMENTS_KEY, None)
++            metadata["uid"] = parent.non_tensor_batch["uid"].copy()
++            metadata["episode_id"] = parent.non_tensor_batch["episode_id"].copy()
++            rows.append(DataProto(batch=tensors, non_tensor_batch=metadata))
++    expanded = DataProto.concat(rows)
++    expanded.meta_info = dict(data.meta_info)
++    expanded.meta_info["episode_segments_expanded"] = True
++    expanded.meta_info["num_rollout_episodes"] = len(data)
++    expanded.meta_info["num_training_segments"] = len(expanded)
++    expanded.batch[PADDING_KEY] = torch.zeros(len(expanded), dtype=torch.bool)
++    return pad_segments(expanded, _forward_batch_divisor(config))
++
++
++def iter_episode_minibatches(data: DataProto, actor_config, rollout_n: int, dp_size: int):
++    """Select episodes first, then balance/pad their segments for one update.
++
++    The planner is global: no worker-local row shuffle may split an episode
++    across optimizer steps. Physical row counts can vary between updates.
++    Loss denominators are computed after trainer-side filtering and before
++    microbatching; later loss-side rejection does not renormalize them.
++    """
++    groups = {}
++    for row, (episode, padding) in enumerate(
++        zip(data.batch[EPISODE_INDEX].tolist(), data.batch[PADDING_KEY].tolist(), strict=True)
++    ):
++        if not padding:
++            groups.setdefault(episode, []).append(row)
++    episodes = sorted(groups)
++    budget = int(actor_config.ppo_mini_batch_size * rollout_n)
++    if budget < 1 or dp_size < 1:
++        raise ValueError("Episode batch size and DP size must be positive")
++
++    # A denominator per row survives arbitrary DP and microbatch placement.
++    counts = data.batch["response_mask"].sum(-1)
++    denominators = torch.zeros_like(counts)
++    for rows in groups.values():
++        denominators[rows] = counts[rows].sum()
++    data.batch[TOKEN_COUNT] = denominators
++
++    generator = torch.Generator().manual_seed(actor_config.data_loader_seed)
++    plans = []  # indices only, never materialize epochs of token tensors
++    for _ in range(actor_config.ppo_epochs):
++        order = (
++            torch.randperm(len(episodes), generator=generator).tolist()
++            if actor_config.shuffle
++            else range(len(episodes))
++        )
++        ordered = [episodes[i] for i in order]
++        for start in range(0, len(ordered), budget):
++            selected = ordered[start : start + budget]
++            rows = [row for episode in selected for row in groups[episode]]
++            # Skip a globally empty update, never an individual empty rank.
++            if counts[rows].sum() > 0:
++                plans.append((rows, len(selected)))
++
++    micro_size = 1 if actor_config.use_dynamic_bsz else actor_config.ppo_micro_batch_size_per_gpu
++    if micro_size is None or micro_size < 1:
++        raise ValueError("ppo_micro_batch_size_per_gpu must be positive for fixed batching")
++    for step, (rows, episode_count) in enumerate(plans):
++        batch = data.select_idxs(np.asarray(rows, dtype=np.int64))
++        batch.meta_info = dict(data.meta_info)
++        batch = pad_segments(batch, dp_size * int(micro_size))
++        workloads = calculate_workload(batch.batch["attention_mask"].sum(-1)).tolist()
++        partitions = get_seqlen_balanced_partitions(workloads, dp_size, equal_size=True)
++        batch.reorder(torch.tensor([row for partition in partitions for row in partition]))
++        batch.meta_info["num_update_episodes"] = episode_count
++        batch.meta_info["update_lr_scheduler"] = step == len(plans) - 1
++        yield batch
++
++
++def compute_episode_grpo(data, norm_adv_by_std_in_grpo=True):
++    """Compute one outcome advantage per episode and broadcast to its segments.
++
++    Filtered/empty rows never enter the baseline. If a partially truncated
++    episode still has usable segments, it contributes once through those rows.
++    """
++    from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
++    from verl.trainer.ppo.trajectory_filter import FILTER_MASK_KEY
++
++    mask = data.batch["response_mask"]
++    invalid = np.asarray(data.non_tensor_batch.get(FILTER_MASK_KEY, np.zeros(len(data), dtype=bool)))
++    padding = data.batch[PADDING_KEY].cpu().numpy()
++    episodes = {}
++    row_episode = {}
++    for i, episode in enumerate(data.non_tensor_batch["episode_id"]):
++        if padding[i] or invalid[i] or not mask[i].any():
++            continue
++        uid = data.non_tensor_batch["uid"][i]
++        reward = float(data.non_tensor_batch["episode_reward"][i])
++        if episode not in episodes:
++            episodes[episode] = (len(episodes), uid, reward)
++        slot, original_uid, original_reward = episodes[episode]
++        if uid != original_uid or reward != original_reward:
++            raise ValueError("Segments in one episode must share query uid and outcome reward")
++        row_episode[i] = slot
++    result = torch.zeros_like(data.batch["token_level_rewards"])
++    if episodes:
++        scores = result.new_tensor([item[2] for item in episodes.values()]).unsqueeze(1)
++        uids = np.array([item[1] for item in episodes.values()], dtype=object)
++        episode_adv, _ = compute_grpo_outcome_advantage(
++            token_level_rewards=scores,
++            response_mask=torch.ones_like(scores),
++            index=uids,
++            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
++        )
++        for row, slot in row_episode.items():
++            result[row] = episode_adv[slot, 0] * mask[row]
++    return result, result.clone()
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index 96d35a6..1972754 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -246,6 +246,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
+         mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
+         num_mini_batch = tu.pop(data, key="num_mini_batch", default=None)
+         epochs = tu.pop(data, key="epochs", default=1)
++        update_lr_scheduler = tu.pop(data, key="update_lr_scheduler", default=True)
+         seed = tu.pop(data, key="seed", default=42)
+         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+ 
+@@ -295,7 +296,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
+                 tu.assign_non_tensor(
+                     mini_batch_td,
+                     global_token_num=NonTensorData(global_token_num),
+-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
++                    update_lr_scheduler=update_lr_scheduler and batch_idx == total_num_iterations - 1,
+                     disable_auto_offload=True,
+                 )
+                 actor_output = self.train_batch(mini_batch_td)
+diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
+index 1080e94..75cf0f4 100644
+--- a/verl/workers/utils/losses.py
++++ b/verl/workers/utils/losses.py
+@@ -66,6 +66,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+     config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
++    # Keep binary action masks for GSPO ratios. Only the reducer receives the
++    # whole-episode denominator, including for entropy and actor KL losses.
++    config.global_batch_info["episode_token_count"] = data.get("episode_token_count", None)
+ 
+     # assumes that if any of the global batch info is set, the policy_loss_fn will
+     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM

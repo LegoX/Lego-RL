@@ -126,7 +126,7 @@ def test_validation_uses_configured_harness_even_when_metadata_differs(definitio
 def test_validation_still_rejects_unknown_explicit_harness(definitions):
     resolver = HarnessResolver(
         definitions,
-        {"val_harness": "openhands_sdk"},
+        {"default": "openhands_sdk", "val_harness": "openhands_sdk"},
     )
 
     with pytest.raises(ValueError, match="Unknown harness"):

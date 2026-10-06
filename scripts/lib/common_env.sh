@@ -8,8 +8,6 @@ export GLOO_SOCKET_IFNAME=eth0 TP_SOCKET_IFNAME=eth0 NCCL_SOCKET_IFNAME=eth0
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}" DOCKER_BUILDKIT=1
 export TOKENIZERS_PARALLELISM=false RAYON_NUM_THREADS=1
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
-# Disable proxy mismatch-logprob recompute (fragmented vLLM allocation → weight-sync NCCL starvation → step1 OOM)
-export HARBOR_RECOMPUTE_MISMATCH_LOGPROBS="${HARBOR_RECOMPUTE_MISMATCH_LOGPROBS:-0}"
 
 # site/infra layer: cluster-specific (registry / nydus / mounts / kubeconfig / acceleration / MODEL_ROOT).
 # Default = portable vanilla; local acceleration only turns on when the site file exists. For another cluster, copy from site.example.env first.
