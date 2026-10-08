@@ -32,6 +32,10 @@ updates the policy from the captured trajectory.
 
 ## News
 
+- [2026/10/08] **Codex training dashboard.** The dedicated
+  [Codex dashboard](https://rl-dashboard-codex.legox.net/) shows the
+  `cx-6n8g-dlcoenjt6d5urdcu` experiment, with training curves and per-trial analysis.
+  Workspace sign-in is required.
 - [2026/09/17] **Public training dashboards.** We are opening the live dashboards of six real
   Lego-RL runs, all on Qwen3.5-35B-A3B: GSPO on OpenSWE with each harness natively —
   [OpenHands SDK](https://rl-dashboard-openhands.legox.net),
@@ -128,6 +132,10 @@ the dashboard on your own logs:
 bash webui/start_dashboard.sh
 ```
 
+**Codex:** [rl-dashboard-codex ↗](https://rl-dashboard-codex.legox.net/) is the dedicated
+board for `cx-6n8g-dlcoenjt6d5urdcu`. It displays only this experiment and requires
+Workspace sign-in.
+
 ## Key Features
 
 - **Native agents**: Claude Code, OpenHands, and OpenCode run through thin adapters. A custom
@@ -177,7 +185,9 @@ The validate step launches nothing. In Claude Code the same run is `/rl:run scri
 Questions, run reports and contributions are welcome. Scan to join the WeChat group:
 
 <div align="center">
- <img src="docs/public/wechat_group.png" width="220" alt="Lego-RL WeChat group">
+ <a href="docs/public/wechat_group.png">
+  <img src="docs/public/wechat_group.png" width="320" alt="Lego-RL WeChat group — click to view the full-size QR code">
+ </a>
 </div>
 
 
