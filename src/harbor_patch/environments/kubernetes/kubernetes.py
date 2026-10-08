@@ -2696,7 +2696,10 @@ true
                     saw_output = True
 
                 while resp.peek_stderr():
-                    stderr_chunks.append(resp.read_stderr())
+                    data = resp.read_stderr()
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8", errors="replace")
+                    stderr_chunks.append(data)
                     saw_output = True
 
                 if resp.is_open():
@@ -2740,6 +2743,7 @@ true
             stdin=False,
             stdout=True,
             tty=False,
+            binary=True,
             _preload_content=False,
         )
 
@@ -2797,6 +2801,7 @@ true
                 stdin=False,
                 stdout=True,
                 tty=False,
+                binary=True,
                 _preload_content=False,
             )
         except ApiException as e:
