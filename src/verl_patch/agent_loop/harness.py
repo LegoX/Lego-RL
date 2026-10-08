@@ -205,6 +205,8 @@ def infer_implicit_harness_name(harbor_cfg: Mapping[str, Any]) -> str:
     ).lower()
     if "claude" in descriptor:
         return "claude_code"
+    if "codex" in descriptor:
+        return "codex"
     if "opencode" in descriptor:
         return "opencode"
     if "openhands_sdk" in descriptor or "openhands-sdk" in descriptor:
@@ -581,3 +583,6 @@ def inject_harness_endpoint(
     if "opencode" in descriptor:
         agent_env["HOSTED_VLLM_BASE_URL"] = openai_base
         agent_env.setdefault("HOSTED_VLLM_API_KEY", openai_api_key)
+    if "codex" in descriptor:
+        agent_env["OPENAI_BASE_URL"] = openai_base
+        agent_env.setdefault("OPENAI_API_KEY", openai_api_key)

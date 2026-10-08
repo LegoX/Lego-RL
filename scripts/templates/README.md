@@ -47,7 +47,7 @@ The common train config shape is:
 ```bash
 # --- template selection -----------------------------------------------
 BACKEND=k8s              # k8s | docker
-SCAFFOLD=ohsdk           # ohsdk | oh | cc | oc | mixed
+SCAFFOLD=ohsdk           # ohsdk | oh | cc | oc | cx | mixed
 TRAINING_MODE=async      # async | sync
 MODEL_ENGINE=veomni      # veomni | fsdp
 

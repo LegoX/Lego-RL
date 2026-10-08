@@ -1,0 +1,70 @@
+---
+title: Codex CLI
+description: Run Codex through the in-process Responses API proxy.
+---
+
+Codex uses the same `BuiltinSWEAgentLoop` and trajectory recorder as the other
+harnesses. Its `/v1/responses` requests are converted before tokenization; sampled
+token IDs and behavior logprobs stay in the existing recorder.
+
+## Configure training
+
+Start with `scripts/train/_template.env` and fill in your model, data, environment,
+and cluster settings. Select:
+
+```bash
+BACKEND=k8s
+SCAFFOLD=cx
+HARBOR_AGENT_MAX_ITERATIONS=100
+CODEX_REASONING_EFFORT=medium
+```
+
+Keep the template's `scaffold/${SCAFFOLD}.env` entry in `TEMPLATE_MODULES`.
+The `cx` module selects `agent_loop_config_cx.yaml` and
+`harbor_patch.agents.image_mounted_codex:Codex`. Leave `HARBOR_AGENT_NAME=null`
+so Harbor uses this import path.
+
+The proxy applies the rollout's train/validation sampling settings when Codex
+omits them. It enforces the Codex turn limit across main and routed subagent
+requests. A limit response is a control message, excluded from training tokens;
+the verifier still runs and its reward is retained. Other harnesses keep their
+existing sampling and turn-limit behavior.
+
+## Mount a pinned runtime
+
+The supported runtime is Codex CLI `0.153.4` on Linux x86-64. Build and push it
+to a registry reachable by your sandbox nodes:
+
+```bash
+bash scripts/agent_runtimes/codex/0.153.4/build-runtime-image.sh \
+  --image YOUR_REGISTRY/lego/c-codex-0.153.4:v0.1 --push
+```
+
+Then set this in your experiment config:
+
+```bash
+HARBOR_AGENT_RUNTIME_IMAGE=YOUR_REGISTRY/lego/c-codex-0.153.4:v0.1
+```
+
+The wrapper checks the mounted binary's version and writes a per-trial custom
+provider with `wire_api="responses"` and WebSockets disabled. No production
+registry or host path is built into the scaffold. With the image left as `null`,
+Harbor's installer is used and the sandbox needs network access for installation.
+
+Preview the launch command before starting an experiment:
+
+```bash
+bash scripts/train/train.sh --dry-run scripts/train/configs/YOUR_EXPERIMENT.env
+```
+
+## Supported scope
+
+This adapter supports text, function tools, reasoning round trips, and JSON/SSE
+Responses output. Send the complete input history on each request;
+`previous_response_id` and image/audio content are rejected. Server-side web
+search and namespace tools are not exposed to the local model.
+
+Native compaction routing and summary training from the H20 integration branch
+are not included here. This change does not add a compaction profile, modify
+other harnesses' routing, or replace the episode training objective. Model windows,
+trajectory selection, and training lengths remain experiment configuration.

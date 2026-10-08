@@ -8,6 +8,7 @@ from verl_patch.agent_loop.builtin_swe_agent_loop import BuiltinSWEAgentLoop
 
 
 CURRENT_LOOP_CONFIGS = (
+    "src/verl_patch/config/agent_loop_config_cx.yaml",
     "src/verl_patch/config/agent_loop_config_oh.yaml",
     "src/verl_patch/config/agent_loop_config_cc.yaml",
     "src/verl_patch/config/agent_loop_config_oh_docker.yaml",
@@ -24,6 +25,9 @@ SHARED_LOOP_CONTROLS = {
 
 class FakeProxy:
     def __init__(self):
+        self.sampling = []
+        self.harness_names = []
+        self.turn_limits = []
         self.opened = []
         self.popped = []
 
@@ -33,8 +37,11 @@ class FakeProxy:
     def session_anthropic_base(self, session_id):
         return f"http://proxy/sess/{session_id}"
 
-    async def open_session(self, session_id, trajectory_dir=None):
+    async def open_session(self, session_id, trajectory_dir=None, **kwargs):
         self.opened.append((session_id, trajectory_dir))
+        self.sampling.append(kwargs.get("sampling_params"))
+        self.harness_names.append(kwargs.get("harness_name"))
+        self.turn_limits.append(kwargs.get("max_turns"))
 
     async def pop_session(self, session_id):
         self.popped.append(session_id)
@@ -293,3 +300,71 @@ async def test_openai_trial_uses_chat_completions_base(tmp_path, monkeypatch):
     assert cfg["agent"]["extra_allowed_hosts"] == ["proxy"]
     assert "ANTHROPIC_BASE_URL" not in cfg["agent"]["env"]
     assert cfg["trial_name"].startswith("ohsdk-")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_val, val_timeout, expected", [
+    (False, 4800, 3600), (True, 4800, 4800), (True, None, 3600),
+])
+@pytest.mark.parametrize("multiplier", [1.0, 1.5])
+@pytest.mark.parametrize("harness_name", ["codex", "claude_code", "opencode", "openhands_sdk"])
+async def test_trial_sampling_and_validation_timeout_reach_runtime(
+    tmp_path, monkeypatch, is_val, val_timeout, expected, multiplier, harness_name
+):
+    from verl_patch.agent_loop import builtin_swe_agent_loop as module
+
+    FakeTrial.configs = []
+    FakeTrial.results = [result(verifier=True)]
+    monkeypatch.setattr(module, "Trial", FakeTrial)
+    monkeypatch.setattr(module, "TrialConfig", FakeTrialConfig)
+    loop = make_loop(tmp_path)
+    loop.val_agent_max_timeout = val_timeout
+    definition = deepcopy(loop.harnesses.get(harness_name, loop.harnesses["openhands_sdk"]))
+    definition.name = harness_name
+    definition.harbor_cfg["agent"].update(override_timeout_sec=3600, max_timeout_sec=3600)
+    definition.harbor_cfg["agent_timeout_multiplier"] = multiplier
+    definition.harbor_cfg["agent"]["kwargs"]["max_turns"] = 200
+    original = deepcopy(definition.harbor_cfg)
+    sampling = {"temperature": 0.7 if is_val else 1.0, "top_p": 1.0, "top_k": -1}
+    proxy = FakeProxy()
+    await loop._run_harbor_trial(
+        task_path="/tasks/example", global_steps=40, sampling_params=sampling,
+        proxy=proxy, is_val=is_val,
+        harness_selection=SimpleNamespace(definition=definition, source="default"))
+    cfg = FakeTrial.configs[0]
+    assert cfg["agent"]["override_timeout_sec"] == (expected if harness_name == "codex" else 3600)
+    assert cfg["agent"]["max_timeout_sec"] == expected
+    assert cfg["agent_timeout_multiplier"] == multiplier
+    assert proxy.sampling == [sampling if harness_name == "codex" else None]
+    assert proxy.harness_names == [harness_name]
+    assert proxy.turn_limits == [200 if harness_name == "codex" else None]
+    assert definition.harbor_cfg == original
+
+
+@pytest.mark.asyncio
+async def test_codex_limit_keeps_verifier_reward_and_classifies_termination(tmp_path, monkeypatch):
+    from verl_patch.agent_loop import builtin_swe_agent_loop as module
+    FakeTrial.configs = []
+    FakeTrial.results = [result(verifier=True)]
+    monkeypatch.setattr(module, "Trial", FakeTrial)
+    monkeypatch.setattr(module, "TrialConfig", FakeTrialConfig)
+    loop = make_loop(tmp_path)
+    definition = deepcopy(loop.harnesses["openhands_sdk"])
+    definition.name = "codex"
+    definition.harbor_cfg["agent"]["kwargs"]["max_turns"] = 200
+
+    class LimitedProxy(FakeProxy):
+        async def pop_session(self, session_id):
+            meta = await super().pop_session(session_id)
+            meta.update(max_turns=200, completed_assistant_turns=200, turn_limit_reached=True)
+            return meta
+
+    proxy = LimitedProxy()
+    reward, reason, meta = await loop._run_harbor_trial(
+        task_path="/tasks/example", global_steps=120,
+        sampling_params={"temperature": .7}, proxy=proxy, is_val=True,
+        harness_selection=SimpleNamespace(definition=definition, source="default"))
+    assert reward == 1.0
+    assert reason == "max_turns_reached"
+    assert meta["completed_assistant_turns"] == 200
+    assert len(FakeTrial.configs) == 1

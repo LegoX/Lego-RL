@@ -1,0 +1,88 @@
+# Harbor × Codex agent loop config.
+#
+# Architecture (same Design A as Claude Code):
+#   codex exec (inside k8s pod)
+#     -> in-process vLLM proxy (started by BuiltinSWEAgentLoop, serves the
+#        OpenAI Responses API at /sess/{id}/v1/responses; OPENAI_BASE_URL is
+#        overridden per-trial with the proxy's per-session URL)
+#       -> vLLM (managed by verl, OpenAI Chat Completions internally)
+#
+# Why Responses and not Chat Completions: codex-cli removed `wire_api = "chat"`
+# in 0.122.0 (2026-04-20); the protocol itself was deprecated 2026-02-01. The
+# proxy's responses_transform module converts the wire format to the canonical
+# OpenAI chat messages+tools BEFORE tokenization, so token_ids/log_probs are
+# archived exactly as on the OpenAI and Anthropic paths.
+#
+# BuiltinSWEAgentLoop obtains exact sampled trajectories from the proxy recorder.
+- name: builtin_swe_agent
+  _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
+  trajectory_selection: ${oc.env:HARBOR_TRAJECTORY_SELECTION,longest}
+  # Shared worker controls live at the loop level, not inside Harbor's
+  # per-harness TrialConfig (BuiltinSWEAgentLoop.__init__ requires all four).
+  tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
+  max_consecutive_no_tool: ${oc.decode:${oc.env:HARBOR_MAX_CONSECUTIVE_NO_TOOL,3}}
+  trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
+  max_retries: ${oc.decode:${oc.env:HARBOR_MAX_RETRIES,2}}
+  harbor_cfg:
+    agent:
+      # harbor's AgentFactory prefers `name` over `import_path`, so this MUST stay
+      # null: naming the agent "codex" silently bypasses the harbor_patch
+      # subclass and instantiates harbor.agents.installed.codex:Codex, which
+      # installs in-pod via nvm+npm (needs egress, dies at 96 workers). Mirrors
+      # the same warning in agent_loop_config_oc.yaml.
+      name: ${oc.decode:${oc.env:HARBOR_AGENT_NAME,null}}
+      import_path: ${oc.env:HARBOR_AGENT_IMPORT_PATH,harbor_patch.agents.image_mounted_codex:Codex}
+      # Pinned codex-cli version, asserted against the mounted binary at setup.
+      # Also the npm spec if no runtime image is mounted — unset, harbor would
+      # install @openai/codex@latest, which moves under you.
+      version: ${oc.env:HARBOR_AGENT_VERSION,0.153.4}
+      # Served model name; codex passes it through as `model` in the request.
+      model_name: ${oc.env:SERVED_MODEL_NAME,vllm_model}
+      max_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_TIMEOUT_SEC,1500}}
+      override_timeout_sec: ${oc.decode:${oc.env:HARBOR_AGENT_OVERRIDE_TIMEOUT_SEC,1500}}
+      kwargs:
+        max_turns: ${oc.decode:${oc.env:HARBOR_AGENT_MAX_ITERATIONS,100}}
+        # MUST match actor_rollout_ref.rollout.temperature so RL rollouts come
+        # from the same distribution verl computes log_prob under.
+        temperature: ${oc.decode:${oc.env:HARBOR_AGENT_TEMPERATURE,1.0}}
+        # Codex CLI flag descriptors, forwarded as `-c model_reasoning_*`.
+        reasoning_effort: ${oc.env:CODEX_REASONING_EFFORT,medium}
+      # Env vars injected into the codex process inside the k8s pod.
+      env:
+        # OPENAI_BASE_URL is ALWAYS overridden per-attempt by
+        # BuiltinSWEAgentLoop._run_harbor_trial with the proxy's per-session URL
+        # (.../sess/{id}/v1). Codex appends "/responses" to it, which lands on
+        # the proxy route registered for exactly that path. The literal below is
+        # an inert config-load placeholder; it is never reached.
+        OPENAI_BASE_URL: ${oc.env:HARBOR_OPENAI_BASE_URL,http://127.0.0.1:8002/v1}
+        OPENAI_API_KEY: ${oc.env:HARBOR_OPENAI_API_KEY,sk-dummy}
+        # Force API-key auth so codex never looks for a ChatGPT auth.json.
+        CODEX_FORCE_API_KEY: "1"
+        # Where image_mounted_codex looks for the mounted runtime.
+        CUSTOM_AGENT_RUNTIME_ROOT: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/codex}
+    verifier:
+      enabled: ${oc.decode:${oc.env:HARBOR_VERIFIER_ENABLED,True}}
+    environment:
+      # MUST be null (None) — harbor's EnvironmentType enum does not include
+      # 'kubernetes'; the K8s implementation is loaded via import_path below.
+      type: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_TYPE,null}}
+      import_path: ${oc.env:HARBOR_ENVIRONMENT_IMPORT_PATH,harbor_patch.environments.kubernetes.kubernetes:KubernetesEnvironment}
+      force_build: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_FORCE_BUILD,False}}
+      delete: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_DELETE,True}}
+      override_cpus: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_OVERRIDE_CPUS,1}}
+      kwargs:
+        kubeconfig_path: ${oc.env:K8S_KUBECONFIG,${oc.env:HOME}/.kube/config}
+        namespace: ${oc.env:K8S_NAMESPACE,default}
+        pod_startup_timeout_sec: ${oc.decode:${oc.env:K8S_POD_STARTUP_TIMEOUT,900}}
+        pod_active_deadline_seconds: ${oc.decode:${oc.env:K8S_POD_ACTIVE_DEADLINE_SECONDS,null}}
+        agent_runtime_image: ${oc.decode:${oc.env:HARBOR_AGENT_RUNTIME_IMAGE,null}}
+        # Node names to keep sandbox pods OFF, comma-separated. Empty = no
+        # affinity block, spec unchanged. See kubernetes.py:exclude_nodes.
+        exclude_nodes: ${oc.env:HARBOR_EXCLUDE_NODES,''}
+        agent_runtime_mount_path: ${oc.env:HARBOR_AGENT_RUNTIME_MOUNT_PATH,/opt/custom-agent-runtime/codex}
+        agent_runtime_image_subpath: ${oc.env:HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH,opt/custom-agent-runtime/codex}
+        host_path_mounts: ${oc.env:HARBOR_HOSTPATH_MOUNTS,null}
+    environment_build_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,1.0}}
+    agent_setup_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER,5.0}}
+    agent_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_AGENT_TIMEOUT_MULTIPLIER,0.8}}
+    verifier_timeout_multiplier: ${oc.decode:${oc.env:HARBOR_VERIFIER_TIMEOUT_MULTIPLIER,1.0}}
