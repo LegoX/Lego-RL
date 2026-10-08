@@ -108,33 +108,32 @@ Full protocol, ablations, and failure analysis are in the [paper](https://arxiv.
 
 <br>
 
-Six of our own runs are public, all training Qwen3.5-35B-A3B:
+Seven of our own runs are listed below, all training Qwen3.5-35B-A3B.
+The six original dashboards are public; the Codex dashboard requires Workspace sign-in:
 
 | Run              | Harness                                | Data (train / val)                                 | Algorithm                  | Steps | Val (start → best)     | Dashboard                                                     |
 |:-----------------|:---------------------------------------|:---------------------------------------------------|:---------------------------|------:|:-----------------------|:--------------------------------------------------------------|
 | OpenHands SDK    | OpenHands SDK                          | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   126 | 64.0 → 70.4            | [rl-dashboard-openhands ↗](https://rl-dashboard-openhands.legox.net)       |
 | OpenCode         | OpenCode                               | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   127 | 57.2 → 66.6            | [rl-dashboard-opencode ↗](https://rl-dashboard-opencode.legox.net)         |
 | Claude Code      | Claude Code                            | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   130 | 62.4 → 68.2            | [rl-dashboard-claudecode ↗](https://rl-dashboard-claudecode.legox.net)     |
+| Codex            | Codex                                  | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   125 | 60.0 → 67.6            | [rl-dashboard-codex ↗](https://rl-dashboard-codex.legox.net/)             |
 | Mixed harness    | OpenHands SDK + OpenCode + Claude Code | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO with R3 router replay |   126 | 62.2 → 68.2            | [rl-dashboard-mixed ↗](https://rl-dashboard-mixed.legox.net)               |
 | SAO on OpenSWE   | OpenHands SDK                          | OpenSWE 2,699 / SWE-bench Verified 500             | SAO                        |   239 | 64.0 → 68.6            | [rl-dashboard-sao ↗](https://rl-dashboard-sao.legox.net)                   |
 | SAO multilingual | OpenHands SDK                          | Self-made multilingual 1,729 / SWE-bench Multilingual 300 | SAO                 |   110 | 51.7 → 57.0            | [rl-dashboard-multilingual ↗](https://rl-dashboard-multilingual.legox.net) |
 
 <br>
 
-These boards are our runs made public as they are: one run per board, followed live from the
-first step to the last, down to the individual trial. Val is the solve rate
-(`val-core/.../mean@1`, %) on the run's validation set, "best" is the best validation checkpoint,
-and all runs are fully asynchronous. See the
+Each board follows one run from the first step to the last, down to the individual trial.
+Val is the solve rate (%) on the run's validation set, and "best" is the best validation checkpoint.
+The six original runs use `val-core/.../mean@1`. Codex uses its registered offline evaluations
+(200k context, 4,800 seconds per task): 60.0% before training and 67.6% at step 40.
+Its board displays only `cx-6n8g-dlcoenjt6d5urdcu`. All runs are fully asynchronous. See the
 **[dashboard docs](https://lego-rl.pages.dev/docs/dashboard)** for what each panel shows, or run
 the dashboard on your own logs:
 
 ```bash
 bash webui/start_dashboard.sh
 ```
-
-**Codex:** [rl-dashboard-codex ↗](https://rl-dashboard-codex.legox.net/) is the dedicated
-board for `cx-6n8g-dlcoenjt6d5urdcu`. It displays only this experiment and requires
-Workspace sign-in.
 
 ## Key Features
 
