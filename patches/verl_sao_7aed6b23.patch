@@ -1439,12 +1439,6 @@ index d2e7779b..5f1b6c46 100644
              if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                  apply_greedy_sampling_params(sample_sampling_params)
              kwargs["global_steps"] = batch.meta_info.get("global_steps", 0)
-             # Concrete loops may use this stable identity for deterministic
-             # per-trajectory decisions (for example mixed-harness selection).
-             # It is derived before concurrent scheduling and must not be
-             # inferred from worker-local execution order.
-             kwargs["trajectory_info"] = dict(trajectory_info[i])
-             kwargs["rollout_n"] = trajectory_info[i]["rollout_n"]
 +            # Thread the train/val flag through so concrete agent loops can apply
 +            # validation-specific settings (e.g. harbor retries / pod-startup / agent
 +            # timeout). Forwarded the same way as global_steps above.
