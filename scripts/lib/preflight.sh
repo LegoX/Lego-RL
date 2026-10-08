@@ -236,6 +236,20 @@ fi
 # --- 8. lr_scheduler / val timeout / rollout_is ── other silent pitfalls ───────────────────
 # Training-only: eval/infer have no optimizer, no val loop and no IS correction.
 if [ "${PF_KIND:-train}" = train ]; then
+    case "${HARBOR_TRAJECTORY_SELECTION:-longest}" in
+        longest) ;;
+        all)
+            [ "$(_lc "${ADV_ESTIMATOR:-}")" = grpo ] || _pf_fatal "HARBOR_TRAJECTORY_SELECTION=all requires ADV_ESTIMATOR=grpo"
+            case "$(_lc "${USE_KL_IN_REWARD:-False}")" in
+                false|0) ;; *) _pf_fatal "HARBOR_TRAJECTORY_SELECTION=all requires USE_KL_IN_REWARD=False" ;;
+            esac
+            case "${MODEL_ENGINE:-${ENGINE:-}}" in
+                fsdp|fsdp2|veomni) ;;
+                *) _pf_fatal "HARBOR_TRAJECTORY_SELECTION=all requires FSDP/FSDP2 or VeOmni" ;;
+            esac
+            ;;
+        *) _pf_fatal "HARBOR_TRAJECTORY_SELECTION must be longest or all" ;;
+    esac
     # Never default this: an unset LR_SCHEDULER used to fall back to "constant" here and
     # print a green ✓ while the runner actually launched with cosine (sync mode), i.e. the
     # check validated its own default instead of the value that reached the trainer.
@@ -275,6 +289,75 @@ for _k in $_pf_path_vars; do
     fi
     [ -e "$_v" ] && _pf_ok "$_k exists: $_v" || _pf_fatal "$_k path does not exist: $_v"
 done
+
+# Task indexes may exist while their embedded local paths are stale.
+_pf_task_paths() {
+    _tp_idx="${1:-}"; _tp_label="${2:-index}"
+    [ -n "$_tp_idx" ] && [ -e "$_tp_idx" ] || return 0
+    case "$_tp_idx" in *.parquet) ;; *) return 0 ;; esac
+    _tp_py="${PYTHON_BIN:-python3}"
+    command -v "$_tp_py" >/dev/null 2>&1 || { _pf_skip "$_tp_label task paths: no python"; return 0; }
+    _tp_out="$("$_tp_py" - "$_tp_idx" <<'PYEOF' 2>/dev/null
+import sys, os
+def out(*a): print("|".join(str(x) for x in a))
+try:
+    import pandas as pd
+except Exception:
+    out("SKIP", "pandas unavailable"); raise SystemExit(0)
+try:
+    d = pd.read_parquet(sys.argv[1], columns=["extra_info"])
+except Exception as e:
+    out("SKIP", f"unreadable ({type(e).__name__})"); raise SystemExit(0)
+if len(d) == 0:
+    out("EMPTY", 0, 0, "-"); raise SystemExit(0)
+# Sample across the file, not just the head: a partially-rewritten index is a real
+# shape (only the rows someone fixed by hand resolve).
+n = min(len(d), 8)
+idxs = sorted({int(i * (len(d) - 1) / max(n - 1, 1)) for i in range(n)})
+ok = bad = 0; miss = None
+for i in idxs:
+    ei = d["extra_info"].iloc[i]
+    p = ei.get("harbor_task_path") if hasattr(ei, "get") else None
+    if not p:
+        out("SKIP", "no harbor_task_path column"); raise SystemExit(0)
+    # instruction.md alone is not enough: a task dir can carry the prompt and
+    # still be missing task.toml, which harbor needs to build the environment.
+    # That shape cost us 2 of 8 trials on 2026-09-10 — the check said OK and the
+    # trials still died with "No such file or directory: .../task.toml".
+    if all(os.path.isfile(os.path.join(str(p), f)) for f in ("instruction.md", "task.toml")):
+        ok += 1
+    else:
+        bad += 1
+        if miss is None: miss = str(p)
+out("RES", ok, bad, miss or "-")
+PYEOF
+)"
+    _tp_kind="$(printf '%s' "$_tp_out" | awk -F'|' '{print $1}')"
+    _tp_a="$(printf '%s' "$_tp_out" | awk -F'|' '{print $2}')"
+    _tp_b="$(printf '%s' "$_tp_out" | awk -F'|' '{print $3}')"
+    _tp_m="$(printf '%s' "$_tp_out" | awk -F'|' '{print $4}')"
+    case "$_tp_kind" in
+        SKIP)  _pf_skip "$_tp_label task paths: $_tp_a" ;;
+        EMPTY) _pf_warn "$_tp_label has 0 rows: $_tp_idx" ;;
+        RES)
+            if [ "${_tp_b:-1}" = "0" ]; then
+                _pf_ok "$_tp_label task paths resolve ✓ (sampled $_tp_a, instruction.md + task.toml present)"
+            elif [ "${_tp_a:-0}" = "0" ]; then
+                _pf_fatal "$_tp_label task paths do NOT exist on this host — sampled $_tp_b, all missing. First: $_tp_m . The sampled tasks cannot be loaded; fix the index before starting rollout. Rewrite extra_info.harbor_task_path to a copy this host can see."
+            else
+                _pf_warn "$_tp_label task paths partially missing: $_tp_b of $((_tp_a+_tp_b)) sampled. First missing: $_tp_m"
+            fi ;;
+        *)     _pf_skip "$_tp_label task paths: check produced no result" ;;
+    esac
+}
+if [ "$_PF_STRUCT" = "1" ]; then
+    _pf_skip "task path resolution: structure-only run"
+else
+    _pf_task_paths "${TRAIN_INDEX:-}" "TRAIN_INDEX"
+    if [ "${PF_KIND:-train}" = "train" ]; then
+        _pf_task_paths "${VAL_INDEX:-}" "VAL_INDEX"
+    fi
+fi
 
 # --- 10. SAO / critic ── value-based runs (scripts/templates/verl/sao.env) ───────────────
 # Every rule here is a way to get a run that LOOKS like SAO and is not: the config
