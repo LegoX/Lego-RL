@@ -37,12 +37,10 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             task_path=task_path, sampling_params=sampling_params, proxy=proxy,
             harness_selection=harness)
 
-        # token source of truth = the proxy trajectory — never a re-tokenized
-        # transcript; robust to crash/timeout trials (pre-failure tokens kept)
-        ids  = session_meta["traj_acc_ids"]
-        mask = session_meta["traj_response_mask"]
-        lps  = session_meta["traj_response_logprobs"]
-        return self._make_output(ids, mask, lps, reward, trial_reason)
+        # All segments preserve the context used by the inference engine.
+        # Selection controls training rows; the archive always contains all.
+        return self._outputs_from_segments(
+            session_meta, reward, trial_reason, metrics, kwargs, harness)
 ```
 
 ## Worker concurrency
@@ -112,3 +110,35 @@ HARBOR_AGENT_IMPORT_PATH=harbor_patch.agents.my_scaffold:MyScaffold
 
 Every adapter funnels through the same proxy, so a new scaffold gets trajectory
 capture, load balancing, and R3 routing replay for free.
+
+## Context segment selection
+
+Set `HARBOR_TRAJECTORY_SELECTION=longest` (default) or `all`. This sets the
+loop's `trajectory_selection`, outside Harbor's TrialConfig.
+
+- `longest` selects the segment with the most retained model tokens after
+  response-window truncation; ties prefer the later segment. It keeps one row
+  per episode and the existing training path.
+- `all` trains all segments with retained model tokens. GRPO counts each
+  episode reward once within its query group and broadcasts the advantage.
+  Each optimizer minibatch contains `ppo_mini_batch_size * rollout.n` original
+  episodes (or the remaining tail), including all their selected segments.
+
+For `all`, sequence-mean loss counts episodes. With `seq-mean-token-mean`, sum
+losses over each episode's model tokens, divide by its total model-token count,
+then average over episodes. `token-mean` retains token weighting. GSPO keeps
+its upstream sequence-mean objective with this episode normalization, but its
+**ratio and clipping remain per segment**. Entropy and actor KL use the configured
+reduction. Zero-mask dispatch padding contributes no reward or loss.
+
+Rollout queues and validation retain one row per episode; extra segments expand
+only for training. Validation rewards remain independent of training truncation.
+Rewritten prompt overflow occupies the response region with mask zero, preserving
+its prefix; truncated segments carry `overlong`. All segments remain archived.
+
+`all` currently supports GRPO with the FSDP/FSDP2 and VeOmni engines, the new
+training workers (`trainer.use_legacy_worker_impl=disable`), and
+`algorithm.use_kl_in_reward=false`. Prefix grouping and distillation are unsupported.
+Actor KL regularization and fixed or dynamic microbatching are supported.
+The setup script applies `patches/verl_segments_7aed6b23.patch` after the base
+and SAO patches. See `tests/agent_loop` for CPU regression coverage.

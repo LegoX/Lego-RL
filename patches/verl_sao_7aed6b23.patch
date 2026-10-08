@@ -1449,6 +1449,12 @@ index d2e7779b..5f1b6c46 100644
 +            # validation-specific settings (e.g. harbor retries / pod-startup / agent
 +            # timeout). Forwarded the same way as global_steps above.
 +            kwargs["validate"] = validate
+             # Concrete loops may use this stable identity for deterministic
+             # per-trajectory decisions (for example mixed-harness selection).
+             # It is derived before concurrent scheduling and must not be
+             # inferred from worker-local execution order.
+             kwargs["trajectory_info"] = dict(trajectory_info[i])
+             kwargs["rollout_n"] = trajectory_info[i]["rollout_n"]
              tasks.append(
                  asyncio.create_task(
                      self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)

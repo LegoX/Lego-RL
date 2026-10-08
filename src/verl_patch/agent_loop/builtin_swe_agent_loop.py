@@ -105,6 +105,8 @@ from omegaconf import OmegaConf
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.utils.profiler import simple_timer
 
+from .trajectory import select_trajectories
+
 # Harbor imports - wrapped in try/except for graceful degradation
 try:
     from harbor.trial.trial import Trial
@@ -241,6 +243,12 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         self._max_consecutive_no_tool = int(kwargs["max_consecutive_no_tool"])
         self.base_trials_dir = str(kwargs["trials_dir"])
         self.max_retries = int(kwargs["max_retries"])
+        self.trajectory_selection = str(kwargs.get("trajectory_selection", "longest"))
+        select_trajectories([], self.trajectory_selection)  # validate before starting any trials
+        if self.trajectory_selection == "all":
+            from verl.utils.episode_segments import validate_episode_training
+
+            validate_episode_training(self.config)
 
         self.harnesses = definitions
         self.harness_resolver = HarnessResolver(self.harnesses, raw_selection)
@@ -296,7 +304,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             self._vllm_chat_proxy = await _ensure_proxy_started(self)
         return self._vllm_chat_proxy
 
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | list[AgentLoopOutput]:
         """
         Run Harbor trial for SWE-bench task and return AgentLoopOutput.
 
@@ -415,133 +423,151 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         # pick the slowest trial based on actual wall-clock trial duration.
         metrics["generate_sequences"] = metrics.get("harbor_total", 0.0)
 
-        traj_acc = session_meta.get("traj_acc_ids") or []
-        prompt_token_len = int(session_meta.get("initial_prompt_token_len") or 0)
-        tail_mask = session_meta.get("traj_response_mask") or []
-        tail_lp = session_meta.get("traj_response_logprobs") or []
-        # R3: per-token routing captured by the shared proxy (loop-agnostic).
-        tail_routing = session_meta.get("traj_response_routing") or []
-        traj_ok = (
-            not session_meta.get("disable_proxy_trajectory")
-            and traj_acc
-            and prompt_token_len <= len(traj_acc)
-            and len(tail_mask) == (len(traj_acc) - prompt_token_len)
-            and len(tail_lp) == len(tail_mask)
+        return self._outputs_from_segments(
+            session_meta, reward, trial_reason, metrics, kwargs, harness_selection
         )
 
-        if not traj_ok:
-            logger.warning(
-                "Invalid proxy trajectory (task=%s): traj_len=%d prompt_len=%d "
-                "mask_len=%d logprob_len=%d disable=%s",
-                task_path,
-                len(traj_acc),
-                prompt_token_len,
-                len(tail_mask),
-                len(tail_lp),
-                session_meta.get("disable_proxy_trajectory"),
-            )
+    def _outputs_from_segments(
+        self,
+        session_meta: dict[str, Any],
+        reward: float,
+        trial_reason: str,
+        metrics: dict[str, float],
+        kwargs: dict[str, Any],
+        harness_selection: HarnessSelection,
+    ) -> AgentLoopOutput | list[AgentLoopOutput]:
+        """Keep each sampled action under its original context, then select rows.
+
+        The worker carries extra rows in an episode envelope until the trainer
+        expands them. Validation therefore still observes one verifier result.
+        """
+        segments = session_meta.get("trajectory_segments", [])
+        if session_meta.get("disable_proxy_trajectory"):
+            segments = []
+        selection = getattr(self, "trajectory_selection", "longest")
+        # Select longest only after fitting the training budget. A rewritten
+        # prompt can otherwise consume the entire response region and hide a
+        # shorter segment that still has trainable actions.
+        selected = select_trajectories(segments, "all")
+        if not selected:
             return self._make_empty_output(
                 kwargs,
                 metrics=metrics,
                 session_meta=session_meta,
                 reason="invalid_trajectory",
                 harness_selection=harness_selection,
+                reward=reward,
             )
 
-        prompt_ids = traj_acc[:prompt_token_len]
-        response_ids = traj_acc[prompt_token_len:]
-        response_mask = tail_mask
-        response_logprobs = tail_lp
-        # R3: routing aligned to the response region (same length as mask/logprobs).
-        # Empty when routing was not captured (R3 off / non-MoE).
-        response_routing = tail_routing if len(tail_routing) == len(tail_mask) else []
-
-        if not prompt_ids or not response_ids:
-            logger.warning(
-                "Empty proxy trajectory token ids (prompt=%d, response=%d), task=%s",
-                len(prompt_ids),
-                len(response_ids),
-                task_path,
+        metrics[f"harness_reward/{harness_selection.definition.name}"] = float(reward)
+        metrics["trajectory_segments"] = float(len(segments))
+        metrics["trajectory_sampled_tokens"] = float(
+            sum(sum(s["response_mask"]) for s in segments)
+        )
+        num_turns = sum(s["num_turns"] for s in segments)
+        reason = trial_reason
+        if (
+            reason == TerminationReason.AGENT_COMPLETED
+            and self._max_turns
+            and num_turns >= self._max_turns
+        ):
+            reason = TerminationReason.MAX_TURNS_REACHED
+        outputs = []
+        for index, segment in selected:
+            prompt = segment["prompt_ids"]
+            response = segment["response_ids"]
+            mask = segment["response_mask"]
+            lp = segment["response_logprobs"]
+            routing = segment["response_routing"]
+            if (
+                not prompt
+                or len(response) != len(mask)
+                or len(routing) != len(response)
+            ):
+                raise ValueError("Invalid segment token/mask/routing alignment")
+            if lp is None or len(lp) != len(response):
+                raise ValueError("Training segments require aligned behavior logprobs from the engine")
+            segment_reason = reason
+            if (
+                reason == TerminationReason.AGENT_COMPLETED
+                and max(0, len(prompt) - self.prompt_length) + len(response) > self.response_length
+            ):
+                segment_reason = TerminationReason.OVERLONG
+            # Rewritten contexts can exceed prompt_length. Place the overflow
+            # in the response region with mask=0, retaining the entire prefix.
+            context = prompt[self.prompt_length :]
+            prompt = prompt[: self.prompt_length]
+            response = (context + response)[: self.response_length]
+            mask = ([0] * len(context) + mask)[: self.response_length]
+            lp = ([0.0] * len(context) + lp)[: self.response_length]
+            routing = ([None] * len(context) + routing)[: self.response_length]
+            if not any(mask):
+                continue
+            step = kwargs.get("global_steps", 0)
+            outputs.append(
+                AgentLoopOutput(
+                    prompt_ids=prompt,
+                    response_ids=response,
+                    response_mask=mask,
+                    response_logprobs=lp,
+                    routed_experts=self._build_routed_experts(prompt, routing),
+                    multi_modal_data=None,
+                    reward_score=reward,
+                    num_turns=num_turns,
+                    metrics=dict(metrics),
+                    extra_fields={
+                        "turn_scores": [],
+                        "tool_rewards": [],
+                        "termination_reason": segment_reason,
+                        **_termination_reason_flags(segment_reason),
+                        "raw_prompt": kwargs.get("raw_prompt", []),
+                        "min_global_steps": segment.get("min_global_steps")
+                        if segment.get("min_global_steps") is not None
+                        else step,
+                        "max_global_steps": segment.get("max_global_steps")
+                        if segment.get("max_global_steps") is not None
+                        else step,
+                        "proxy_num_calls": int(metrics.get("proxy_num_calls", 0)),
+                        "proxy_num_aborts": int(metrics.get("proxy_num_aborts", 0)),
+                        "proxy_num_preempted": int(
+                            metrics.get("proxy_num_preempted", 0)
+                        ),
+                        "trajectory_token_source": "proxy_tokens",
+                        "tool_parser": self._tool_parser_name,
+                        "agent_harness": harness_selection.definition.name,
+                        "harness_protocol": harness_selection.definition.protocol,
+                        "harness_selection_source": harness_selection.source,
+                        "harness_selection_error": "",
+                        "episode_id": session_meta["episode_id"],
+                        "episode_reward": float(reward),
+                        "segment_index": index,
+                        "segment_count": len(segments),
+                        "trajectory_selection": selection,
+                    },
+                )
             )
+        if not outputs:
             return self._make_empty_output(
                 kwargs,
                 metrics=metrics,
                 session_meta=session_meta,
-                reason="empty_token_ids",
+                reason=TerminationReason.OVERLONG,
                 harness_selection=harness_selection,
+                reward=reward,
             )
-
-        # Real verifier reward for every kept trajectory (agent_completed / overlong /
-        # max_turns_reached). Categories the trajectory filter drops (timeout,
-        # env_setup_failed) get their reward+advantage zeroed there, so no force-0 here.
-        reward_score = reward
-        metrics[f"harness_reward/{harness_selection.definition.name}"] = float(
-            reward_score
+        # Use the longest selected row for rollout metrics/validation. The
+        # stable original segment_index preserves temporal order in the archive.
+        outputs.sort(
+            key=lambda o: (sum(o.response_mask), o.extra_fields["segment_index"]),
+            reverse=True,
         )
-
-        # Resolve global_steps span. ``min/max_global_steps`` from the proxy's
-        # session metadata reflects all weight versions actually observed
-        # during this trial's vLLM calls (across partial-rollout retries).
-        # When the proxy never received a call (extremely unlikely here but
-        # guard anyway), fall back to the step at trial dispatch.
-        cur_step = kwargs.get("global_steps", 0)
-        min_gs = session_meta.get("min_global_steps")
-        max_gs = session_meta.get("max_global_steps")
-        min_gs = min_gs if min_gs is not None else cur_step
-        max_gs = max_gs if max_gs is not None else cur_step
-
-        messages_snapshot = session_meta.get("messages_snapshot") or []
-
-        # Single termination classification (consumed by algorithm.trajectory_filter).
-        # _run_harbor_trial returns the trial-level reason (agent_completed / timeout /
-        # overlong-from-context-overflow). Refine a plain completion here with the two signals
-        # only known after assembling the trajectory: exhausting the turn cap
-        # (max_turns_reached) and a response longer than the training window — truncated by the
-        # slicing below, its verifier verdict reflecting a budget limit (DAPO "overlong").
-        # Priority: context overflow (upstream) > max_turns_reached > response-window overlong.
-        num_turns = len([m for m in messages_snapshot if m.get("role") == "assistant"])
-        termination_reason = trial_reason
-        if termination_reason == TerminationReason.AGENT_COMPLETED:
-            if self._max_turns and num_turns >= self._max_turns:
-                termination_reason = TerminationReason.MAX_TURNS_REACHED
-            elif len(response_ids) > self.response_length:
-                termination_reason = TerminationReason.OVERLONG
-
-        output = AgentLoopOutput(
-            prompt_ids=prompt_ids,
-            response_ids=response_ids[: self.response_length],
-            response_mask=response_mask[: self.response_length],
-            response_logprobs=response_logprobs[: self.response_length],
-            # R3: full-length [prompt+response, layers, topk] routing tensor;
-            # None when no routing was captured, so non-R3 runs are unaffected.
-            routed_experts=self._build_routed_experts(
-                prompt_ids, response_routing[: self.response_length]
-            ),
-            multi_modal_data=None,
-            reward_score=reward_score,
-            num_turns=num_turns,
-            metrics=metrics,
-            extra_fields={
-                "turn_scores": [],
-                "tool_rewards": [],
-                "termination_reason": termination_reason,
-                **_termination_reason_flags(termination_reason),
-                "raw_prompt": raw_prompt,
-                "min_global_steps": min_gs,
-                "max_global_steps": max_gs,
-                "proxy_num_calls": int(metrics.get("proxy_num_calls", 0)),
-                "proxy_num_aborts": int(metrics.get("proxy_num_aborts", 0)),
-                "proxy_num_preempted": int(metrics.get("proxy_num_preempted", 0)),
-                "trajectory_token_source": "proxy_tokens",
-                "tool_parser": self._tool_parser_name,
-                "agent_harness": harness_selection.definition.name,
-                "harness_protocol": harness_selection.definition.protocol,
-                "harness_selection_source": harness_selection.source,
-                "harness_selection_error": "",
-            },
-        )
-
-        return output
+        if selection == "longest":
+            outputs = outputs[:1]
+        retained = float(sum(sum(o.response_mask) for o in outputs))
+        for output in outputs:
+            output.metrics.trajectory_retained_tokens = retained
+            output.metrics.trajectory_selected_segments = float(len(outputs))
+        return outputs if selection == "all" else outputs[0]
 
     @staticmethod
     def _timing_duration(timing_info) -> float:
@@ -905,6 +931,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         reason: str = "empty",
         harness_selection: HarnessSelection | None = None,
         selection_error: str = "",
+        reward: float = 0.0,
     ) -> AgentLoopOutput:
         """
         Create empty AgentLoopOutput for failed trials.
@@ -979,6 +1006,15 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         max_gs = session_meta.get("max_global_steps")
         min_gs = min_gs if min_gs is not None else cur_step
         max_gs = max_gs if max_gs is not None else cur_step
+        termination_reason = (
+            reason
+            if reason in {
+                TerminationReason.OVERLONG,
+                TerminationReason.MAX_TURNS_REACHED,
+                TerminationReason.TIMEOUT,
+            }
+            else TerminationReason.ENV_SETUP_FAILED
+        )
         return AgentLoopOutput(
             prompt_ids=[0],  # dummy token
             response_ids=[0],
@@ -987,24 +1023,30 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             # rollout-correction path requires it for all-failed batches.
             response_mask=[
                 int(
-                    os.environ.get("HARBOR_EMPTY_RESPONSE_MASK_ONE", "0").lower()
+                    termination_reason == TerminationReason.ENV_SETUP_FAILED
+                    and getattr(self, "trajectory_selection", "longest") != "all"
+                    and os.environ.get("HARBOR_EMPTY_RESPONSE_MASK_ONE", "0").lower()
                     in {"1", "true", "yes", "on"}
                 )
             ],
             response_logprobs=[0],
             routed_experts=None,
             multi_modal_data=None,
-            reward_score=0.0,
+            reward_score=float(reward),
             num_turns=0,
             metrics=base_metrics,
             extra_fields={
+                "episode_id": session_meta.get("episode_id"),
+                "episode_reward": float(reward),
+                "segment_index": 0,
+                "segment_count": 0,
+                "trajectory_selection": getattr(self, "trajectory_selection", "longest"),
                 "turn_scores": [],
                 "tool_rewards": [],
-                # Env-setup failure: the trial never produced a usable trajectory. The dummy
-                # sample only keeps the batch alive; algorithm.trajectory_filter drops it (it
-                # is in the default drop_reasons) from the loss and GRPO group statistics.
-                "termination_reason": TerminationReason.ENV_SETUP_FAILED,
-                **_termination_reason_flags(TerminationReason.ENV_SETUP_FAILED),
+                # This dummy keeps rollout accounting intact. Its zero mask
+                # excludes it from training even when verification succeeded.
+                "termination_reason": termination_reason,
+                **_termination_reason_flags(termination_reason),
                 "raw_prompt": kwargs.get("raw_prompt", []),
                 "min_global_steps": min_gs,
                 "max_global_steps": max_gs,

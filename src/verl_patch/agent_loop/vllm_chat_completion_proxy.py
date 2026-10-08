@@ -32,6 +32,8 @@ import aiohttp.web
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
 
+from .trajectory import TrajectoryRecorder
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -41,15 +43,6 @@ _R3_PROXY_DIAG = 0
 # R3 probe: per-turn, how many of the generated (last n) rows are actually non-zero —
 # splits "vLLM read returns zeros for gen tokens" from "we lose it in archiving".
 _R3_TURN_PROBE = 0
-
-# When a genuine sequence divergence forces the lossy rebuild path (CC mutated
-# mid-history — e.g. a dynamic <system-reminder> insertion — which id-anchoring
-# cannot absorb), recompute the rebuilt prefix's per-token logprobs via vLLM
-# prompt_logprobs instead of training on zeros. Kill-switch: set to 0 to revert
-# to the old zero-fill behavior (e.g. if prompt_logprobs + prefix-cache misbehave).
-_RECOMPUTE_MISMATCH_LP = os.environ.get(
-    "HARBOR_RECOMPUTE_MISMATCH_LOGPROBS", "1"
-).strip().lower() not in ("0", "false", "no", "")
 
 _OPENCODE_HIDDEN_SYSTEM_PROMPT_PREFIXES = (
     "You are a title generator. You output ONLY a thread title.",
@@ -185,7 +178,7 @@ def _compute_assistant_eos_tail(
     template emits *after* the assistant turn's EOS marker. vLLM stops at
     EOS without emitting these trailing tokens, so the proxy needs to
     backfill them whenever it appends a vLLM completion that ended at EOS,
-    in order to keep ``rolling_acc_ids`` and ``traj_acc_ids`` byte-equivalent
+    in order to keep ``rolling_acc_ids`` and the trajectory recorder byte-equivalent
     to a one-shot ``apply_chat_template`` result.
 
     Computed once at proxy construction time by encoding a trivial assistant
@@ -285,7 +278,7 @@ def _tool_calls_equiv(snap_tcs, inc_tcs) -> bool:
     blank-line whitespace, and more — but round-trips the call ``id`` and
     ``name`` verbatim (empirically 151/151 prefix-mismatches had identical
     id+name with args-only diffs). Crucially, the real sampled token_ids +
-    logprobs for this turn already live in ``traj_acc_ids`` (appended verbatim
+    logprobs for this turn already live in the trajectory recorder (appended verbatim
     from ``output.token_ids`` in ``_finalize_generation``, never re-tokenized
     from this echoed history), so however CC re-renders the arguments is
     irrelevant to *alignment*. Matching on the verbatim ``id`` is therefore both
@@ -677,7 +670,7 @@ def _turn_routing_per_token(routed_experts: Any, n_tokens: int) -> list:
     rows (mirrors verl fully_async agent_loop's ``[-len(token_ids):]``). Returns a
     per-token list aligned 1:1 with the turn's output token ids -- each element a
     ``[num_layers, topk]`` list, or ``None`` when routing is unavailable (R3 off /
-    non-MoE). Kept as plain Python lists to mirror ``traj_response_logprobs``;
+    non-MoE). Kept as plain Python lists alongside segment response logprobs;
     assembled into a tensor only in ``BuiltinSWEAgentLoop.run``.
     """
     if routed_experts is None or n_tokens <= 0:
@@ -1086,7 +1079,7 @@ class _VLLMChatCompletionsProxy:
         # vLLM stops at the assistant EOS token without emitting the trailing
         # tokens that the chat template would otherwise put after it (e.g. the
         # ``\n`` after ``<|im_end|>`` for Qwen). ``_finalize_generation`` uses
-        # these to backfill ``rolling_acc_ids`` / ``traj_acc_ids`` whenever a
+        # these to backfill ``rolling_acc_ids`` / the trajectory recorder whenever a
         # completion ended at EOS, so the incremental path becomes
         # byte-equivalent to a one-shot ``apply_chat_template``.
         self._assistant_eos_token_id, self._assistant_eos_tail = _compute_assistant_eos_tail(
@@ -1224,6 +1217,10 @@ class _VLLMChatCompletionsProxy:
         await self._session_scheduler.finish_session(session_id, reason="pop_session")
         for sub_key in sub_keys:
             await self._session_scheduler.finish_session(sub_key, reason="pop_session")
+        recorder = meta.pop("trajectory_recorder")
+        meta["episode_id"] = session_id
+        meta["trajectory_segments"] = recorder.export()
+        meta["discarded_generations"] = recorder.discarded_generations
         traj_dir = meta.get("trajectory_dir")
         # One-shot assemble: final snapshot already holds full chat prefix (no per-step duplication).
         if traj_dir and (
@@ -1231,6 +1228,8 @@ class _VLLMChatCompletionsProxy:
         ):
             payload = {
                 "session_id": session_id,
+                "trajectory_segments": meta["trajectory_segments"],
+                "discarded_generations": meta["discarded_generations"],
                 "messages_snapshot": _copy_messages_for_snapshot(
                     meta.get("messages_snapshot") or []
                 ),
@@ -1256,13 +1255,11 @@ class _VLLMChatCompletionsProxy:
             "message_snap_debug": [],
             "last_tools": None,
             "rolling_acc_ids": [],
-            "initial_prompt_token_len": None,
-            "traj_acc_ids": [],
-            "traj_response_mask": [],
-            "traj_response_logprobs": [],
-            # R3: per-response-token routed experts, parallel to traj_response_logprobs.
-            # Each element is a [num_layers, topk] list (sampled token) or None placeholder.
-            "traj_response_routing": [],
+            "trajectory_recorder": TrajectoryRecorder(),
+            "last_generation_messages": None,
+            "last_generation_tools": None,
+            "last_generation_snapshot": None,
+            "pending_retry": False,
             "incremental_tokenize_ok": True,
             "disable_proxy_trajectory": False,
             # Set True when a generate call is refused because the prompt overflowed the
@@ -1462,7 +1459,7 @@ class _VLLMChatCompletionsProxy:
                 exc,
             )
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[Proxy] %s response send failed unexpectedly "
                 "(session=%s, bytes=%d, total=%.3fs): %r",
@@ -1672,6 +1669,10 @@ class _VLLMChatCompletionsProxy:
                     prev_snap = sess.get("messages_snapshot") or []
                     normalized_assistant = _normalize_openai_messages_for_template([message])[0]
                     sess["messages_snapshot"] = list(prev_snap) + [normalized_assistant]
+                    if output.token_ids:
+                        sess["last_generation_snapshot"] = _copy_messages_for_snapshot(
+                            sess["messages_snapshot"]
+                        )
                     prev_debug = list(sess.get("message_snap_debug") or [])
                     if len(prev_debug) != len(prev_snap):
                         logger.warning(
@@ -1918,85 +1919,8 @@ class _VLLMChatCompletionsProxy:
             logger.warning("[Proxy] SSE write_eof failed (client gone?): %s", exc)
         return resp
 
-    async def _recompute_prefix_logprobs(
-        self,
-        session_id: str,
-        acc_ids: list[int],
-        mask: list[int],
-        lp_out: list[float],
-    ) -> None:
-        """Recompute real per-token logprobs for a just-rebuilt prefix, in place.
-
-        Called only on the rebuild path — a genuine sequence divergence that
-        id-anchoring could not absorb (e.g. Claude Code inserting a dynamic
-        ``<system-reminder>`` mid-history, which shifts every following token).
-        The incrementally-archived logprobs no longer align, so instead of
-        training on zeros we run a throwaway 1-token generation over ``acc_ids``
-        with vLLM ``prompt_logprobs`` enabled and fill the assistant
-        (``mask==1``) positions of ``lp_out`` under the current (sampling-time)
-        weights — exactly what the training-time actor recompute will later see,
-        keeping ``rollout_probs_diff`` ~0 by construction.
-
-        Best-effort and ISOLATED from the real generation: any failure (engine
-        error, prompt_logprobs/prefix-cache incompatibility, shape mismatch) is
-        logged and leaves ``lp_out`` as zeros (== prior behavior). Never raises.
-
-        Alignment: ``extract_prompt_logprobs`` (num_prompt_logprobs=0) drops the
-        first prompt token (no preceding context → no logprob) and re-bases the
-        list, so element ``pl[m]`` holds the logprob of the token at sequence
-        position ``m+1``. Hence the token at position ``p`` (p>=1) reads
-        ``pl[p-1]``; position 0 has no logprob. A trailing dummy keeps
-        ``len(pl) == len(acc_ids)``.
-        """
-        try:
-            out = await self._server_manager.generate(
-                request_id=f"{session_id}-lprecompute",
-                prompt_ids=list(acc_ids),
-                sampling_params={
-                    "prompt_logprobs": 0,
-                    "max_tokens": 1,
-                    "temperature": 0.0,
-                    "logprobs": False,
-                },
-            )
-        except Exception as exc:
-            logger.warning(
-                "[Proxy] prefix logprob recompute failed (session=%s, len=%d): %s",
-                session_id, len(acc_ids), exc,
-            )
-            return
-
-        pl = (getattr(out, "extra_fields", None) or {}).get("prompt_logprobs")
-        n_assist = sum(1 for m in mask if m == 1)
-        if not pl:
-            logger.warning(
-                "[Proxy] prefix logprob recompute: no prompt_logprobs returned "
-                "(session=%s, acc_len=%d)", session_id, len(acc_ids),
-            )
-            return
-
-        filled = missing = 0
-        for p in range(1, len(acc_ids)):
-            if mask[p] != 1:
-                continue
-            j = p - 1  # extract is shifted by one: token at p reads pl[p-1].
-            if j >= len(pl):
-                missing += 1
-                continue
-            v = pl[j]
-            val = v[0] if isinstance(v, (list, tuple)) and v else v
-            if val is None:
-                missing += 1
-                continue
-            lp_out[p] = float(val)
-            filled += 1
-        logger.info(
-            "[Proxy] prefix logprob recompute (session=%s): filled=%d/%d assistant "
-            "tokens (missing=%d, prompt_logprobs_len=%d, acc_len=%d)",
-            session_id, filled, n_assist, missing, len(pl), len(acc_ids),
-        )
-
     async def _compute_prompt_ids(self, sess: dict, messages: list[dict], tools: list[dict] | None, session_id: str) -> list[int]:
+        sess["pending_retry"] = False
         # Only disable token-level trajectory archiving for *genuinely* multimodal
         # requests. A processor object being loaded (Qwen3.5 base ships
         # processor_config.json) does NOT imply multimodal: text-only requests
@@ -2018,20 +1942,37 @@ class _VLLMChatCompletionsProxy:
             sess["messages_snapshot"] = _copy_messages_for_snapshot(messages)
             sess["message_snap_debug"] = _message_snap_debug_for(messages, "incoming_initial")
             sess["last_tools"] = tools
-            sess["initial_prompt_token_len"] = len(ids_list)
-            sess["traj_acc_ids"] = list(ids_list)
-            sess["traj_response_mask"] = []
-            sess["traj_response_logprobs"] = []
-            sess["traj_response_routing"] = []
             sess["incremental_tokenize_ok"] = True
             return ids_list
 
         snap = sess["messages_snapshot"]
-        if not _messages_is_prefix(snap, messages) or not _tools_equal(sess.get("last_tools"), tools):
+        # Prompt preparation mutates snap even if generation subsequently
+        # fails. Retry detection must compare with the last successful reply.
+        successful_snap = sess.get("last_generation_snapshot")
+        previous_request = sess.get("last_generation_messages")
+        retry = (
+            previous_request is not None
+            and _tools_equal(sess.get("last_generation_tools"), tools)
+            and _messages_is_prefix(previous_request, messages)
+        )
+        suffix = messages[len(previous_request) :] if retry else []
+        retry = retry and (
+            not suffix
+            or (
+                len(suffix) == 1
+                and suffix[0].get("role") == "assistant"
+                and (successful_snap is None or not _messages_is_prefix(successful_snap, messages))
+            )
+        )
+        if (
+            retry
+            or not _messages_is_prefix(snap, messages)
+            or not _tools_equal(sess.get("last_tools"), tools)
+        ):
             trajectory_dir = sess.get("trajectory_dir")
-            logger.error(
+            logger.info(
                 "messages are not a prefix extension of the snapshot or tools are not the same as tools "
-                "in the snapshot, falling back to per-message rebuild "
+                "in the snapshot, starting a new context segment "
                 "(session_id=%s, trajectory_dir=%s)",
                 session_id,
                 trajectory_dir,
@@ -2069,184 +2010,29 @@ class _VLLMChatCompletionsProxy:
                         dump_exc,
                     )
 
-            # Rebuild rolling/traj state piece-by-piece so the result matches
-            # what the incremental (prefix-matched) path would have produced
-            # token-for-token, modulo the trailing ``\n`` after each historical
-            # ``<|im_end|>`` that vLLM omits when stopping at the EOS marker.
-            #
-            # Layout (same as the incremental path):
-            #
-            #   prompt segment      = apply_chat_template(prefix_msgs, tools)
-            #                         (ends with a single gen_prompt block)
-            #   for each assistant: format(msg) stripped of its leading
-            #                       <|im_start|>assistant\n (already present as
-            #                       the previous segment's trailing gen_prompt)
-            #                       AND its trailing gen_prompt; marked mask=1.
-            #   for each batch of   apply_chat_template(batch, tools=None,
-            #     consecutive          remove_system_prompt=True) → format(batch)
-            #     non-assistant       + gen_prompt; marked mask=0 (the trailing
-            #     messages:           gen_prompt is the start-of-assistant marker
-            #                       for the next assistant turn / the next
-            #                       vLLM call).
-            #
-            # Batching consecutive non-assistant messages (instead of tokenizing
-            # them one by one) keeps the result bit-equivalent to the
-            # incremental path's ``delta = messages[len(snap):]`` tokenization.
-            #
-            # Snapshot the PRIOR archive before we overwrite it: the dominant
-            # rebuild trigger is abort/retry, where the clean incoming history is
-            # a token *prefix* of this (stale, phantom-carrying) archive. We use
-            # it below to salvage real logprobs for the unchanged prefix instead
-            # of training the whole trajectory on zeros.
-            _old_acc = list(sess.get("traj_acc_ids") or [])
-            _old_lp = list(sess.get("traj_response_logprobs") or [])
-            _old_routing = list(sess.get("traj_response_routing") or [])
-            _old_plen = int(sess.get("initial_prompt_token_len") or 0)
-
-            prefix_msgs = _messages_before_first_assistant(messages)
-            prompt_ids_list = list(
-                await self._agent_loop.apply_chat_template(prefix_msgs, tools=tools)
-            )
-
-            gp_len = self._gen_prompt_len
-            rebuilt_acc: list[int] = list(prompt_ids_list)
-            rebuilt_mask: list[int] = []
-            rebuilt_lp: list[float] = []
-            rebuilt_routing: list = []
-
-            idx = len(prefix_msgs)
-            while idx < len(messages):
-                if messages[idx].get("role") == "assistant":
-                    asst_ids = list(
-                        await self._agent_loop.apply_chat_template(
-                            [messages[idx]], tools=None, remove_system_prompt=True
-                        )
-                    )
-                    # asst_ids == <|im_start|>assistant\n + content + <|im_end|>\n + gen_prompt.
-                    # The leading <|im_start|>assistant\n is already in
-                    # ``rebuilt_acc`` as the previous segment's trailing
-                    # gen_prompt; the trailing gen_prompt is redundant and
-                    # would duplicate the start-of-assistant marker for the
-                    # *next* turn. Strip both.
-                    if gp_len > 0 and len(asst_ids) >= 2 * gp_len:
-                        asst_ids = asst_ids[gp_len:-gp_len]
-                    rebuilt_acc.extend(asst_ids)
-                    rebuilt_mask.extend([1] * len(asst_ids))
-                    rebuilt_lp.extend([0.0] * len(asst_ids))
-                    rebuilt_routing.extend([None] * len(asst_ids))
-                    idx += 1
-                    continue
-
-                run_end = idx
-                while run_end < len(messages) and messages[run_end].get("role") != "assistant":
-                    run_end += 1
-                batch = messages[idx:run_end]
-                batch_ids = list(
-                    await self._agent_loop.apply_chat_template(
-                        batch, tools=None, remove_system_prompt=True
-                    )
-                )
-                rebuilt_acc.extend(batch_ids)
-                rebuilt_mask.extend([0] * len(batch_ids))
-                rebuilt_lp.extend([0.0] * len(batch_ids))
-                rebuilt_routing.extend([None] * len(batch_ids))
-                idx = run_end
-
-            sess["rolling_acc_ids"] = list(rebuilt_acc)
+            # A retry of the *latest* request may replace its unconsumed
+            # assistant reply. Only this exact case is rolled back; arbitrary
+            # history edits retain the previously sampled actions in a segment.
+            recorder = sess["trajectory_recorder"]
+            current = recorder.current
+            if retry and current is not None and current.generations:
+                start = current.generations[-1][0]
+                ids = current.prompt_ids + current.response_ids[:start]
+                if suffix:
+                    # A replaced assistant is context, not a sampled action.
+                    # Full rendering starts a new segment if the token prefix
+                    # cannot be kept exactly.
+                    ids = list(await self._agent_loop.apply_chat_template(messages, tools=tools))
+                sess["pending_retry"] = True
+            else:
+                ids = list(await self._agent_loop.apply_chat_template(messages, tools=tools))
+            sess["rolling_acc_ids"] = list(ids)
             sess["messages_snapshot"] = _copy_messages_for_snapshot(messages)
             sess["message_snap_debug"] = _message_snap_debug_for(messages, "incoming_rebuild")
-            sess["last_tools"] = tools
-            sess["initial_prompt_token_len"] = len(prompt_ids_list)
-            sess["traj_acc_ids"] = list(rebuilt_acc)
-            sess["traj_response_mask"] = rebuilt_mask
-
-            # --- Salvage real logprobs for the unchanged token prefix. ---
-            # ``rebuilt_lp`` is placeholder zeros. The dominant rebuild cause is
-            # abort/retry: a turn vLLM generated but Claude Code dropped/replaced
-            # leaves the prior archive one (or more) assistant turns AHEAD of the
-            # clean incoming history, so the rebuilt token sequence is a *prefix*
-            # of the stale archive. Every leading token they share has a
-            # byte-identical left context, hence the previously-archived logprob
-            # is exactly correct — copy it back rather than train on a zero. We
-            # salvage ONLY the common prefix, never a common suffix: a token's
-            # logprob is conditioned on its full left context, so a turn
-            # re-generated after a phantom carries logprobs computed under that
-            # phantom and must not be reused once the phantom is gone (zeros are
-            # the correct value there). This recovers ~all logprobs for the
-            # abort/retry case and everything up to the divergence otherwise,
-            # with no recompute (zero OOM risk).
-            n_salvaged = 0
-            cp = None
-            if _old_acc and _old_plen == len(prompt_ids_list):
-                cp = 0
-                cp_max = min(len(rebuilt_acc), len(_old_acc))
-                while cp < cp_max and rebuilt_acc[cp] == _old_acc[cp]:
-                    cp += 1
-                n_resp_prefix = cp - len(prompt_ids_list)
-                for k in range(max(0, min(n_resp_prefix, len(rebuilt_lp), len(_old_lp)))):
-                    if rebuilt_mask[k]:
-                        rebuilt_lp[k] = _old_lp[k]
-                        if k < len(_old_routing):
-                            rebuilt_routing[k] = _old_routing[k]
-                        n_salvaged += 1
-            n_resp_total = sum(rebuilt_mask)
-
-            def _decode_token_for_log(token_ids: list[int]) -> str:
-                try:
-                    return self._tokenizer.decode(
-                        token_ids,
-                        skip_special_tokens=False,
-                        clean_up_tokenization_spaces=False,
-                    )
-                except TypeError:
-                    return self._tokenizer.decode(token_ids, skip_special_tokens=False)
-                except Exception as exc:
-                    return f"<decode-error {type(exc).__name__}: {exc}>"
-
-            def _token_window_for_log(acc: list[int], center: int | None) -> list[tuple[int, int, str]]:
-                if center is None or not acc:
-                    return []
-                start = max(0, center - 5)
-                end = min(len(acc), center + 5)
-                return (center, acc[start:end], _decode_token_for_log(acc[start:end]))
-
-            mismatch_pos = cp
-            if mismatch_pos is not None and mismatch_pos >= min(len(rebuilt_acc), len(_old_acc)):
-                mismatch_pos = min(len(rebuilt_acc), len(_old_acc))
-            logger.info(
-                "[Proxy] rebuild salvaged %d/%d response logprobs from the prior "
-                "archive's common prefix (session=%s, len_old_acc=%d, old_plen=%d, "
-                "len_prompt_ids=%d, len_rebuilt_acc=%d, cp=%s, mismatch_pos=%s, "
-                "rebuilt_window=%r, old_window=%r)",
-                n_salvaged,
-                n_resp_total,
-                session_id,
-                len(_old_acc),
-                _old_plen,
-                len(prompt_ids_list),
-                len(rebuilt_acc),
-                cp,
-                mismatch_pos,
-                _token_window_for_log(rebuilt_acc, mismatch_pos),
-                _token_window_for_log(_old_acc, mismatch_pos),
-            )
-
-            # Optional recompute fallback for the still-zero (divergent-tail)
-            # positions. Off by default (HARBOR_RECOMPUTE_MISMATCH_LOGPROBS=0)
-            # because vLLM prompt_logprobs over the full sequence OOMs; the
-            # prefix salvage above already recovers the bulk. Best-effort +
-            # isolated: on any failure the affected positions stay zero.
-            if (
-                _RECOMPUTE_MISMATCH_LP
-                and not sess.get("disable_proxy_trajectory")
-                and any(rebuilt_mask)
-            ):
-                await self._recompute_prefix_logprobs(
-                    session_id, rebuilt_acc, rebuilt_mask, rebuilt_lp
-                )
-            sess["traj_response_logprobs"] = rebuilt_lp
-            sess["traj_response_routing"] = rebuilt_routing
-            return list(rebuilt_acc)
+            sess["last_tools"] = deepcopy(tools)
+            # Do not alter the archive while preparing a request. It is sealed
+            # only after generation succeeds, using the exact engine input ids.
+            return list(ids)
 
         # ``snap`` must end with the prior turn's assistant message (appended in
         # ``_handle_chat`` after each successful generation) so ``delta`` is only
@@ -2278,10 +2064,6 @@ class _VLLMChatCompletionsProxy:
         )
         sess["last_tools"] = tools
 
-        sess["traj_acc_ids"] = list(sess["traj_acc_ids"]) + delta_ids
-        sess["traj_response_mask"] = list(sess["traj_response_mask"]) + [0] * len(delta_ids)
-        sess["traj_response_logprobs"] = list(sess["traj_response_logprobs"]) + [0.0] * len(delta_ids)
-        sess["traj_response_routing"] = list(sess.get("traj_response_routing") or []) + [None] * len(delta_ids)
         return new_prompt
 
     async def _finalize_generation(self, session_id: str, sess: dict, output: TokenOutput, prompt_len: int) -> None:
@@ -2308,40 +2090,38 @@ class _VLLMChatCompletionsProxy:
                 s["max_global_steps"] = mx if cur is None else max(cur, mx)
 
             output_ids = list(output.token_ids)
-            s["rolling_acc_ids"] = list(s.get("rolling_acc_ids") or []) + output_ids
-
-            if not s.get("disable_proxy_trajectory"):
-                lp = output.log_probs
-                if lp is None:
-                    lp = [0.0] * len(output_ids)
-                elif len(lp) != len(output_ids):
-                    lp = list(lp) + [0.0] * max(0, len(output_ids) - len(lp))
-
-                s["traj_acc_ids"] = list(s.get("traj_acc_ids") or []) + output_ids
-                s["traj_response_mask"] = list(s.get("traj_response_mask") or []) + [1] * len(output_ids)
-                s["traj_response_logprobs"] = list(s.get("traj_response_logprobs") or []) + list(lp)
-                # R3: archive this turn's per-token routing (vLLM returns the last
-                # len(output_ids) rows for the generated tokens). Parallel to logprobs.
-                s["traj_response_routing"] = list(s.get("traj_response_routing") or []) + _turn_routing_per_token(
-                    getattr(output, "routed_experts", None), len(output_ids)
-                )
-
-            # Backfill the trailing tokens that the chat template puts after
-            # the assistant EOS marker (typically ``\n``). vLLM stops at EOS
-            # without emitting them, so without this step the incremental
-            # ``rolling_acc_ids`` would diverge from a one-shot
-            # ``apply_chat_template`` result by exactly these tokens per
-            # assistant turn. Only triggered when the completion actually
-            # ended at EOS — length/stop-string terminations are left alone.
+            prompt_ids = list(s.get("rolling_acc_ids") or [])
             eos_id = self._assistant_eos_token_id
-            tail = self._assistant_eos_tail
-            if eos_id is not None and tail and output_ids and output_ids[-1] == eos_id:
-                s["rolling_acc_ids"] = list(s["rolling_acc_ids"]) + list(tail)
-                if not s.get("disable_proxy_trajectory"):
-                    s["traj_acc_ids"] = list(s["traj_acc_ids"]) + list(tail)
-                    s["traj_response_mask"] = list(s["traj_response_mask"]) + [0] * len(tail)
-                    s["traj_response_logprobs"] = list(s["traj_response_logprobs"]) + [0.0] * len(tail)
-                    s["traj_response_routing"] = list(s.get("traj_response_routing") or []) + [None] * len(tail)
+            tail = (
+                list(self._assistant_eos_tail)
+                if (eos_id is not None and output_ids and output_ids[-1] == eos_id)
+                else []
+            )
+            if not s.get("disable_proxy_trajectory"):
+                recorder = s["trajectory_recorder"]
+                if output.log_probs is not None and len(output.log_probs) != len(output_ids):
+                    raise ValueError("Generated token ids and logprobs must have identical lengths")
+                if s.get("pending_retry") and output_ids:
+                    recorder.rollback_last_generation()
+                recorder.record(
+                    prompt_ids,
+                    output_ids,
+                    None if output.log_probs is None else list(output.log_probs),
+                    _turn_routing_per_token(
+                        getattr(output, "routed_experts", None), len(output_ids)
+                    ),
+                    context_tail=tail,
+                    min_global_steps=mn,
+                    max_global_steps=mx,
+                )
+            s["rolling_acc_ids"] = prompt_ids + output_ids + tail
+            if output_ids:
+                s["last_generation_messages"] = _copy_messages_for_snapshot(
+                    s.get("messages_snapshot") or []
+                )
+                s["last_generation_tools"] = deepcopy(s.get("last_tools"))
+                s["last_generation_snapshot"] = None
+            s["pending_retry"] = False
 
     @staticmethod
     def _translate_sampling_params(body: dict) -> dict:

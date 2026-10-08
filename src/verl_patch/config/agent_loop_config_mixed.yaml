@@ -4,6 +4,7 @@
 # each harness only carries its protocol-specific agent and runtime config.
 - name: builtin_swe_agent
   _target_: verl_patch.agent_loop.BuiltinSWEAgentLoop
+  trajectory_selection: ${oc.env:HARBOR_TRAJECTORY_SELECTION,longest}
   tool_parser: ${oc.env:TOOL_CALL_PARSER,qwen3_coder}
   max_consecutive_no_tool: ${oc.decode:${oc.env:HARBOR_MAX_CONSECUTIVE_NO_TOOL,3}}
   trials_dir: ${oc.env:HARBOR_TRIALS_DIR,./harbor_trials}
