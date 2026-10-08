@@ -27,6 +27,10 @@ add_if_set() {
 }
 
 append_common_hydra_args() {
+    # Upstream episode expansion requires the new workers in sync and async mode.
+    if [ "${HARBOR_TRAJECTORY_SELECTION:-longest}" = all ]; then
+        add_force trainer.use_legacy_worker_impl disable
+    fi
     if [ "$MODEL_ENGINE" = "veomni" ]; then
         hydra_args+=("model_engine=veomni")
     fi

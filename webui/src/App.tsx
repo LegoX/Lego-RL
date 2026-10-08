@@ -1,3 +1,4 @@
+import { trainingStepCount } from "./utils/trainingSteps";
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Activity,
@@ -381,7 +382,7 @@ export default function App() {
               <span className="text-xs text-rose-400">{metricsError}</span>
             )}
             <span className="text-xs text-slate-500 font-mono">
-              {metrics.length} {t("app.steps")}
+              {trainingStepCount(metrics)} {t("app.steps")}
             </span>
             <button
               onClick={toggleLang}

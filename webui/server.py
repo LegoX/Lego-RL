@@ -950,7 +950,11 @@ EXP_DIR_RE = re.compile(
 
 
 def _strip_trial_hash(trial_name: str) -> str:
-    return TRIAL_HASH_RE.sub("", trial_name)
+    name = TRIAL_HASH_RE.sub("", trial_name)
+    return re.sub(
+        r"^(?:oc|ohsdk|oh|cc|cx|codex|opencode|openhands|claude[-_]?code)-(?=[^/]+__)",
+        "", name,
+    )
 
 
 def _exp_dirs_from_log(log_path: str) -> list[str]:
@@ -963,7 +967,7 @@ def _exp_dirs_from_log(log_path: str) -> list[str]:
                 if "harbor_trials" not in line:
                     continue
                 for m in EXP_DIR_RE.finditer(line):
-                    d = m.group(1)
+                    d = os.path.normpath(re.sub(r"^/+", "/", m.group(1)))
                     if d not in seen and os.path.isdir(d):
                         seen.add(d)
                         found.append(d)

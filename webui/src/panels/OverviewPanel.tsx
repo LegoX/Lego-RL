@@ -27,13 +27,13 @@ export default function OverviewPanel({ data, runId }: Props) {
           color="#7a6ddb"
         />
         <MetricCard
-          label="Reward (mean)"
+          label="Trainer Reward (mean)"
           metricKey="critic/rewards/mean"
           data={data}
           color="#4a9440"
         />
         <MetricCard
-          label="Score (mean)"
+          label="Trainer Score (mean)"
           metricKey="critic/score/mean"
           data={data}
           color="#199e70"
@@ -91,6 +91,16 @@ export default function OverviewPanel({ data, runId }: Props) {
           color="#e0a01a"
         />
       </div>
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mt-3">
+        <MetricCard label="Trial Reward" metricKey="dashboard/reward/trial_mean" data={data} />
+        <MetricCard label="Segment Reward" metricKey="dashboard/reward/segment_mean" data={data} />
+        <MetricCard label="Padding Ratio" metricKey="dashboard/reward/padding_ratio" data={data} format="percent" />
+      </div>
+      <p className="text-xs text-slate-500 mt-2">
+        Trial Reward counts each attempt once; Segment Reward counts each segment once.
+        Both exclude synthetic padding. Missing or ambiguous statistics display --;
+        trainer score/reward retains the original logged values and weighting.
+      </p>
       <ConfigSection runId={runId ?? null} />
     </div>
   );

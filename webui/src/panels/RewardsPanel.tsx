@@ -26,7 +26,7 @@ export default function RewardsPanel({ data }: Props) {
     <div>
       <h2 className="text-lg font-semibold text-slate-100 mb-1">Rewards & Scores</h2>
       <p className="text-xs text-slate-500 mb-4">
-        Reward signal from the verifier, advantage estimates, and return values
+        Original trainer score/reward statistics, advantage estimates, and returns. Their weighting can include segments or padding; they are not necessarily trial success rates.
         {scoreEqualsReward && (
           <span className="ml-1 text-slate-400">
             · rewards ≡ scores (KL not applied in reward)
@@ -34,6 +34,14 @@ export default function RewardsPanel({ data }: Props) {
         )}
       </p>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {data.some(p => Number.isFinite(p["dashboard/reward/trial_mean"])) && (
+          <ChartPanel title="Trial Reward (each attempt once, padding excluded)"
+            data={data.filter(p => Number.isFinite(p["dashboard/reward/trial_mean"]))} keys={["dashboard/reward/trial_mean"]} />
+        )}
+        {data.some(p => Number.isFinite(p["dashboard/reward/segment_mean"])) && (
+          <ChartPanel title="Segment Reward (each segment once, padding excluded)"
+            data={data.filter(p => Number.isFinite(p["dashboard/reward/segment_mean"]))} keys={["dashboard/reward/segment_mean"]} />
+        )}
         {scoreEqualsReward ? (
           <MinMaxChart
             title="Score / Reward"
