@@ -1,0 +1,16 @@
+{
+  "agent": "codex",
+  "runtime_version": "0.153.4",
+  "package_name": "@openai/codex",
+  "packages": {
+    "@openai/codex": "0.153.4"
+  },
+  "container_runtime_root": "/opt/custom-agent-runtime/codex",
+  "node_abis": ["static"],
+  "notes": [
+    "Unlike claude-code / opencode, the Codex CLI is a Rust binary shipped through npm: the JS entry point only locates and execs it. The vendored artifact is x86_64-unknown-linux-musl and static-pie linked, so it runs unchanged on both glibc and musl task containers.",
+    "That removes the dual-ABI node build the other runtimes need: no node, no libc shims, no runtime-select-node.sh. The image is FROM scratch and carries only the vendor tree.",
+    "Consumed as a k8s ImageVolume; only the subpath opt/custom-agent-runtime/codex is mounted into the task pod.",
+    "The matching agent class is harbor_patch.agents.image_mounted_codex:Codex, which detects the mount and skips the in-pod npm install."
+  ]
+}

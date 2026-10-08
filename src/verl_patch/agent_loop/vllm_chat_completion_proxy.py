@@ -33,6 +33,11 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
 
 from .trajectory import TrajectoryRecorder
+from .responses_transform import (
+    openai_message_to_responses,
+    responses_sse_events,
+    responses_to_openai_messages,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -1125,6 +1130,8 @@ class _VLLMChatCompletionsProxy:
         # directly, no LiteLLM). Both per-session and anonymous variants.
         self._app.router.add_post("/sess/{session_id}/v1/messages", self._handle_messages)
         self._app.router.add_post("/v1/messages", self._handle_messages_anon)
+        self._app.router.add_post("/sess/{session_id}/v1/responses", self._handle_responses)
+        self._app.router.add_post("/v1/responses", self._handle_responses_anon)
 
     async def ensure_started(self) -> "_VLLMChatCompletionsProxy":
         if self._site is not None:
@@ -1189,11 +1196,30 @@ class _VLLMChatCompletionsProxy:
             return lock
 
     async def open_session(
-        self, session_id: str, trajectory_dir: str | Path | None = None
+        self,
+        session_id: str,
+        trajectory_dir: str | Path | None = None,
+        sampling_params: dict | None = None,
+        harness_name: str | None = None,
+        max_turns: int | None = None,
     ) -> None:
+        """Open a trial; sampling defaults and turn caps apply only to Codex."""
         async with self._sessions_lock:
             self._session_state_locks.setdefault(session_id, asyncio.Lock())
             st = self._fresh_session_state()
+            st["session_id"] = session_id
+            # Codex omits sampling fields on the wire. Keep the caller's
+            # train/validation settings scoped to this trial.
+            st["harness_name"] = harness_name
+            # Codex CLI does not consume Harbor's max_turns kwarg. Enforce it
+            # here, at the model-request boundary, for the whole trial.
+            if harness_name == "codex" and max_turns is not None:
+                if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 0:
+                    raise ValueError("Codex max_turns must be a non-negative integer or None")
+                st["max_turns"] = max_turns or None
+            st["sampling_defaults"] = (
+                deepcopy(sampling_params or {}) if harness_name == "codex" else {}
+            )
             if trajectory_dir is not None:
                 st["trajectory_dir"] = str(Path(trajectory_dir).expanduser().resolve())
             self._sessions[session_id] = st
@@ -1228,6 +1254,8 @@ class _VLLMChatCompletionsProxy:
         ):
             payload = {
                 "session_id": session_id,
+                "sampling_defaults": deepcopy(meta.get("sampling_defaults") or {}),
+                "last_sampling_params": deepcopy(meta.get("last_sampling_params") or {}),
                 "trajectory_segments": meta["trajectory_segments"],
                 "discarded_generations": meta["discarded_generations"],
                 "messages_snapshot": _copy_messages_for_snapshot(
@@ -1244,6 +1272,9 @@ class _VLLMChatCompletionsProxy:
     @staticmethod
     def _fresh_session_state() -> dict:
         return {
+            "turn_limit_reached": False,
+            "completed_assistant_turns": 0,
+            "max_turns": None,
             "min_global_steps": None,
             "max_global_steps": None,
             "num_calls": 0,
@@ -1496,8 +1527,17 @@ class _VLLMChatCompletionsProxy:
         # no-op returning the bare session_id; sub-agents get an isolated,
         # non-archived state key. All session-state and the vLLM request_id below
         # use the routed key.
+        async with self._sessions_lock:
+            main_session = self._sessions.get(session_id, {})
+            is_codex = main_session.get("harness_name") == "codex"
+            sampling_defaults = dict(main_session.get("sampling_defaults") or {})
+        trial_session_id = session_id
+        turn_budget = main_session if is_codex and main_session.get("max_turns") else None
         session_id, _is_subagent = await self._route_subagent_session(session_id, messages)
-        session_lock = await self._get_session_generation_lock(session_id)
+        # Share the Codex limit across main and routed subagent calls.
+        session_lock = await self._get_session_generation_lock(
+            trial_session_id if turn_budget is not None else session_id
+        )
         state_lock = await self._get_session_state_lock(session_id)
         attempt = await self._register_session_attempt(session_id)
         try:
@@ -1508,6 +1548,17 @@ class _VLLMChatCompletionsProxy:
                 if attempt.abort_event.is_set():
                     await self._record_admission_preempted(session_id, state_lock)
                     raise _AdmissionPreempted(session_id)
+                if turn_budget is not None and (
+                    turn_budget["completed_assistant_turns"] >= turn_budget["max_turns"]
+                ):
+                    turn_budget["turn_limit_reached"] = True
+                    # A terminal control response lets Codex exit normally and
+                    # Harbor run the verifier. It is not a sampled completion:
+                    # never add it to tokens, masks, logprobs, or the trajectory.
+                    return {
+                        "role": "assistant",
+                        "content": f"[Lego-RL] Maximum agent turns reached ({turn_budget['max_turns']}).",
+                    }, "stop", 0, 0
                 async with state_lock:
                     sess = self._sessions.setdefault(session_id, self._fresh_session_state())
                     t_enter = time.perf_counter()
@@ -1518,7 +1569,12 @@ class _VLLMChatCompletionsProxy:
                         sess.setdefault("tool_gap_secs", []).append(_gap)
                     prompt_ids = await self._compute_prompt_ids(sess, messages, tools, session_id)
 
-                sampling_params = self._translate_sampling_params(body)
+                sampling_params = self._translate_sampling_params(
+                    body, defaults=sampling_defaults if is_codex else None
+                )
+                if is_codex:
+                    async with state_lock:
+                        sess["last_sampling_params"] = dict(sampling_params)
 
                 attempt.phase = "admission_wait"
                 try:
@@ -1619,6 +1675,7 @@ class _VLLMChatCompletionsProxy:
                             {
                                 "messages": [{"role": "user", "content": "-"}],
                                 "model": body.get("model") or "vllm-rollout",
+                                "tools": tools if is_codex else None,
                             }
                         )
                         extracted = self._vllm_tool_parser.extract_tool_calls(decoded_out, _dummy_req)
@@ -1686,6 +1743,9 @@ class _VLLMChatCompletionsProxy:
                     sess["message_snap_debug"] = prev_debug + [
                         _message_snap_debug_entry(len(prev_snap), normalized_assistant, "assistant_append")
                     ]
+
+                    if turn_budget is not None:
+                        turn_budget["completed_assistant_turns"] += 1
 
                     # Track consecutive no-tool turns and optionally terminate early.
                     if finish_reason == "tool_calls":
@@ -1919,6 +1979,99 @@ class _VLLMChatCompletionsProxy:
             logger.warning("[Proxy] SSE write_eof failed (client gone?): %s", exc)
         return resp
 
+    async def _handle_responses_anon(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        request.match_info["session_id"] = "anon-" + uuid4().hex
+        return await self._handle_responses(request)
+
+
+    async def _handle_responses(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        """OpenAI Responses API endpoint — reuses the token-fidelity core.
+
+        Lets Codex CLI talk to the proxy directly: the Responses request body
+        is converted to OpenAI-shaped (messages, tools) BEFORE tokenization, so
+        the sampled token_ids/log_probs are archived exactly as on the OpenAI
+        and Anthropic paths. Codex always streams (``accept:
+        text/event-stream``), so the reply is replayed as SSE unless the caller
+        explicitly opted out.
+        """
+        try:
+            body = await request.json()
+        except Exception as exc:
+            return _proxy_error(400, f"Invalid JSON body: {exc}")
+
+        session_id = request.match_info.get("session_id") or "anon-" + uuid4().hex
+        try:
+            messages, tools = responses_to_openai_messages(body)
+            messages = _normalize_openai_messages_for_template(messages)
+        except (TypeError, ValueError) as exc:
+            return _proxy_error(400, str(exc))
+
+        # _translate_sampling_params only knows the chat spelling.
+        gen_body = dict(body)
+        if gen_body.get("max_output_tokens") is not None:
+            gen_body.setdefault("max_tokens", gen_body["max_output_tokens"])
+
+        try:
+            msg, finish_reason, p_tok, c_tok = await self._generate_assistant_message(
+                session_id, messages, tools, gen_body
+            )
+        except _AdmissionPreempted as exc:
+            logger.info("[Proxy] responses request preempted (session=%s)", session_id)
+            return _proxy_error_from_exception(exc)
+        except Exception as exc:
+            logger.exception("[Proxy] responses generation failed (session=%s)", session_id)
+            return _proxy_error_from_exception(exc)
+
+        model = body.get("model") or "vllm-rollout"
+        responses_body = openai_message_to_responses(
+            msg, finish_reason, model, p_tok, c_tok, session_id
+        )
+
+        if not bool(body.get("stream", True)):
+            return await self._logged_json_response(
+                request, responses_body, session_id=session_id, api="responses"
+            )
+        return await self._responses_sse_response(request, responses_body)
+
+
+    async def _responses_sse_response(
+        self, request: aiohttp.web.Request, response_body: dict
+    ) -> aiohttp.web.StreamResponse:
+        """Emit a fully-computed Responses body as its SSE event sequence.
+
+        The generation already finished (token fidelity is unaffected); this
+        only replays the result in the streaming wire-format Codex expects.
+        """
+        resp = aiohttp.web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        try:
+            await resp.prepare(request)
+        except Exception as exc:
+            # Client already gone — generation/token-fidelity is done, the SSE
+            # replay is cosmetic. Don't let a dead socket crash the worker.
+            logger.warning("[Proxy] responses SSE prepare failed (client gone?): %s", exc)
+            return resp
+
+        for event_name, payload in responses_sse_events(response_body):
+            try:
+                data = json.dumps(payload, ensure_ascii=False)
+                await resp.write(f"event: {event_name}\ndata: {data}\n\n".encode("utf-8"))
+            except Exception as exc:
+                logger.warning("[Proxy] responses SSE write failed (client gone?): %s", exc)
+                break
+        try:
+            await resp.write_eof()
+        except Exception as exc:
+            logger.warning("[Proxy] responses SSE write_eof failed (client gone?): %s", exc)
+        return resp
+
+
     async def _compute_prompt_ids(self, sess: dict, messages: list[dict], tools: list[dict] | None, session_id: str) -> list[int]:
         sess["pending_retry"] = False
         # Only disable token-level trajectory archiving for *genuinely* multimodal
@@ -2124,27 +2277,36 @@ class _VLLMChatCompletionsProxy:
             s["pending_retry"] = False
 
     @staticmethod
-    def _translate_sampling_params(body: dict) -> dict:
+    def _translate_sampling_params(body: dict, defaults: dict | None = None) -> dict:
         sp: dict[str, Any] = {}
-        for src_key, dst_key, conv in (
-            ("temperature", "temperature", float),
-            ("top_p", "top_p", float),
-            ("top_k", "top_k", int),
-            ("max_tokens", "max_tokens", int),
-            ("max_completion_tokens", "max_tokens", int),
-            ("seed", "seed", int),
-        ):
-            v = body.get(src_key)
-            if v is None:
-                continue
-            try:
-                sp[dst_key] = conv(v)
-            except (TypeError, ValueError):
-                continue
-        v = body.get("stop")
-        if v is not None:
-            sp["stop"] = v if isinstance(v, list) else [v]
-        # if body.get("logprobs"):
+        # Explicit non-null request values win. Translating separately also
+        # handles aliases such as max_completion_tokens overriding max_tokens.
+        for source in (defaults or {}, body):
+            for src_key, dst_key, conv in (
+                ("temperature", "temperature", float),
+                ("top_p", "top_p", float),
+                ("top_k", "top_k", int),
+                ("max_tokens", "max_tokens", int),
+                ("max_completion_tokens", "max_tokens", int),
+                ("seed", "seed", int),
+            ):
+                v = source.get(src_key)
+                if v is None:
+                    continue
+                try:
+                    sp[dst_key] = conv(v)
+                except (TypeError, ValueError):
+                    continue
+            # This additional field belongs to the opt-in Codex path only.
+            if defaults is not None and source.get("repetition_penalty") is not None:
+                try:
+                    sp["repetition_penalty"] = float(source["repetition_penalty"])
+                except (TypeError, ValueError):
+                    pass
+            v = source.get("stop")
+            if v is not None:
+                sp["stop"] = v if isinstance(v, list) else [v]
+        # Token-fidelity training requires generated-token log probabilities.
         sp["logprobs"] = True
         return sp
 

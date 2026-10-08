@@ -465,11 +465,13 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             sum(sum(s["response_mask"]) for s in segments)
         )
         num_turns = sum(s["num_turns"] for s in segments)
+        codex_cap = session_meta.get("max_turns") if harness_selection.definition.name == "codex" else None
+        if codex_cap:
+            num_turns = int(session_meta.get("completed_assistant_turns", num_turns))
         reason = trial_reason
         if (
             reason == TerminationReason.AGENT_COMPLETED
-            and self._max_turns
-            and num_turns >= self._max_turns
+            and (session_meta.get("turn_limit_reached") or (not codex_cap and self._max_turns and num_turns >= self._max_turns))
         ):
             reason = TerminationReason.MAX_TURNS_REACHED
         outputs = []
@@ -695,9 +697,9 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                     "pod_active_deadline_seconds"
                 ] = self.val_pod_active_deadline
             if self.val_agent_max_timeout is not None:
-                cfg.setdefault("agent", {})["max_timeout_sec"] = (
-                    self.val_agent_max_timeout
-                )
+                cfg.setdefault("agent", {})["max_timeout_sec"] = self.val_agent_max_timeout
+                if definition.name == "codex":
+                    cfg["agent"]["override_timeout_sec"] = self.val_agent_max_timeout
 
         reward = 0.0
         trial_reason = TerminationReason.AGENT_COMPLETED
@@ -723,7 +725,13 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             trajectory_dir = (
                 Path(base_trials_dir) / f"step_{global_steps:04d}" / session_id
             )
-            await proxy.open_session(session_id, trajectory_dir=trajectory_dir)
+            await proxy.open_session(
+                session_id, trajectory_dir=trajectory_dir,
+                sampling_params=sampling_params if definition.name == "codex" else None,
+                harness_name=definition.name,
+                max_turns=(cfg.get("agent", {}).get("kwargs", {}).get("max_turns")
+                           if definition.name == "codex" else None),
+            )
 
             inject_harness_endpoint(
                 cfg,
@@ -883,6 +891,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         ):
             trial_reason = TerminationReason.OVERLONG
 
+        if session_meta.get("turn_limit_reached") and trial_reason == TerminationReason.AGENT_COMPLETED:
+            trial_reason = TerminationReason.MAX_TURNS_REACHED
         return reward, trial_reason, session_meta
 
     @staticmethod

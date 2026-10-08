@@ -56,11 +56,25 @@ case "$SCAFFOLD" in
     export HARBOR_CUSTOM_AGENT_OPENCODE="${HARBOR_CUSTOM_AGENT_OPENCODE:-$HARBOR_AGENT_RUNTIME_MOUNT_PATH/bin/opencode}"
     export HARBOR_CUSTOM_AGENT_RUNTIME_ENV_SCRIPT="${HARBOR_CUSTOM_AGENT_RUNTIME_ENV_SCRIPT:-$HARBOR_AGENT_RUNTIME_MOUNT_PATH/runtime-env.sh}"
     _loop_default="agent_loop_config_oh.yaml"; : "${ENABLE_R3:=False}" ;;
+  cx)     # Codex CLI. OpenAI Responses surface; base_url injected per-session by the loop
+    # null → dispatch on import_path (mounted runtime). "codex" would select
+    # harbor.agents.installed.codex:Codex and install in-pod via nvm+npm instead.
+    : "${HARBOR_AGENT_NAME:=null}"
+    : "${HARBOR_AGENT_IMPORT_PATH:=harbor_patch.agents.image_mounted_codex:Codex}"
+    : "${HARBOR_AGENT_RUNTIME_IMAGE:=null}"
+    : "${HARBOR_AGENT_RUNTIME_MOUNT_PATH:=/opt/custom-agent-runtime/codex}"
+    : "${HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH:=opt/custom-agent-runtime/codex}"
+    # Pinned: the installed path falls back to @latest, which moves under you.
+    : "${HARBOR_AGENT_VERSION:=0.153.4}"
+    export HARBOR_OPENAI_BASE_URL="${HARBOR_OPENAI_BASE_URL:-http://in-process-proxy/v1}"
+    export HARBOR_OPENAI_API_KEY="${HARBOR_OPENAI_API_KEY:-sk-dummy}"
+    export CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-medium}"
+    _loop_default="agent_loop_config_cx.yaml"; : "${ENABLE_R3:=True}" ;;
   mixed)  # Per-sample selection; each complete runtime definition lives in mixed YAML.
     : "${HARBOR_AGENT_NAME:=null}"
     : "${HARBOR_VAL_HARNESS:=openhands_sdk}"
     _loop_default="agent_loop_config_mixed.yaml"; : "${ENABLE_R3:=True}" ;;
-  *) echo "[harbor_env][FATAL] unknown SCAFFOLD='$SCAFFOLD' (supports ohsdk|oh|cc|oc|mixed)" >&2; return 1 2>/dev/null || exit 1 ;;
+  *) echo "[harbor_env][FATAL] unknown SCAFFOLD='$SCAFFOLD' (supports ohsdk|oh|cc|oc|cx|mixed)" >&2; return 1 2>/dev/null || exit 1 ;;
 esac
 export HARBOR_AGENT_NAME HARBOR_AGENT_IMPORT_PATH HARBOR_AGENT_RUNTIME_IMAGE \
        HARBOR_AGENT_RUNTIME_MOUNT_PATH HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH HARBOR_AGENT_VERSION ENABLE_R3
