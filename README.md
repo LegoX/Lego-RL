@@ -109,7 +109,7 @@ Full protocol, ablations, and failure analysis are in the [paper](https://arxiv.
 <br>
 
 Seven of our own runs are listed below, all training Qwen3.5-35B-A3B.
-All seven dashboards are public. The Codex dashboard opens directly without Workspace sign-in:
+All seven dashboards are public. The Codex and Mixed harness dashboards open directly without Workspace sign-in:
 
 | Run              | Harness                                | Data (train / val)                                 | Algorithm                  | Steps | Val (start → best)     | Dashboard                                                     |
 |:-----------------|:---------------------------------------|:---------------------------------------------------|:---------------------------|------:|:-----------------------|:--------------------------------------------------------------|
@@ -123,7 +123,7 @@ All seven dashboards are public. The Codex dashboard opens directly without Work
 
 <br>
 
-Each board follows one run from the first step to the last. The Codex board publishes
+Each board follows one run from the first step to the last. The Codex and Mixed harness boards publish
 read-only training and validation curves; the other boards also provide individual-trial views.
 Val is the solve rate (%) on the run's validation set, and "best" is the best validation checkpoint.
 The six original runs use `val-core/.../mean@1`. Codex uses its registered offline evaluations
