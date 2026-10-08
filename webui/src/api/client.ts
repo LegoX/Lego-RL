@@ -1,5 +1,8 @@
 import type { RunInfo, MetricPoint, MetricsData, IngestJob } from "../types";
 
+import { withTrainingStep } from "../utils/trainingSteps";
+import { withRewardMetrics } from "../utils/rewardMetrics";
+
 const BASE = "/api";
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -50,7 +53,11 @@ export async function fetchMetrics(
   const params = new URLSearchParams();
   if (keys?.length) params.set("keys", keys.join(","));
   const qs = params.toString();
-  return fetchJson(`${BASE}/runs/${runId}/metrics${qs ? `?${qs}` : ""}`);
+  const result = await fetchJson<MetricsData>(`${BASE}/runs/${runId}/metrics${qs ? `?${qs}` : ""}`);
+  result.metrics = result.metrics.map(point => withRewardMetrics(withTrainingStep(point)));
+  result.available_keys = [...new Set([...result.available_keys,
+    ...result.metrics.flatMap(point => Object.keys(point).filter(key => key !== "step"))])];
+  return result;
 }
 
 export async function fetchLatest(runId: string): Promise<MetricPoint | null> {
