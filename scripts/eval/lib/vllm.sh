@@ -24,6 +24,16 @@ preflight_vllm_port() {
     echo "[Preflight] vLLM port free: $VLLM_PORT"
 }
 
+acquire_eval_lock() {
+    # Reserve the port even while the model is loading and has no listener yet.
+    local lock_path="${TMPDIR:-/tmp}/lego-rl-eval-${UID}-${VLLM_PORT}.lock"
+    exec {EVAL_LOCK_FD}>"$lock_path"
+    if ! flock -n "$EVAL_LOCK_FD"; then
+        echo "[FATAL] another eval owns vLLM port $VLLM_PORT on $(hostname) ($lock_path)" >&2
+        exit 1
+    fi
+}
+
 kill_tree() {
     local p="$1" c
     for c in $(pgrep -P "$p" 2>/dev/null); do
@@ -33,15 +43,11 @@ kill_tree() {
 }
 
 kill_vllm_and_wait() {
-    local max
-    [ -n "${VLLM_PID:-}" ] && kill_tree "$VLLM_PID"
-    pkill -9 -f "vllm serve" 2>/dev/null || true
-    for _ in $(seq 1 60); do
-        max=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -rn | head -1)
-        [ "${max:-9999}" -lt 2000 ] && break
-        sleep 2
-    done
-    echo "[vLLM] GPUs drained (max used ${max:-?} MiB)"
+    if [ -n "${VLLM_PID:-}" ]; then
+        kill_tree "$VLLM_PID"
+        wait "$VLLM_PID" 2>/dev/null || true
+        VLLM_PID=""
+    fi
 }
 
 cleanup_vllm() {
@@ -53,9 +59,12 @@ start_vllm() {
     VLLM_PID=""
     trap cleanup_vllm EXIT
 
-    kill_vllm_and_wait
     echo "[vLLM] starting plain model server..."
-    "${vllm_cmd[@]}" > "$VLLM_LOG" 2>&1 &
+    (
+        # Only the runner owns the lock; workers must not keep it after exit.
+        exec {EVAL_LOCK_FD}>&-
+        exec "${vllm_cmd[@]}"
+    ) > "$VLLM_LOG" 2>&1 &
     VLLM_PID=$!
     echo "[vLLM] PID=$VLLM_PID"
 }

@@ -45,6 +45,7 @@ source "$EVAL_LIB_DIR/job_config.sh"
 source_config_and_templates
 validate_runtime_config
 initialize_runtime
+"$PYTHON_BIN" -m harbor_patch.eval_tools preflight
 print_launch_summary
 print_final_environment
 
@@ -56,8 +57,9 @@ if [ "$DRY_RUN" = "1" ]; then
     exit 0
 fi
 
-write_job_config
+acquire_eval_lock
 preflight_vllm_port
+write_job_config
 start_vllm
 wait_for_vllm
 run_vllm_sanity

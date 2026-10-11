@@ -9,6 +9,159 @@ only the `.sh` runners, which call into this directory as `$SCRIPT_DIR/../utils/
 
 ---
 
+## DeepSWE
+
+`scripts/eval/configs/qwen38-27b_deepswe.env` evaluates the original
+[Datacurve DeepSWE](https://github.com/datacurve-ai/deep-swe) tasks using this
+repository's Harbor fork, Claude Code and Kubernetes. No dataset converter or
+Pier installation is needed. The official leaderboard's Pier + mini-swe-agent
+scaffold is different.
+
+The task schema and collect commands were checked against all 113 tasks at
+`0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea` (v1.1). Keep the dataset revision
+with your experiment record:
+
+```bash
+git clone https://github.com/datacurve-ai/deep-swe /path/to/deep-swe
+git -C /path/to/deep-swe checkout 0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea
+```
+
+### Harbor support
+
+`scripts/setup_env.sh` pins the ydu Harbor fork to
+`77282683ba93315ae1175b34230e67c1cd233255` and applies `patches/harbor.patch`.
+For an existing checkout at that revision, apply the patch once before launching
+new jobs (do not replace source while a job is running):
+
+```bash
+git -C third_party/harbor apply --check "$PWD/patches/harbor.patch"
+git -C third_party/harbor apply "$PWD/patches/harbor.patch"
+```
+
+The patch adds `verifier.environment_mode`, `verifier.environment`,
+`verifier.collect` (main service only), and task-level `artifacts`. Existing
+shared-environment tasks keep their original verification path. Separate tasks
+run collect hooks before verification, copy declared artifacts to the host, and
+upload them into a fresh verifier environment. Explicit verifier resource/env
+fields override the task environment; omitted fields, including the prebuilt
+image, inherit from it. Agent runtime and host mounts are not inherited by the
+verifier. Each verifier retry uses a new environment and log directory.
+
+Collect/copy errors are reported as infrastructure errors, rather than silently
+grading an empty submission. A successfully collected zero-byte patch remains
+a valid empty submission. This error reporting is intentionally stricter than
+Pier's best-effort collect hooks. Verifier logs are retained on errors/timeouts
+and the separate environment is cleaned up. Canonical scores and logs remain
+under `<trial>/verifier/`; individual attempts live under
+`<trial>/verifier-environments/`.
+
+### Configure and validate
+
+`qwen38-27b_deepswe.env` selects Qwen3.8-27B with
+Claude Code and site-specific model, dataset and Kubernetes paths.
+Before launching, set `MODEL_PATH`, `DATASET_PATH`, `K8S_KUBECONFIG` and
+`HARBOR_NETADMIN_IMAGE`. Workers must be able to pull the configured task images
+and Claude Code runtime image.
+No SWE-rebench/Pro grading-toolchain host mount is needed. The endpoint in
+`LLM_BASE_URL` must be reachable from the task pods.
+
+The [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B) reports
+DeepSWE 1.1 at 42.2 with Claude Code, temperature 1.0, top_p 0.95 and a 256K
+context window. The config sets these sampling defaults in vLLM and sets
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144` in the actual agent environment.
+Thinking and preserved reasoning history stay enabled with Qwen's default
+xhigh effort; `qwen3` parses reasoning and `qwen3_coder` parses tool calls.
+CC 2.1.118, 32768 output tokens, one attempt per task and task-defined timeouts
+are local choices: the card does not specify those details for DeepSWE. Its
+avg@3/8-hour/32768 note belongs to QwenSWEBench, not DeepSWE. A model evaluation
+is still needed to measure whether this setup reaches the reported score.
+
+Important settings in this config:
+
+- `HARBOR_K8S_SKIP_DOCKERFILE=true` consumes the complete prebuilt task image;
+  it preserves the image's PATH and /tmp (which can contain offline caches),
+  and skips Dockerfile RUN replay and extra musl setup. It requires `docker_image`.
+- `HARBOR_BLOCK_GIT_HISTORY_LEAK=0` preserves the official image's pruned Git
+  history. DeepSWE collects `git diff --binary <base_commit> HEAD`, so the agent
+  must commit its changes as requested by the original instruction. Rebuilding
+  or restoring `.git` would break this submission protocol.
+- `HARBOR_EVAL_CC_SUBMISSION_GUARD=1` in `EVAL_AGENT_EXTRA_ENV` initializes
+  missing Git author fields locally in `/app` before CC runs (existing identity
+  is preserved), and fails explicitly if setup fails. It leaves the original
+  task instruction unchanged; the task already requests a commit. Training does
+  not enable it.
+- `python -m harbor_patch.eval_tools tally <job-dir>` reports job completion,
+  pending final results and aggregate exceptions, including failures without a
+  task result file. `EVAL_REWARD_KEY` and `EVAL_REWARD_VALUES` select the score;
+  `solved` counts the highest allowed value (binary defaults: `reward`, `[0,1]`).
+  `python -m harbor_patch.eval_tools diagnose <job-dir>` lists missing test IDs,
+  other failed tests, empty patches, and raw-log storage/build/timeout/report
+  signatures without modifying scores. Build failures are not automatically
+  classified as infrastructure failures. Missing IDs
+  can reflect renamed tests, compilation failures or interrupted test runs;
+  inspect the raw logs before attributing a cause.
+- Eval acquires a host-local lock for its vLLM port before launching. Duplicate
+  launches fail even during model loading. Cleanup terminates only this runner's
+  server process tree, rather than all `vllm serve` processes on the host.
+- `EVAL_TASK_NAMES` accepts a JSON array of exact task names or globs for
+  diagnostic subsets. Local preflight rejects unmatched filters. Subset scores
+  are diagnostic and do not replace a full-benchmark score.
+- `HARBOR_K8S_STRICT_NETWORK_POLICY=true` makes network-policy installation
+  failures fatal. `HARBOR_K8S_ALLOW_PRIVATE_NETWORK=false` restricts agent
+  access to explicitly allowed hosts (the LLM endpoint), loopback and cluster
+  DNS; it disables the backend's legacy blanket RFC1918 exception. Verifier networking
+  follows the task's `no-network` policy. Offline external connections are
+  rejected immediately so optional web assets cannot stall local browser tests.
+- Agent timeout and CPU/memory overrides are `null`, retaining each task's
+  own budgets. The Pod deadline is a separate backstop; adjust it if changing
+  the task budget. Start with low concurrency because verifier pods also use
+  cluster resources.
+- Memory requests remain 8 GiB; `HARBOR_ENVIRONMENT_MEMORY_LIMIT_FACTOR=1.5`
+  sets a 12 GiB hard limit. This is a local resource difference, not an exact
+  reproduction of an 8 GiB limit.
+- `HARBOR_ENVIRONMENT_OVERRIDE_CPU_LIMIT=2` enforces v1.1's declared CPU quota.
+  CPU requests alone let joblib detect the whole node and can exhaust memory
+  in tasks such as `skrub-duration-encoding`.
+- `HARBOR_K8S_NOFILE=65536` raises the soft open-file limit for commands in
+  the task/verifier container. MongoDB in `eicrud-keyset-pagination-cursor`
+  exhausts containerd's default 1024 descriptors. The container's hard limit
+  must permit the configured value; an unsuccessful `ulimit` fails the command.
+- `EVAL_REQUIRE_SEPARATE_VERIFIER=true` rejects an unpatched Harbor before
+  starting vLLM. When the dataset is present, preflight validates every task's
+  schema. A dry-run with a placeholder dataset only checks runner capability.
+- `EVAL_REWARD_KEY=reward` computes the job mean from the binary score while
+  retaining DeepSWE's other reward fields (`f2p`, `p2p`, `partial`, and counts)
+  for diagnostics. Standalone Harbor jobs should set
+  `metrics: [{type: mean, kwargs: {reward_key: reward}}]` as well.
+- `EVAL_REWARD_VALUES='[0,1]'` sets `verifier.allowed_rewards.reward` to
+  `[0,1]`. A crash sentinel (`reward=-1`) or missing/invalid primary score
+  raises `InvalidRewardError` before aggregation. Verification retries once
+  using the same collected submission in a fresh container. Persistent errors
+  remain unscored, with logs retained; the default job retry policy excludes
+  this exception to avoid regenerating the model answer. As with other missing
+  rewards, the job mean counts this trial as zero; report errors alongside it.
+  Standalone Harbor jobs should set `verifier: {allowed_rewards: {reward: [0,1]}}`.
+
+```bash
+bash scripts/eval/eval.sh --dry-run scripts/eval/configs/qwen38-27b_deepswe.env
+```
+
+Before a full model run, validate the configured backend with official oracle
+and nop agents on a small subset: oracle should apply/commit the solution and
+score 1, while nop should produce an empty patch and score 0. Check
+`artifacts/model.patch`, verifier logs, image pulls and endpoint/network access.
+Then run a small Claude Code subset using `N_TASKS` before increasing concurrency.
+The runner's final tally reads JSON or text rewards, counts only top-level
+trials, and reports infrastructure errors separately. Agent errors with a valid
+verifier reward are both scored and included in the error count.
+
+Local regression tests (no GPU, containers or cluster required):
+
+```bash
+.venv/bin/python -m pytest -c third_party/harbor/pyproject.toml \
+  third_party/harbor/tests/unit/test_separate_verifier.py tests/eval/test_deepswe.py
+```
+
 ## Called from the shell runners
 
 Changing these affects training / evaluation runs already in flight.

@@ -40,7 +40,8 @@ VLLM_DIR="${VLLM_DIR:-$THIRD_PARTY_DIR/vllm}"
 # than failing loudly. The fork tracks harbor-internal main; re-merge it there
 # rather than switching this URL back.
 HARBOR_REPO_URL="${HARBOR_REPO_URL:-https://github.com/Elvin-Yiming-Du/harbor.git}"
-HARBOR_REF="${HARBOR_REF:-${HARBOR_COMMIT:-main}}"
+# Pin the fork revision used to build patches/harbor.patch.
+HARBOR_REF="${HARBOR_REF:-${HARBOR_COMMIT:-77282683ba93315ae1175b34230e67c1cd233255}}"
 
 VERL_REPO_URL="${VERL_REPO_URL:-https://github.com/verl-project/verl.git}"
 VERL_REF="${VERL_REF:-${VERL_COMMIT:-v0.8.0}}"
@@ -48,8 +49,8 @@ VERL_REF="${VERL_REF:-${VERL_COMMIT:-v0.8.0}}"
 VLLM_REPO_URL="${VLLM_REPO_URL:-https://github.com/vllm-project/vllm.git}"
 VLLM_REF="${VLLM_REF:-${VLLM_COMMIT:-v0.19.0}}"
 
-# Harbor has no repo patch checked in today. Drop one at patches/harbor.patch or
-# export HARBOR_PATCH=/path/to/patch to enable the same monkey-patch step.
+# Harbor's separate-verifier/collect support is maintained against 7728268.
+# Override HARBOR_PATCH only when using a fork with equivalent native support.
 HARBOR_PATCH="${HARBOR_PATCH:-$REPO_ROOT/patches/harbor.patch}"
 # verl takes an ORDERED, whitespace-separated list. Each patch is generated
 # against the tree left by the previous one, so the order is part of the
