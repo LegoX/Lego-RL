@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 write_job_config() {
+    export EVAL_REWARD_KEY EVAL_REWARD_VALUES
     export EXP_NAME N_CONCURRENT MAX_RETRIES SERVED_MODEL_NAME LLM_BASE_URL LLM_API_KEY
-    export DATASET_PATH DATASET_NAME N_TASKS EVAL_AGENT_NAME
+    export DATASET_PATH DATASET_NAME N_TASKS EVAL_TASK_NAMES EVAL_AGENT_NAME
     # Harness-specific endpoint/model/env declarations come from the scaffold
     # module.  The generated JobConfig is consumed by a separate `harbor run`
     # process, so render those declarations into each agent trial here.
@@ -180,8 +181,8 @@ environment_cfg = {
     "import_path": os.environ["HARBOR_ENVIRONMENT_IMPORT_PATH"],
     "force_build": truthy(os.environ.get("HARBOR_ENVIRONMENT_FORCE_BUILD", "False")),
     "delete": truthy(os.environ.get("HARBOR_ENVIRONMENT_DELETE", "True")),
-    "override_cpus": int(os.environ.get("HARBOR_ENVIRONMENT_OVERRIDE_CPUS", "1")),
-    "override_memory_mb": int(os.environ.get("HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB", "4096")),
+    "override_cpus": optional_number("HARBOR_ENVIRONMENT_OVERRIDE_CPUS"),
+    "override_memory_mb": optional_number("HARBOR_ENVIRONMENT_OVERRIDE_MEMORY_MB"),
     "kwargs": {k: v for k, v in env_kwargs.items() if v not in (None, "")},
 }
 environment_type = optional_raw("HARBOR_ENVIRONMENT_TYPE")
@@ -204,8 +205,18 @@ cfg = {
         "path": os.environ.get("DATASET_PATH") or None,
         "name": os.environ.get("DATASET_NAME") or None,
         "n_tasks": int(os.environ["N_TASKS"]) if os.environ.get("N_TASKS") else None,
+        "task_names": json.loads(os.environ["EVAL_TASK_NAMES"]) if os.environ.get("EVAL_TASK_NAMES") else None,
     }.items() if v is not None}],
 }
+
+reward_key = optional_raw("EVAL_REWARD_KEY")
+if reward_key is not None:
+    cfg["metrics"] = [{"type": "mean", "kwargs": {"reward_key": reward_key}}]
+reward_values = optional_raw("EVAL_REWARD_VALUES")
+if reward_values is not None:
+    if reward_key is None:
+        raise ValueError("EVAL_REWARD_VALUES requires EVAL_REWARD_KEY")
+    cfg["verifier"]["allowed_rewards"] = {reward_key: json.loads(reward_values)}
 
 agent_import_path = os.environ["HARBOR_AGENT_IMPORT_PATH"]
 
@@ -289,8 +300,5 @@ run_harbor_eval() {
 }
 
 print_eval_tally() {
-    local solved scored
-    solved=$(find "$EVAL_JOBS_DIR/$EXP_NAME" -maxdepth 3 -name reward.txt -exec cat {} \; 2>/dev/null | grep -c '^1$' || true)
-    scored=$(find "$EVAL_JOBS_DIR/$EXP_NAME" -maxdepth 3 -name reward.txt 2>/dev/null | wc -l)
-    echo "=== DONE: solved=$solved / scored=$scored  ($EVAL_JOBS_DIR/$EXP_NAME) ==="
+    "$PYTHON_BIN" -m harbor_patch.eval_tools tally "$EVAL_JOBS_DIR/$EXP_NAME"
 }

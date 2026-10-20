@@ -1,0 +1,1061 @@
+diff --git a/src/harbor/metrics/mean.py b/src/harbor/metrics/mean.py
+index 4fd1985..1dd7286 100644
+--- a/src/harbor/metrics/mean.py
++++ b/src/harbor/metrics/mean.py
+@@ -2,6 +2,9 @@ from harbor.metrics.base import BaseMetric
+ 
+ 
+ class Mean(BaseMetric[dict[str, float | int]]):
++    def __init__(self, reward_key: str | None = None):
++        self.reward_key = reward_key
++
+     def compute(
+         self, rewards: list[dict[str, float | int] | None]
+     ) -> dict[str, float | int]:
+@@ -10,6 +13,10 @@ class Mean(BaseMetric[dict[str, float | int]]):
+         for reward in rewards:
+             if reward is None:
+                 values.append(0)
++            elif self.reward_key is not None:
++                if self.reward_key not in reward:
++                    raise ValueError(f"Missing reward key {self.reward_key!r}")
++                values.append(reward[self.reward_key])
+             elif len(reward) != 1:
+                 raise ValueError(
+                     f"Expected exactly one key in reward dictionary, got {len(reward)}"
+diff --git a/src/harbor/models/job/config.py b/src/harbor/models/job/config.py
+index e5f6e87..4784e40 100644
+--- a/src/harbor/models/job/config.py
++++ b/src/harbor/models/job/config.py
+@@ -226,6 +226,9 @@ class RetryConfig(BaseModel):
+             "RewardFileNotFoundError",
+             "RewardFileEmptyError",
+             "VerifierOutputParseError",
++            # Verification already retries the same submission. Never rerun
++            # the agent to replace an answer after an invalid verifier reward.
++            "InvalidRewardError",
+         },
+         description="Exception types to NOT retry on. Takes precedence over "
+         "include_exceptions.",
+diff --git a/src/harbor/models/task/config.py b/src/harbor/models/task/config.py
+index 4d8cb18..ca78946 100644
+--- a/src/harbor/models/task/config.py
++++ b/src/harbor/models/task/config.py
+@@ -5,12 +5,13 @@ import re
+ import tomllib
+ import warnings
+ from enum import StrEnum
+-from typing import Any
++from typing import Any, Literal
+ 
+ import toml
+ from pydantic import BaseModel, Field, field_validator, model_validator
+ 
+ from harbor.constants import ORG_NAME_PATTERN
++from harbor.models.trial.config import ArtifactConfig
+ 
+ 
+ class Author(BaseModel):
+@@ -65,6 +66,14 @@ class PackageInfo(BaseModel):
+         return self.name.split("/")[1]
+ 
+ 
++class VerifierCollectConfig(BaseModel):
++    command: str
++    # Only the main container is supported by the current environment API.
++    service: Literal["main"] = "main"
++    timeout_sec: float = Field(default=60.0, gt=0)
++    user: str | int | None = None
++
++
+ class VerifierConfig(BaseModel):
+     timeout_sec: float = 600.0
+     env: dict[str, str] = Field(default_factory=dict)
+@@ -74,9 +83,18 @@ class VerifierConfig(BaseModel):
+     )
+     network_mode: "NetworkMode | None" = None
+     allowed_hosts: list[str] = Field(default_factory=list)
++    environment_mode: Literal["shared", "separate"] | None = None
++    environment: "EnvironmentConfig | None" = None
++    collect: list[VerifierCollectConfig] = Field(default_factory=list)
++
++    @property
++    def uses_separate_environment(self) -> bool:
++        return self.environment_mode == "separate" or self.environment is not None
+ 
+     @model_validator(mode="after")
+     def validate_network_policy(self) -> "VerifierConfig":
++        if self.environment_mode == "shared" and self.environment is not None:
++            raise ValueError("shared verifier cannot specify verifier.environment")
+         self.network_mode, self.allowed_hosts = _validate_network_policy_fields(
+             self.network_mode,
+             self.allowed_hosts,
+@@ -344,6 +362,7 @@ class TaskConfig(BaseModel):
+     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
+     solution: SolutionConfig = Field(default_factory=SolutionConfig)
+     source: str | None = None
++    artifacts: list[str | ArtifactConfig] = Field(default_factory=list)
+ 
+     @model_validator(mode="before")
+     @classmethod
+diff --git a/src/harbor/models/trial/config.py b/src/harbor/models/trial/config.py
+index df667ad..a4dd32a 100644
+--- a/src/harbor/models/trial/config.py
++++ b/src/harbor/models/trial/config.py
+@@ -7,6 +7,7 @@ from uuid import UUID
+ from pydantic import (
+     BaseModel,
+     Field,
++    FiniteFloat,
+     field_serializer,
+     field_validator,
+     model_validator,
+@@ -180,6 +181,14 @@ class VerifierConfig(BaseModel):
+     max_timeout_sec: float | None = None
+     env: dict[str, str] = Field(default_factory=dict)
+     disable: bool = False
++    allowed_rewards: dict[str, list[FiniteFloat]] = Field(default_factory=dict)
++
++    @field_validator("allowed_rewards")
++    @classmethod
++    def validate_allowed_rewards(cls, values):
++        if any(not key or not allowed for key, allowed in values.items()):
++            raise ValueError("allowed_rewards requires nonempty keys and value lists")
++        return values
+ 
+     @field_serializer("env")
+     @classmethod
+diff --git a/src/harbor/trial/separate_verifier.py b/src/harbor/trial/separate_verifier.py
+new file mode 100644
+index 0000000..d0499a8
+--- /dev/null
++++ b/src/harbor/trial/separate_verifier.py
+@@ -0,0 +1,241 @@
++"""Collect declared submissions and grade them in a fresh environment.
++
++Only declared artifacts cross from the agent into the verifier. Agent logs,
++runtime mounts and the agent's writable log directories are not shared.
++"""
++
++import asyncio
++import json
++import logging
++import shutil
++from dataclasses import dataclass
++from math import ceil
++from pathlib import Path, PurePosixPath
++from uuid import uuid4
++
++from harbor.environments.base import BaseEnvironment
++from harbor.environments.factory import EnvironmentFactory
++from harbor.models.environment_type import EnvironmentType
++from harbor.models.task.config import EnvironmentConfig
++from harbor.models.task.task import Task
++from harbor.models.trial.config import ArtifactConfig, TrialConfig
++from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
++from harbor.models.verifier.result import VerifierResult
++from harbor.verifier.verifier import Verifier
++
++
++@dataclass(frozen=True)
++class SubmissionArtifact:
++    local: Path
++    remote: str
++    is_dir: bool
++
++
++def resolve_verifier_environment(task: Task) -> EnvironmentConfig:
++    """Inherit the task image/resources, then apply explicit verifier overrides."""
++    cfg = task.config.verifier
++    values = task.config.environment.model_dump()
++    if cfg.environment is not None:
++        overrides = cfg.environment.model_dump(exclude_unset=True)
++        # EnvironmentConfig's validator normalizes these even when omitted.
++        if overrides.get("network_mode") is None:
++            overrides.pop("network_mode", None)
++            overrides.pop("allowed_hosts", None)
++        overrides["env"] = {**values["env"], **overrides.get("env", {})}
++        values.update(overrides)
++    policy = cfg.explicit_phase_policy()
++    if policy is not None:
++        values.update(
++            network_mode=policy.network_mode, allowed_hosts=policy.allowed_hosts
++        )
++    return EnvironmentConfig.model_validate(values)
++
++
++async def collect_submission(
++    task: Task,
++    config: TrialConfig,
++    environment: BaseEnvironment,
++    paths: TrialPaths,
++) -> list[SubmissionArtifact]:
++    """Run collection once, before restoring history or modifying the worktree.
++
++    Hook/copy failures are infrastructure errors, not an empty submission or
++    a model failure. An intentionally empty patch is still a valid artifact.
++    """
++    for hook in task.config.verifier.collect:
++        result = await asyncio.wait_for(
++            environment.exec(
++                command=hook.command, user=hook.user, timeout_sec=ceil(hook.timeout_sec)
++            ),
++            timeout=hook.timeout_sec,
++        )
++        if result.return_code != 0:
++            raise RuntimeError(
++                f"verifier.collect failed ({result.return_code}): {result.stderr}"
++            )
++
++    artifacts = []
++    destinations: dict[Path, str] = {}
++    for entry in [*task.config.artifacts, *config.artifacts]:
++        entry = ArtifactConfig(source=entry) if isinstance(entry, str) else entry
++        source = PurePosixPath(entry.source)
++        destination = PurePosixPath(entry.destination or source.name)
++        if not source.is_absolute() or ".." in source.parts:
++            raise ValueError(f"Artifact source must be an absolute path: {source}")
++        if (
++            destination.is_absolute()
++            or ".." in destination.parts
++            or destination == PurePosixPath(".")
++        ):
++            raise ValueError(f"Artifact destination must be relative: {destination}")
++        target = paths.artifacts_dir / str(destination)
++        if target in destinations:
++            if destinations[target] == str(source):
++                continue
++            raise ValueError(f"Conflicting artifact destination: {destination}")
++        destinations[target] = str(source)
++        is_dir = await environment.is_dir(str(source), user="root")
++        # Mounted environments already expose convention artifacts on the host.
++        mounted_source = None
++        if environment.is_mounted and source.is_relative_to(
++            EnvironmentPaths.artifacts_dir
++        ):
++            mounted_source = paths.artifacts_dir / str(
++                source.relative_to(EnvironmentPaths.artifacts_dir)
++            )
++        if mounted_source != target:
++            if is_dir:
++                target.mkdir(parents=True, exist_ok=True)
++                await environment.download_dir(
++                    source_dir=str(source), target_dir=target
++                )
++            else:
++                target.parent.mkdir(parents=True, exist_ok=True)
++                await environment.download_file(
++                    source_path=str(source), target_path=target
++                )
++        if not target.exists():
++            raise FileNotFoundError(
++                f"Declared verifier artifact was not collected: {source}"
++            )
++        artifacts.append(SubmissionArtifact(target, str(source), is_dir))
++    paths.artifacts_dir.mkdir(parents=True, exist_ok=True)
++    paths.artifacts_manifest_path.write_text(
++        json.dumps(
++            [
++                {
++                    "source": artifact.remote,
++                    "destination": str(artifact.local.relative_to(paths.trial_dir)),
++                    "type": "directory" if artifact.is_dir else "file",
++                    "status": "ok",
++                }
++                for artifact in artifacts
++            ],
++            indent=2,
++        )
++    )
++    return artifacts
++
++
++async def verify_separately(
++    task: Task,
++    config: TrialConfig,
++    paths: TrialPaths,
++    artifacts: list[SubmissionArtifact],
++    timeout_sec: float,
++    logger: logging.Logger,
++) -> VerifierResult:
++    env_config = resolve_verifier_environment(task)
++    # Separate trial paths prevent an agent-written reward or mounted file from
++    # being mistaken for verifier output. Every retry gets a fresh environment.
++    suffix = uuid4().hex[:8]
++    verifier_paths = TrialPaths(paths.trial_dir / "verifier-environments" / suffix)
++    verifier_paths.mkdir()
++    backend = config.environment.model_copy(deep=True)
++    # Backend credentials and scheduling settings remain; agent runtime mounts
++    # and resource overrides must not replace the task's verifier definition.
++    backend.override_cpus = None
++    backend.override_memory_mb = None
++    backend.override_storage_mb = None
++    backend.override_gpus = None
++    backend.mounts_json = None
++    backend.env = {}
++    backend.kwargs = {
++        key: value
++        for key, value in backend.kwargs.items()
++        if not key.startswith("agent_runtime_") and key != "host_path_mounts"
++    }
++    extra = (
++        {"has_dynamic_network_policy": True}
++        if backend.type == EnvironmentType.DOCKER
++        else {}
++    )
++    environment = EnvironmentFactory.create_environment_from_config(
++        config=backend,
++        environment_dir=task.paths.environment_dir,
++        environment_name=task.name,
++        session_id=f"{config.trial_name}-verifier-{suffix}",
++        trial_paths=verifier_paths,
++        task_env_config=env_config,
++        logger=logger,
++        **extra,
++    )
++    try:
++        multiplier = config.environment_build_timeout_multiplier
++        if multiplier is None:
++            multiplier = config.timeout_multiplier
++        await asyncio.wait_for(
++            environment.start(force_build=False),
++            env_config.build_timeout_sec * multiplier,
++        )
++        await environment.apply_network_policy(env_config.resolve_baseline())
++        await environment.run_healthcheck()
++        environment.default_user = task.config.verifier.user
++        for artifact in artifacts:
++            if artifact.is_dir:
++                await environment.upload_dir(
++                    source_dir=artifact.local, target_dir=artifact.remote
++                )
++            else:
++                await environment.upload_file(
++                    source_path=artifact.local, target_path=artifact.remote
++                )
++        verifier = Verifier(
++            task=task,
++            trial_paths=verifier_paths,
++            environment=environment,
++            override_env=config.verifier.env or None,
++            allowed_rewards=config.verifier.allowed_rewards,
++        )
++        return await asyncio.wait_for(verifier.verify(), timeout_sec)
++    finally:
++        # Preserve diagnostic output on timeout/error without masking that error.
++        try:
++            if not environment.is_mounted:
++                try:
++                    await asyncio.wait_for(
++                        environment.download_dir(
++                            source_dir=str(EnvironmentPaths.verifier_dir),
++                            target_dir=verifier_paths.verifier_dir,
++                        ),
++                        timeout=60,
++                    )
++                except Exception:
++                    logger.warning(
++                        "Could not download separate verifier logs", exc_info=True
++                    )
++            paths.verifier_dir.mkdir(parents=True, exist_ok=True)
++            for reward in (paths.reward_text_path, paths.reward_json_path):
++                reward.unlink(missing_ok=True)
++            shutil.copytree(
++                verifier_paths.verifier_dir, paths.verifier_dir, dirs_exist_ok=True
++            )
++        except Exception:
++            logger.warning("Could not recover separate verifier logs", exc_info=True)
++        finally:
++            try:
++                await asyncio.shield(environment.stop(delete=config.environment.delete))
++            except Exception:
++                logger.warning(
++                    "Could not stop separate verifier environment", exc_info=True
++                )
+diff --git a/src/harbor/trial/trial.py b/src/harbor/trial/trial.py
+index 9ab612f..134ad18 100644
+--- a/src/harbor/trial/trial.py
++++ b/src/harbor/trial/trial.py
+@@ -40,8 +40,9 @@ from harbor.trial.network_policy import (
+     should_apply_legacy_baseline_for_dynamic_policy,
+     should_apply_verifier_phase_policy,
+ )
++from harbor.trial.separate_verifier import collect_submission, verify_separately
+ from harbor.utils.logger import logger
+-from harbor.verifier.verifier import Verifier
++from harbor.verifier.verifier import InvalidRewardError, Verifier
+ 
+ 
+ class AgentSetupTimeoutError(asyncio.TimeoutError):
+@@ -68,7 +69,9 @@ TrialHookCallback = Callable[[TrialHookEvent], Awaitable[None]]
+ # retrying just multiplies the wasted wall-time. Set HARBOR_ENV_START_MAX_ATTEMPTS=1
+ # to disable the retry for such workloads. Default 2 preserves the original
+ # behavior (retry genuinely transient pod-infra failures).
+-_ENV_START_MAX_ATTEMPTS = max(1, int(os.environ.get("HARBOR_ENV_START_MAX_ATTEMPTS", "2")))
++_ENV_START_MAX_ATTEMPTS = max(
++    1, int(os.environ.get("HARBOR_ENV_START_MAX_ATTEMPTS", "2"))
++)
+ 
+ 
+ class Trial:
+@@ -84,6 +87,7 @@ class Trial:
+     """
+ 
+     _AGENT_SETUP_TIMEOUT_SEC = 360
++    SUPPORTS_SEPARATE_VERIFIER = True
+ 
+     def __init__(self, config: TrialConfig, *, _task: Task | None = None):
+         """Deprecated. Use ``await Trial.create(config)`` instead."""
+@@ -97,6 +101,7 @@ class Trial:
+         self.job_id = config.job_id
+         self._are_agent_logs_downloaded = False
+         self._predict_patch_captured = False
++        self._verifier_artifacts = None
+ 
+         self._hooks: dict[TrialEvent, list[TrialHookCallback]] = {
+             event: [] for event in TrialEvent
+@@ -109,7 +114,7 @@ class Trial:
+         self._log_handler: logging.Handler | None = None
+         self._init_logger()
+ 
+-        extra_kwargs = {}
++        extra_kwargs: dict[str, Any] = {}
+         if config.agent.name == AgentName.ORACLE.value:
+             extra_kwargs = {
+                 "task_dir": self._task._task_dir,
+@@ -141,7 +146,7 @@ class Trial:
+             environment_name=self._task.name,
+             session_id=self.config.trial_name,
+             trial_paths=self._trial_paths,
+-            task_env_config=self._task.config.environment,
++            task_env_config=self._task.config.environment.model_copy(deep=True),
+             logger=self._logger,
+             **environment_kwargs,
+         )
+@@ -355,7 +360,15 @@ class Trial:
+         # stripped for the agent phase (single-commit rebuild) so the verifier's
+         # `git checkout <historical_sha> <testfile>` + `git apply <test_patch>`
+         # work. No-op for environments that did not strip history.
+-        await self._environment.restore_git_history()
++        if self._verifier_artifacts is None and (
++            self._task.config.verifier.collect
++            or self._task.config.verifier.uses_separate_environment
++        ):
++            self._verifier_artifacts = await collect_submission(
++                self._task, self.config, self._environment, self._trial_paths
++            )
++        if not self._task.config.verifier.uses_separate_environment:
++            await self._environment.restore_git_history()
+ 
+         self.result.verifier = TimingInfo(started_at=datetime.now(timezone.utc))
+ 
+@@ -368,10 +381,20 @@ class Trial:
+         reraise=True,
+         stop=stop_after_attempt(2),
+         wait=wait_exponential(multiplier=1, min=1, max=10),
+-        retry=retry_if_exception_type(VerifierTimeoutError),
++        retry=retry_if_exception_type((VerifierTimeoutError, InvalidRewardError)),
+     )
+     async def _verify_with_retry(self) -> None:
+         try:
++            if self._task.config.verifier.uses_separate_environment:
++                self.result.verifier_result = await verify_separately(
++                    self._task,
++                    self.config,
++                    self._trial_paths,
++                    self._verifier_artifacts or [],
++                    self._verifier_timeout_sec,
++                    self._logger,
++                )
++                return
+             if should_apply_verifier_phase_policy(self._task.config, self.config.agent):
+                 await self._environment.apply_network_policy(
+                     resolve_verifier_phase_policy(
+@@ -384,6 +407,7 @@ class Trial:
+                 trial_paths=self._trial_paths,
+                 environment=self._environment,
+                 override_env=self.config.verifier.env or None,
++                allowed_rewards=self.config.verifier.allowed_rewards,
+             )
+ 
+             self.result.verifier_result = await asyncio.wait_for(
+@@ -635,6 +659,13 @@ class Trial:
+         2. Config-driven paths from self.config.artifacts - always downloaded,
+            even for mounted environments (arbitrary paths not under /logs/).
+         """
++        # A separate verifier consumed this exact snapshot. Do not overwrite it
++        # from the agent's environment after grading or on exception paths.
++        if (
++            self._task.config.verifier.uses_separate_environment
++            and self._verifier_artifacts is not None
++        ):
++            return
+         artifacts_dir = self._trial_paths.artifacts_dir
+         manifest: list[dict[str, Any]] = []
+ 
+@@ -671,7 +702,7 @@ class Trial:
+ 
+         # 2. Config-driven paths (always download, even for mounted envs,
+         #    since these are arbitrary paths not under /logs/)
+-        for artifact in self.config.artifacts:
++        for artifact in [*self._task.config.artifacts, *self.config.artifacts]:
+             # Normalize: str -> ArtifactConfig(source=str)
+             if isinstance(artifact, str):
+                 artifact = ArtifactConfig(source=artifact)
+diff --git a/src/harbor/verifier/verifier.py b/src/harbor/verifier/verifier.py
+index 4b8ab99..2a89935 100644
+--- a/src/harbor/verifier/verifier.py
++++ b/src/harbor/verifier/verifier.py
+@@ -18,6 +18,10 @@ class VerifierOutputParseError(Exception):
+     pass
+ 
+ 
++class InvalidRewardError(Exception):
++    """A verifier returned a missing or out-of-domain primary score."""
++
++
+ class DownloadVerifierDirError(Exception):
+     pass
+ 
+@@ -38,12 +42,14 @@ class Verifier:
+         environment: BaseEnvironment,
+         override_env: dict[str, str] | None = None,
+         logger: logging.Logger | None = None,
++        allowed_rewards: dict[str, list[float]] | None = None,
+     ):
+         self._task = task
+         self._trial_paths = trial_paths
+         self._environment = environment
+         self._override_env: dict[str, str] = dict(override_env) if override_env else {}
+         self._logger = (logger or global_logger).getChild(__name__)
++        self._allowed_rewards = allowed_rewards or {}
+ 
+     def _parse_reward_text(self) -> dict[str, float | int]:
+         if self._trial_paths.reward_text_path.stat().st_size == 0:
+@@ -151,4 +157,11 @@ class Verifier:
+                 }"
+             )
+ 
++        for key, allowed in self._allowed_rewards.items():
++            value = rewards.get(key) if isinstance(rewards, dict) else None
++            if not isinstance(value, (int, float)) or value not in allowed:
++                raise InvalidRewardError(
++                    f"Verifier reward {key!r} must be one of {allowed}, got {value!r}. "
++                    "Inspect verifier logs for infrastructure failures."
++                )
+         return VerifierResult(rewards=rewards)
+diff --git a/tests/unit/test_mean_reward_key.py b/tests/unit/test_mean_reward_key.py
+new file mode 100644
+index 0000000..0b8c38d
+--- /dev/null
++++ b/tests/unit/test_mean_reward_key.py
+@@ -0,0 +1,27 @@
++import pytest
++
++from harbor.metrics.factory import MetricFactory
++from harbor.metrics.mean import Mean
++from harbor.models.metric.type import MetricType
++
++
++def test_mean_selects_primary_reward_and_preserves_diagnostics():
++    rewards = [
++        {"reward": 0, "p2p": 1.0, "partial": 0.5},
++        {"reward": 1, "p2p": 1.0, "partial": 1.0},
++        None,
++    ]
++    metric = MetricFactory.create_metric(MetricType.MEAN, reward_key="reward")
++    assert metric.compute(rewards) == {"mean": 1 / 3}
++    assert rewards[0] == {"reward": 0, "p2p": 1.0, "partial": 0.5}
++
++
++def test_mean_rejects_missing_explicit_key():
++    with pytest.raises(ValueError, match="Missing reward key"):
++        Mean(reward_key="reward").compute([{"partial": 1.0}])
++
++
++def test_default_mean_retains_single_key_contract():
++    assert Mean().compute([{"score": 1}, {"score": 0}]) == {"mean": 0.5}
++    with pytest.raises(ValueError, match="exactly one key"):
++        Mean().compute([{"reward": 0, "partial": 1.0}])
+diff --git a/tests/unit/test_separate_verifier.py b/tests/unit/test_separate_verifier.py
+new file mode 100644
+index 0000000..be73128
+--- /dev/null
++++ b/tests/unit/test_separate_verifier.py
+@@ -0,0 +1,476 @@
++"""Separate grading must use committed artifacts and an isolated environment."""
++
++import asyncio
++import logging
++import os
++import shutil
++import subprocess
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from harbor.environments.base import ExecResult
++from harbor.models.job.config import RetryConfig
++from harbor.models.task.config import TaskConfig, VerifierConfig
++from harbor.models.task.task import Task
++from harbor.models.trial.config import TrialConfig
++from harbor.models.trial.paths import TrialPaths
++from harbor.models.verifier.result import VerifierResult
++from harbor.trial import separate_verifier as separate
++from harbor.trial.trial import Trial
++from harbor.verifier.verifier import InvalidRewardError, Verifier
++
++
++def make_task(tmp_path, **verifier):
++    cfg = TaskConfig.model_validate(
++        {
++            "environment": {
++                "docker_image": "official:v1.1",
++                "cpus": 4,
++                "memory_mb": 8192,
++                "env": {"BASE": "yes"},
++                "network_mode": "no-network",
++            },
++            "verifier": {
++                "environment_mode": "separate",
++                "environment": {"cpus": 2},
++                **verifier,
++            },
++            "artifacts": ["/logs/artifacts/model.patch"],
++        }
++    )
++    return SimpleNamespace(
++        config=cfg, paths=SimpleNamespace(environment_dir=tmp_path), name="toy"
++    )
++
++
++def make_config(tmp_path):
++    return TrialConfig.model_validate(
++        {
++            "task": {"path": str(tmp_path)},
++            "trial_name": "toy-trial",
++            "environment": {
++                "type": "docker",
++                "override_memory_mb": 512,
++                "kwargs": {
++                    "agent_runtime_image": "agent:latest",
++                    "host_path_mounts": ["private"],
++                    "namespace": "sandbox",
++                },
++            },
++        }
++    )
++
++
++def test_schema_and_environment_inheritance(tmp_path):
++    task = make_task(tmp_path)
++    cfg = separate.resolve_verifier_environment(task)
++    assert cfg.docker_image == "official:v1.1"
++    assert cfg.cpus == 2 and cfg.memory_mb == 8192
++    assert cfg.resolve_baseline().network_mode == "no-network"
++    assert task.config.environment.cpus == 4
++    assert not VerifierConfig().uses_separate_environment
++    assert VerifierConfig(environment={}).uses_separate_environment
++    with pytest.raises(ValueError, match="shared verifier"):
++        VerifierConfig(environment_mode="shared", environment={})
++    with pytest.raises(ValueError):
++        VerifierConfig(collect=[{"command": "true", "service": "sidecar"}])
++
++
++def test_verifier_phase_network_takes_precedence(tmp_path):
++    task = make_task(
++        tmp_path,
++        network_mode="no-network",
++        environment={"network_mode": "public", "env": {"TEST": "1"}},
++    )
++    cfg = separate.resolve_verifier_environment(task)
++    assert cfg.resolve_baseline().network_mode == "no-network"
++    assert cfg.env == {"BASE": "yes", "TEST": "1"}
++
++
++@pytest.mark.asyncio
++async def test_collect_committed_changes_not_working_tree(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++
++    def git(*args):
++        return subprocess.check_output(
++            ["git", "-C", str(repo), *args], text=True
++        ).strip()
++
++    git("init", "-q")
++    git("config", "user.email", "test@example.invalid")
++    git("config", "user.name", "Test")
++    (repo / "code.txt").write_text("base\n")
++    git("add", ".")
++    git("commit", "-qm", "base")
++    base = git("rev-parse", "HEAD")
++    (repo / "code.txt").write_text("committed fix\n")
++    git("commit", "-qam", "fix")
++    (repo / "code.txt").write_text("uncommitted change\n")
++    remote_patch = tmp_path / "model.patch"
++    task = make_task(
++        tmp_path,
++        collect=[
++            {"command": f"git -C {repo} diff --binary {base} HEAD > {remote_patch}"}
++        ],
++    )
++    env = MagicMock(is_mounted=False)
++
++    async def execute(command, **kwargs):
++        result = await asyncio.to_thread(
++            subprocess.run,
++            command,
++            shell=True,
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++        return ExecResult(return_code=result.returncode, stderr=result.stderr)
++
++    env.exec = AsyncMock(side_effect=execute)
++    env.is_dir = AsyncMock(return_value=False)
++
++    async def download(source_path, target_path):
++        shutil.copyfile(remote_patch, target_path)
++
++    env.download_file = AsyncMock(side_effect=download)
++    paths = TrialPaths(tmp_path / "trial")
++    paths.mkdir()
++    artifacts = await separate.collect_submission(
++        task, make_config(tmp_path), env, paths
++    )
++    assert len(artifacts) == 1
++    patch = artifacts[0].local.read_text()
++    assert "+committed fix" in patch and "uncommitted change" not in patch
++    assert artifacts[0].remote == "/logs/artifacts/model.patch"
++
++
++@pytest.mark.asyncio
++async def test_collect_failure_is_not_a_zero_score(tmp_path):
++    task = make_task(tmp_path, collect=[{"command": "false"}])
++    env = MagicMock()
++    env.exec = AsyncMock(return_value=ExecResult(return_code=1, stderr="missing base"))
++    with pytest.raises(RuntimeError, match="verifier.collect failed"):
++        await separate.collect_submission(
++            task, make_config(tmp_path), env, TrialPaths(tmp_path)
++        )
++
++
++@pytest.mark.asyncio
++async def test_missing_artifact_is_an_error(tmp_path):
++    env = MagicMock(is_mounted=False)
++    env.is_dir = AsyncMock(return_value=False)
++    env.download_file = AsyncMock()
++    with pytest.raises(FileNotFoundError, match="not collected"):
++        await separate.collect_submission(
++            make_task(tmp_path), make_config(tmp_path), env, TrialPaths(tmp_path)
++        )
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", [None, "start", "verify", "timeout", "cancel"])
++async def test_fresh_verifier_transfer_logs_and_cleanup(tmp_path, monkeypatch, failure):
++    task = make_task(tmp_path)
++    config = make_config(tmp_path)
++    paths = TrialPaths(tmp_path / "trial")
++    paths.mkdir()
++    paths.reward_text_path.write_text("1")  # must not be used as verifier output
++    patch = paths.artifacts_dir / "model.patch"
++    patch.write_text("submitted patch")
++    env = MagicMock(is_mounted=True)
++    env.start = AsyncMock()
++    env.stop = AsyncMock()
++    env.apply_network_policy = AsyncMock()
++    env.run_healthcheck = AsyncMock()
++    env.upload_file = AsyncMock()
++    env.upload_dir = AsyncMock()
++    created = []
++
++    def factory(**kwargs):
++        created.append(kwargs)
++        assert kwargs["config"].override_memory_mb is None
++        assert kwargs["config"].kwargs == {"namespace": "sandbox"}
++        assert kwargs["trial_paths"] != paths
++        assert kwargs["task_env_config"].memory_mb == 8192
++        return env
++
++    monkeypatch.setattr(
++        separate.EnvironmentFactory, "create_environment_from_config", factory
++    )
++    verifier = MagicMock()
++
++    async def verify():
++        new_paths = created[-1]["trial_paths"]
++        assert not new_paths.reward_text_path.exists()
++        new_paths.test_stdout_path.write_text("verifier output")
++        if failure == "verify":
++            raise RuntimeError("grading failed")
++        if failure == "timeout":
++            await asyncio.sleep(30)
++        if failure == "cancel":
++            raise asyncio.CancelledError()
++        new_paths.reward_json_path.write_text('{"reward": 0, "partial": 0.5}')
++        return VerifierResult(rewards={"reward": 0, "partial": 0.5})
++
++    verifier.verify = AsyncMock(side_effect=verify)
++    monkeypatch.setattr(separate, "Verifier", lambda **kwargs: verifier)
++    if failure == "start":
++        env.start.side_effect = RuntimeError("start failed")
++    args = (
++        task,
++        config,
++        paths,
++        [separate.SubmissionArtifact(patch, "/logs/artifacts/model.patch", False)],
++        0.01,
++        logging.getLogger(),
++    )
++    if failure:
++        error = (
++            asyncio.CancelledError
++            if failure == "cancel"
++            else asyncio.TimeoutError
++            if failure == "timeout"
++            else RuntimeError
++        )
++        with pytest.raises(error):
++            await separate.verify_separately(*args)
++    else:
++        result = await separate.verify_separately(*args)
++        assert result.rewards["reward"] == 0
++        first_session = created[-1]["session_id"]
++        await separate.verify_separately(*args)
++        assert created[-1]["session_id"] != first_session
++        assert paths.reward_json_path.exists()
++        env.upload_file.assert_awaited_with(
++            source_path=patch, target_path="/logs/artifacts/model.patch"
++        )
++        assert env.apply_network_policy.call_args.args[0].network_mode == "no-network"
++    assert not paths.reward_text_path.exists()
++    env.stop.assert_awaited_with(delete=True)
++    if failure != "start":
++        assert paths.test_stdout_path.read_text() == "verifier output"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("is_separate", [True, False])
++async def test_trial_collects_once_before_verification(
++    tmp_path, monkeypatch, is_separate
++):
++    task = make_task(tmp_path)
++    if not is_separate:
++        task.config.verifier = VerifierConfig()
++    trial = Trial.__new__(Trial)
++    trial._task = task
++    trial.config = make_config(tmp_path)
++    trial._trial_paths = TrialPaths(tmp_path)
++    trial._environment = MagicMock()
++    trial._environment.restore_git_history = AsyncMock()
++    trial._verifier_artifacts = None
++    trial._result = SimpleNamespace(verifier=None)
++    trial._invoke_hooks = AsyncMock()
++    trial._verify_with_retry = AsyncMock()
++    collect = AsyncMock(return_value=[])
++    monkeypatch.setattr("harbor.trial.trial.collect_submission", collect)
++    await trial._run_verification()
++    await trial._run_verification()
++    assert collect.await_count == int(is_separate)
++    assert trial._environment.restore_git_history.await_count == (
++        0 if is_separate else 2
++    )
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("submission,expected", [("committed fix", 1), ("", 0)])
++async def test_actual_verifier_scores_transferred_submission(
++    tmp_path, monkeypatch, submission, expected
++):
++    """Run the real Verifier and a toy grading script using a local fake backend."""
++    task_dir = tmp_path / "task"
++    (task_dir / "environment").mkdir(parents=True)
++    (task_dir / "tests").mkdir()
++    (task_dir / "instruction.md").write_text("Commit a fix.")
++    (task_dir / "environment" / "Dockerfile").write_text("FROM toy:latest\n")
++    (task_dir / "task.toml").write_text(
++        '[environment]\ndocker_image="toy:latest"\n'
++        '[verifier]\nenvironment_mode="separate"\nnetwork_mode="no-network"\n'
++    )
++    script = task_dir / "tests" / "test.sh"
++    script.write_text(
++        "#!/bin/sh\nset -eu\n"
++        'if [ "$(cat "$TOY_ROOT/logs/artifacts/model.patch")" = "committed fix" ]; then reward=1; else reward=0; fi\n'
++        'echo "{\\"reward\\": $reward}" > "$TOY_ROOT/logs/verifier/reward.json"\n'
++        'echo "graded transferred submission"\n'
++    )
++    task = Task(task_dir)
++    config = make_config(tmp_path)
++    config.verifier.allowed_rewards = {"reward": [0, 1]}
++    paths = TrialPaths(tmp_path / "trial")
++    paths.mkdir()
++    artifact = paths.artifacts_dir / "model.patch"
++    artifact.write_text(submission)
++    paths.reward_text_path.write_text("1")
++    root = tmp_path / "fresh-verifier"
++    (root / "logs" / "verifier").mkdir(parents=True)
++    (root / "logs" / "artifacts").mkdir()
++    env = MagicMock(is_mounted=False)
++    env.start = AsyncMock()
++    env.stop = AsyncMock()
++    env.apply_network_policy = AsyncMock()
++    env.run_healthcheck = AsyncMock()
++
++    async def upload_file(source_path, target_path):
++        target = root / target_path.lstrip("/")
++        target.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copyfile(source_path, target)
++
++    async def upload_dir(source_dir, target_dir):
++        shutil.copytree(source_dir, root / target_dir.lstrip("/"), dirs_exist_ok=True)
++
++    async def download_dir(source_dir, target_dir):
++        shutil.copytree(root / source_dir.lstrip("/"), target_dir, dirs_exist_ok=True)
++
++    async def execute(command, **kwargs):
++        command = command.replace("/tests", str(root / "tests")).replace(
++            "/logs", str(root / "logs")
++        )
++        process = await asyncio.create_subprocess_shell(
++            command,
++            env={**os.environ, "TOY_ROOT": str(root)},
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.PIPE,
++        )
++        stdout, stderr = await process.communicate()
++        return ExecResult(
++            return_code=process.returncode,
++            stdout=stdout.decode(),
++            stderr=stderr.decode(),
++        )
++
++    env.upload_file = AsyncMock(side_effect=upload_file)
++    env.upload_dir = AsyncMock(side_effect=upload_dir)
++    env.download_dir = AsyncMock(side_effect=download_dir)
++    env.exec = AsyncMock(side_effect=execute)
++    monkeypatch.setattr(
++        separate.EnvironmentFactory,
++        "create_environment_from_config",
++        lambda **kwargs: env,
++    )
++    result = await separate.verify_separately(
++        task,
++        config,
++        paths,
++        [separate.SubmissionArtifact(artifact, "/logs/artifacts/model.patch", False)],
++        5,
++        logging.getLogger(),
++    )
++    assert result.rewards == {"reward": expected}
++    assert "graded transferred submission" in paths.test_stdout_path.read_text()
++    assert not paths.reward_text_path.exists()
++    env.stop.assert_awaited_once_with(delete=True)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("content", ["-1", "0", "1", "nan", '{"partial": 1}'])
++@pytest.mark.parametrize("validate", [True, False])
++async def test_real_verifier_validates_primary_reward(tmp_path, content, validate):
++    paths = TrialPaths(tmp_path / "trial")
++    paths.mkdir()
++    env = MagicMock(is_mounted=True)
++    env.upload_dir = AsyncMock()
++
++    async def execute(command, **kwargs):
++        if not command.startswith("chmod"):
++            target = (
++                paths.reward_json_path
++                if content.startswith("{")
++                else paths.reward_text_path
++            )
++            target.write_text(content)
++        return ExecResult(return_code=0)
++
++    env.exec = AsyncMock(side_effect=execute)
++    task = make_task(tmp_path)
++    task.paths.tests_dir = tmp_path / "tests"
++    task.paths.test_path = task.paths.tests_dir / "test.sh"
++    verifier = Verifier(
++        task=task,
++        trial_paths=paths,
++        environment=env,
++        allowed_rewards={"reward": [0, 1]} if validate else None,
++    )
++    if validate and content not in ("0", "1"):
++        with pytest.raises(InvalidRewardError):
++            await verifier.verify()
++    else:
++        result = await verifier.verify()
++        assert result.rewards is not None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("recovers", [True, False])
++async def test_invalid_reward_retries_same_submission_only(
++    tmp_path, monkeypatch, recovers
++):
++    trial = Trial.__new__(Trial)
++    trial._task = make_task(tmp_path)
++    trial.config = make_config(tmp_path)
++    trial.config.verifier.allowed_rewards = {"reward": [0, 1]}
++    trial._trial_paths = TrialPaths(tmp_path / "trial")
++    trial._trial_paths.mkdir()
++    patch = trial._trial_paths.artifacts_dir / "model.patch"
++    patch.write_text("original committed submission")
++    trial._verifier_artifacts = [
++        separate.SubmissionArtifact(patch, "/logs/artifacts/model.patch", False)
++    ]
++    trial._verifier_timeout_sec = 5
++    trial._logger = logging.getLogger()
++    trial._result = SimpleNamespace(verifier_result=None)
++    created = []
++
++    def factory(**kwargs):
++        created.append(kwargs)
++        env = MagicMock(is_mounted=True)
++        env.start = AsyncMock()
++        env.stop = AsyncMock()
++        env.run_healthcheck = AsyncMock()
++        env.apply_network_policy = AsyncMock()
++        env.upload_file = AsyncMock()
++        env.upload_dir = AsyncMock()
++
++        async def execute(command, **kw):
++            if not command.startswith("chmod"):
++                vp = kwargs["trial_paths"]
++                vp.reward_text_path.write_text(
++                    "1" if recovers and len(created) == 2 else "-1"
++                )
++                vp.test_stdout_path.write_text(f"attempt {len(created)}")
++            return ExecResult(return_code=0)
++
++        env.exec = AsyncMock(side_effect=execute)
++        kwargs["fake_env"] = env
++        return env
++
++    trial._task.paths.tests_dir = tmp_path / "tests"
++    trial._task.paths.test_path = trial._task.paths.tests_dir / "test.sh"
++    monkeypatch.setattr(
++        separate.EnvironmentFactory, "create_environment_from_config", factory
++    )
++    if recovers:
++        await trial._verify_with_retry()
++        assert trial.result.verifier_result.rewards == {"reward": 1}
++    else:
++        with pytest.raises(InvalidRewardError):
++            await trial._verify_with_retry()
++        assert trial.result.verifier_result is None
++    assert len(created) == 2
++    assert created[0]["session_id"] != created[1]["session_id"]
++    assert created[0]["trial_paths"].reward_text_path.read_text() == "-1"
++    for attempt in created:
++        attempt["fake_env"].upload_file.assert_awaited_once_with(
++            source_path=patch, target_path="/logs/artifacts/model.patch"
++        )
++        attempt["fake_env"].stop.assert_awaited_once_with(delete=True)
++    assert patch.read_text() == "original committed submission"
++    assert "InvalidRewardError" in RetryConfig().exclude_exceptions

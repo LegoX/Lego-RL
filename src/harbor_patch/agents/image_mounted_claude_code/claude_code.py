@@ -22,6 +22,7 @@ import os
 from typing import Any
 
 from harbor.agents.custom.claude_code import CustomClaudeCode as _BaseCustomClaudeCode
+from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 
@@ -38,6 +39,24 @@ _OVERLONG_TOTAL_TOKENS = int(os.environ.get("HARBOR_TRIAL_OVERLONG_TOTAL_TOKENS"
 
 class ClaudeCode(_BaseCustomClaudeCode):
     """CustomClaudeCode + ``metadata['all_messages']`` / ``['tools']``."""
+
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        # Opt in for offline evaluations; leave training prompts and sandboxes alone.
+        if self._get_env("HARBOR_EVAL_CC_SUBMISSION_GUARD") == "1":
+            result = await self._exec_as_agent_with_env_priority(
+                environment,
+                command=(
+                    "cd /app && "
+                    "(git config user.name >/dev/null || git config --local user.name 'Harbor Eval') && "
+                    "(git config user.email >/dev/null || git config --local user.email 'eval@harbor.invalid')"
+                ),
+                env={},
+            )
+            if result.return_code != 0:
+                raise RuntimeError(f"Git identity setup failed: {result.stderr}")
+        await super().run(instruction, environment, context)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         super().populate_context_post_run(context)

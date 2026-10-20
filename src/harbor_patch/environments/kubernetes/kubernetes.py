@@ -539,6 +539,17 @@ def _sanitize_pod_name(session_id: str) -> str:
     return name[: 63 - len(suffix) - 1].strip("-") + "-" + suffix
 
 
+def _label_value(value: str) -> str:
+    """Keep valid labels unchanged; encode package names and long identifiers."""
+    if len(value) <= 63 and (
+        not value or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?", value)
+    ):
+        return value
+    prefix = re.sub(r"[^A-Za-z0-9_.-]", "-", value)[:54].strip("-_.") or "value"
+    suffix = hashlib.sha256(value.encode()).hexdigest()[:8]
+    return f"{prefix}-{suffix}"
+
+
 def _coerce_host_path_mounts(raw) -> list[dict]:
     """
     Normalize the ``host_path_mounts`` constructor argument.
@@ -773,7 +784,12 @@ class KubernetesEnvironment(BaseEnvironment):
         # pure redundant work — and at scale (~100 pods/step) it hammered the
         # node-local ext4 with conda/git/unzip writes (rename-lock + jbd2 journal
         # contention -> agents block on I/O -> GPUs idle).
-        self._skip_dockerfile_run = False
+        self._preserve_prebuilt_image = os.environ.get(
+            "HARBOR_K8S_SKIP_DOCKERFILE", "false"
+        ).lower() in {"1", "true", "yes", "on"}
+        self._skip_dockerfile_run = self._preserve_prebuilt_image
+        if self._skip_dockerfile_run and not task_env_config.docker_image:
+            raise ValueError("HARBOR_K8S_SKIP_DOCKERFILE requires a prebuilt docker_image")
 
         super().__init__(
             environment_dir=environment_dir,
@@ -1092,7 +1108,7 @@ class KubernetesEnvironment(BaseEnvironment):
         if self.cpu_limit:
             limits["cpu"] = self.cpu_limit
 
-        # Mount /logs and /tmp as emptyDir volumes so writes bypass the
+        # Mount /logs and (for legacy environments) /tmp as emptyDir so writes bypass the
         # container's overlayfs layer, eliminating lock contention when many
         # pods run concurrently.  This mirrors the Docker backend which
         # bind-mounts /logs/* directly to the host filesystem.
@@ -1102,15 +1118,21 @@ class KubernetesEnvironment(BaseEnvironment):
                 name="logs-dir",
                 empty_dir=k8s_client.V1EmptyDirVolumeSource(),
             ),
-            k8s_client.V1Volume(
-                name="tmp-dir",
-                empty_dir=k8s_client.V1EmptyDirVolumeSource(),
-            ),
         ]
         volume_mounts: list[k8s_client.V1VolumeMount] = [
             k8s_client.V1VolumeMount(name="logs-dir", mount_path="/logs"),
-            k8s_client.V1VolumeMount(name="tmp-dir", mount_path="/tmp"),
         ]
+        # Complete task images may bake offline dependencies under /tmp, e.g.
+        # Goreleaser's GOMODCACHE/GOCACHE. An emptyDir would hide those files.
+        if not self._preserve_prebuilt_image:
+            volumes.append(
+                k8s_client.V1Volume(
+                    name="tmp-dir", empty_dir=k8s_client.V1EmptyDirVolumeSource(),
+                )
+            )
+            volume_mounts.append(
+                k8s_client.V1VolumeMount(name="tmp-dir", mount_path="/tmp")
+            )
 
         # Optional hostPath volumes (e.g. offline /opt/rebench-v2 source on
         # 240 cluster where pods cannot reach github.com to clone it).
@@ -1187,6 +1209,10 @@ class KubernetesEnvironment(BaseEnvironment):
             ),
             k8s_client.V1EnvVar(name="TMPDIR", value="/tmp"),
         ]
+        if self._preserve_prebuilt_image:
+            # Let Kubernetes inherit the image's PATH, including task-specific
+            # venv/toolchain directories such as /opt/venv/bin and /root/.cargo/bin.
+            container_env = [entry for entry in container_env if entry.name != "PATH"]
 
         # Opt-in fix for cwd-shadowing of the runtime interpreter. The mounted
         # runtime detection probe (and the agent run) execute with cwd=/testbed,
@@ -1343,8 +1369,8 @@ class KubernetesEnvironment(BaseEnvironment):
 
         labels = {
             "app": "harbor-sandbox",
-            "session": self.session_id[:63],
-            "environment": self.environment_name[:63],
+            "session": self.session_id,
+            "environment": self.environment_name,
             # Owner metadata lets external tooling find orphans if both the
             # in-process registry and activeDeadlineSeconds somehow miss them.
             "harbor-owner-pid": self._owner_pid[:63],
@@ -1353,6 +1379,10 @@ class KubernetesEnvironment(BaseEnvironment):
         if self.pod_name_prefix:
             # Selectable via `kubectl -l harbor-run=<prefix>` for targeted cleanup.
             labels["harbor-run"] = self.pod_name_prefix[:63]
+        labels = {key: _label_value(value) for key, value in labels.items()}
+        annotations = {"harbor/environment-name": self.environment_name}
+        if self._egress_isolation_enabled:
+            annotations["kubectl.kubernetes.io/default-container"] = "main"
 
         return k8s_client.V1Pod(
             api_version="v1",
@@ -1364,11 +1394,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 # With the egress sidecar the pod is multi-container; pin the
                 # default exec target to "main" so exec(container=None) (agent
                 # commands, git shim) deterministically hits the task container.
-                annotations=(
-                    {"kubectl.kubernetes.io/default-container": "main"}
-                    if self._egress_isolation_enabled
-                    else None
-                ),
+                annotations=annotations,
             ),
             spec=k8s_client.V1PodSpec(
                 containers=[
@@ -1508,7 +1534,7 @@ class KubernetesEnvironment(BaseEnvironment):
         if self._skip_dockerfile_run:
             logger.info(
                 "KubernetesEnvironment: skipping Dockerfile RUN re-execution — "
-                "prebuilt OpenSWE image already contains the full environment."
+                "prebuilt image already contains the full environment."
             )
             return
 
@@ -1959,7 +1985,8 @@ class KubernetesEnvironment(BaseEnvironment):
 
         # On Alpine (musl) containers, install Node.js and build tools so
         # that agent setup (nvm) does not fail.
-        await self._ensure_musl_compatibility()
+        if not self._preserve_prebuilt_image:
+            await self._ensure_musl_compatibility()
 
         # Create required directories and make them world-writable so
         # non-root agent/verifier users can write to them.
@@ -2193,9 +2220,8 @@ true
     def _build_egress_iptables(self, policy: NetworkPolicy) -> str:
         """Return the sh script (run in the netadmin sidecar) that enforces
         ``policy`` on the shared pod netns. PUBLIC flushes to allow-all;
-        ALLOWLIST allows lo + DNS + the private LAN (RFC1918: LLM proxy /
-        registry / cluster services) + any explicit allowed_hosts and DROPs the
-        rest (public internet = the github/raw/pypi answer-fetch vector);
+        ALLOWLIST allows lo + DNS + explicit allowed_hosts. The legacy private
+        LAN exception is disabled by HARBOR_K8S_ALLOW_PRIVATE_NETWORK=false;
         NO_NETWORK allows only lo + DNS."""
         dns = shlex.quote(self._CLUSTER_DNS_IP)
         if policy.network_mode == NetworkMode.PUBLIC:
@@ -2214,8 +2240,11 @@ true
         if policy.network_mode == NetworkMode.ALLOWLIST:
             # Private LAN is always reachable: the in-cluster LLM proxy (training
             # node), the shared registry, and cluster services all live here.
-            for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
-                lines.append(f"iptables -A OUTPUT -d {cidr} -j ACCEPT")
+            if os.environ.get("HARBOR_K8S_ALLOW_PRIVATE_NETWORK", "true").lower() in {
+                "1", "true", "yes", "on"
+            }:
+                for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
+                    lines.append(f"iptables -A OUTPUT -d {cidr} -j ACCEPT")
             # Explicit extra hosts (e.g. a public LLM endpoint), resolved to IPv4.
             for host in policy.allowed_hosts:
                 h = shlex.quote(host)
@@ -2223,13 +2252,19 @@ true
                     f"for ip in $(getent ahostsv4 {h} 2>/dev/null | awk '{{print $1}}' | sort -u); "
                     f'do iptables -A OUTPUT -d "$ip" -j ACCEPT; done'
                 )
-        # NO_NETWORK: only lo + DNS above. Then drop everything else.
+        # Fail fast when fully offline, like a disconnected Docker network.
+        # Silently dropping optional browser assets can stall local test pages
+        # until their runner's session timeout (e.g. Vitest's external fonts).
+        if policy.network_mode == NetworkMode.NO_NETWORK:
+            lines.append("iptables -A OUTPUT -j REJECT")
         lines.append("iptables -P OUTPUT DROP")
         # No IPv6 allowlist support -> block v6 egress entirely (keep lo).
         lines.append(
-            "ip6tables -F OUTPUT 2>/dev/null; ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null; "
-            "ip6tables -P OUTPUT DROP 2>/dev/null; true"
+            "ip6tables -F OUTPUT 2>/dev/null; ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null"
         )
+        if policy.network_mode == NetworkMode.NO_NETWORK:
+            lines.append("ip6tables -A OUTPUT -j REJECT 2>/dev/null")
+        lines.append("ip6tables -P OUTPUT DROP 2>/dev/null; true")
         return "; ".join(lines)
 
     async def apply_network_policy(self, policy: NetworkPolicy) -> None:
@@ -2246,6 +2281,11 @@ true
                 )
             return
         script = self._build_egress_iptables(policy)
+        strict = os.environ.get("HARBOR_K8S_STRICT_NETWORK_POLICY", "false").lower() in {
+            "1", "true", "yes", "on"
+        }
+        if strict:
+            script = "set -e; " + script
         try:
             result = await self.exec(
                 script,
@@ -2254,6 +2294,10 @@ true
                 timeout_sec=60,
             )
             if result.return_code != 0:
+                if strict:
+                    raise RuntimeError(
+                        f"Failed to enforce {policy.network_mode.value}: {result.stderr}"
+                    )
                 self.logger.warning(
                     "[egress] apply_network_policy(%s) rc=%s in %s: %s",
                     policy.network_mode.value,
@@ -2268,7 +2312,9 @@ true
                     self.pod_name,
                 )
         except Exception as e:
-            # Never fail a rollout because egress hardening could not be applied.
+            # Preserve best-effort rollout behavior unless strict eval is requested.
+            if strict:
+                raise
             self.logger.warning(
                 f"[egress] could not apply network policy in {self.pod_name}: {e}"
             )
@@ -2396,6 +2442,14 @@ true
                 user_arg = shlex.quote(user)
             # Use su (not su -) to preserve the working directory
             full_command = f"su {user_arg} -s /bin/{command_shell} -c {shlex.quote(full_command)}"
+
+        # CRI exec may inherit a low soft limit (1024) even when the hard limit
+        # permits more. Database-backed tasks can exhaust it during verification.
+        nofile = os.environ.get("HARBOR_K8S_NOFILE", "").strip()
+        if nofile and (container is None or container == self._MAIN_CONTAINER_NAME):
+            if not nofile.isascii() or not nofile.isdecimal() or int(nofile) <= 0:
+                raise ValueError("HARBOR_K8S_NOFILE must be a positive integer")
+            full_command = f"ulimit -S -n {int(nofile)} && {full_command}"
 
         exec_command = ["sh", "-c", full_command]
         # print(f'[DEBUG] k8s exec command: {exec_command}')
@@ -2557,6 +2611,21 @@ true
             f"Container not ready for exec after {max_attempts} attempts"
         )
 
+    def _upload_tar_stream(self, resp, data: bytes) -> None:
+        """Wait for remote extraction to finish before exposing uploaded files."""
+        try:
+            resp.write_stdin(data)
+            resp.run_forever(timeout=120)
+            if resp.is_open():
+                raise TimeoutError(f"Upload extraction timed out in pod {self.pod_name}")
+            if resp.returncode != 0:
+                raise RuntimeError(
+                    f"Upload extraction failed in pod {self.pod_name} "
+                    f"({resp.returncode}): {resp.read_stderr()}"
+                )
+        finally:
+            resp.close()
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -2594,9 +2663,7 @@ true
             _preload_content=False,
         )
 
-        resp.write_stdin(tar_buffer.read())
-        resp.run_forever(timeout=1)
-        resp.close()
+        await asyncio.to_thread(self._upload_tar_stream, resp, tar_buffer.read())
 
     @retry(
         stop=stop_after_attempt(5),
@@ -2659,13 +2726,7 @@ true
                 )
             raise
 
-        try:
-            resp.write_stdin(tar_buffer.read())
-        except Exception as e:
-            raise RuntimeError(f"Failed to write tar data to pod {self.pod_name}: {e}")
-
-        resp.run_forever(timeout=1)
-        resp.close()
+        await asyncio.to_thread(self._upload_tar_stream, resp, tar_buffer.read())
         self.logger.debug(
             f"Successfully uploaded {len(files_to_upload)} files ({tar_size} bytes) to {target_dir}"
         )
