@@ -1,0 +1,29 @@
+---
+title: Rollout context and training column limits
+description: Preserve complete SWE contexts and diagnose training segments that exceed the tensor budget.
+---
+
+`rollout.prompt_length` sizes the training prompt column. It is not the model's
+rollout context window. A long initial request or a rewritten history can exceed
+that column even when native compaction is disabled.
+
+The SWE agent loop preserves the complete rendered prompt. This requires
+`verl_preserve_chat_template_context.patch`, included at the end of the default
+installer patch chain. Existing installations must apply that patch to their
+VeRL checkout; explicit `VERL_PATCHES` overrides must include it too. Restart
+workers when adopting the correction so they import the updated dependency.
+
+When packing a training segment, excess prompt tokens move into the response
+column with action mask and logprob set to zero. The concatenated sequence and
+all sampled action tokens remain intact. For example, a 55,000-token prompt and
+6,000-token continuation need 21,000 response positions when the prompt column
+is 40,000 tokens wide.
+
+A segment that exceeds the response-column budget now raises `ValueError`,
+including its episode ID, segment index and required width. Previously the loop
+clipped response tokens, masks and logprobs, and could discard a segment whose
+conditioning history consumed the whole column. This validation happens before
+`longest` selection as well as for `all`: an oversized segment cannot silently
+change which sample is selected. Increase the training tensor budget or adjust
+segment boundaries before retrying. Model context-window and generation limits
+continue to apply independently.

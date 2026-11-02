@@ -200,11 +200,13 @@ def test_unsupported_episode_reward_semantics_fail_before_updates(override):
         expand_episode_segments(data, cfg)
 
 
-def test_changed_context_can_overflow_prompt_region_without_losing_prefix(tmp_path):
+@pytest.mark.parametrize("selection", ["longest", "all"])
+@pytest.mark.parametrize("response_width", [4, 10])
+def test_changed_context_can_overflow_prompt_region_without_losing_prefix(tmp_path, selection, response_width):
     loop = object.__new__(BuiltinSWEAgentLoop)
     loop.prompt_length = 2
-    loop.response_length = 10
-    loop.trajectory_selection = "all"
+    loop.response_length = response_width
+    loop.trajectory_selection = selection
     loop._max_turns = 0
     loop._tool_parser_name = "hermes"
     definition = SimpleNamespace(name="test", protocol="openai")
@@ -226,7 +228,7 @@ def test_changed_context_can_overflow_prompt_region_without_losing_prefix(tmp_pa
         {},
         SimpleNamespace(definition=definition, source="default"),
     )
-    out = outputs[0]
+    out = outputs[0] if isinstance(outputs, list) else outputs
     assert out.prompt_ids + out.response_ids == [1, 50, 30, 4, 40, 41]
     assert out.response_mask == [0, 0, 1, 1]
     assert out.response_logprobs == [0, 0, -0.3, -0.4]
@@ -681,7 +683,7 @@ def test_ppo_loss_passes_episode_denominators_to_policy_entropy_and_kl(monkeypat
 
 
 @pytest.mark.parametrize("selection", ["longest", "all"])
-def test_training_budget_cannot_hide_a_usable_segment(selection, tmp_path, monkeypatch):
+def test_training_budget_rejects_tail_loss_before_selection(selection, tmp_path):
     loop = object.__new__(BuiltinSWEAgentLoop)
     loop.prompt_length, loop.response_length = 2, 4
     loop.trajectory_selection = selection
@@ -704,30 +706,13 @@ def test_training_budget_cannot_hide_a_usable_segment(selection, tmp_path, monke
         "response_logprobs": [-0.1, -0.2],
         "response_routing": [None, None],
     }
-    result = loop._outputs_from_segments(
-        {"episode_id": "e", "trajectory_segments": [usable, hidden]},
-        1,
-        "agent_completed",
-        {},
-        {},
-        SimpleNamespace(definition=definition, source="default"),
-    )
-    result = result if isinstance(result, list) else [result]
-    assert len(result) == 1
-    assert result[0].response_ids == [10]
-    assert result[0].reward_score == 1
-    monkeypatch.setenv("HARBOR_EMPTY_RESPONSE_MASK_ONE", "1")
-    empty = loop._outputs_from_segments(
-        {"episode_id": "e", "trajectory_segments": [hidden]},
-        1,
-        "agent_completed",
-        {},
-        {},
-        SimpleNamespace(definition=definition, source="default"),
-    )
-    assert empty.response_mask == [0]
-    assert empty.reward_score == 1
-    assert empty.extra_fields["termination_reason"] == "overlong"
+    for segments in ([usable, hidden], [hidden]):
+        with pytest.raises(ValueError, match="refusing to truncate"):
+            loop._outputs_from_segments(
+                {"episode_id": "e", "trajectory_segments": segments},
+                1, "agent_completed", {}, {},
+                SimpleNamespace(definition=definition, source="default"),
+            )
 
 
 def test_validation_reward_survives_an_empty_training_mask():

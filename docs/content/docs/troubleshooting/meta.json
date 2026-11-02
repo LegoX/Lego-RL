@@ -4,6 +4,7 @@
         "---Startup---",
         "training-startup",
         "---Training runtime---",
+        "context-truncation",
         "rewards-and-throughput",
         "async-val-deadlock",
         "---val & eval scores---",

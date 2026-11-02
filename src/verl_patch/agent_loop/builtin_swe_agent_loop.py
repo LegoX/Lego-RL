@@ -196,6 +196,10 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
     ``max_retries``) are configured at the loop-item level.
     """
 
+    # Rollout context is bounded by the model window, not a training column.
+    # Requires verl_preserve_chat_template_context.patch in the installed VeRL.
+    preserve_chat_template_context = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -445,9 +449,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         if session_meta.get("disable_proxy_trajectory"):
             segments = []
         selection = getattr(self, "trajectory_selection", "longest")
-        # Select longest only after fitting the training budget. A rewritten
-        # prompt can otherwise consume the entire response region and hide a
-        # shorter segment that still has trainable actions.
+        # Validate complete segments before selection so an oversized rewritten
+        # context cannot silently erase actions or change which segment wins.
         selected = select_trajectories(segments, "all")
         if not selected:
             return self._make_empty_output(
@@ -489,20 +492,23 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 raise ValueError("Invalid segment token/mask/routing alignment")
             if lp is None or len(lp) != len(response):
                 raise ValueError("Training segments require aligned behavior logprobs from the engine")
+            required = max(0, len(prompt) - self.prompt_length) + len(response)
+            if required > self.response_length:
+                raise ValueError(
+                    f"Episode {session_meta.get('episode_id')!r} segment {index} needs "
+                    f"{required} response positions after context relocation, but "
+                    f"response_length={self.response_length}; refusing to truncate "
+                    "sampled tokens or their context. Adjust segment boundaries "
+                    "or the training tensor budget before continuing."
+                )
             segment_reason = reason
-            if (
-                reason == TerminationReason.AGENT_COMPLETED
-                and max(0, len(prompt) - self.prompt_length) + len(response) > self.response_length
-            ):
-                segment_reason = TerminationReason.OVERLONG
-            # Rewritten contexts can exceed prompt_length. Place the overflow
-            # in the response region with mask=0, retaining the entire prefix.
+            # Relocate conditioning tokens without changing the sampled sequence.
             context = prompt[self.prompt_length :]
             prompt = prompt[: self.prompt_length]
-            response = (context + response)[: self.response_length]
-            mask = ([0] * len(context) + mask)[: self.response_length]
-            lp = ([0.0] * len(context) + lp)[: self.response_length]
-            routing = ([None] * len(context) + routing)[: self.response_length]
+            response = context + response
+            mask = [0] * len(context) + mask
+            lp = [0.0] * len(context) + lp
+            routing = [None] * len(context) + routing
             if not any(mask):
                 continue
             step = kwargs.get("global_steps", 0)
