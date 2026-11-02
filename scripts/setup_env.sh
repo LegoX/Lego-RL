@@ -61,7 +61,7 @@ HARBOR_PATCH="${HARBOR_PATCH:-$REPO_ROOT/patches/harbor.patch}"
 #                            DIS preset, reward placement, trajectory filter v6
 #   verl_segments_7aed6b23.patch  Context segments, episode GRPO, batching and loss normalization
 # VERL_PATCH (singular) is kept as an alias for a single-patch override.
-VERL_PATCHES="${VERL_PATCHES:-${VERL_PATCH:-$REPO_ROOT/patches/verl_7aed6b23.patch $REPO_ROOT/patches/verl_sao_7aed6b23.patch $REPO_ROOT/patches/verl_segments_7aed6b23.patch}}"
+VERL_PATCHES="${VERL_PATCHES:-${VERL_PATCH:-$REPO_ROOT/patches/verl_7aed6b23.patch $REPO_ROOT/patches/verl_sao_7aed6b23.patch $REPO_ROOT/patches/verl_segments_7aed6b23.patch $REPO_ROOT/patches/verl_preserve_chat_template_context.patch}}"
 VLLM_PATCH="${VLLM_PATCH:-$REPO_ROOT/patches/vllm_2a69949b.patch}"
 
 # Python / venv / base dependency lock
