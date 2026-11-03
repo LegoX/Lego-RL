@@ -1,29 +1,47 @@
 ---
-title: Rollout context and training column limits
-description: Preserve complete SWE contexts and diagnose training segments that exceed the tensor budget.
+title: Rollout context and training sequence budgets
+description: Preserve complete SWE contexts and share the training sequence budget.
 ---
 
-`rollout.prompt_length` sizes the training prompt column. It is not the model's
-rollout context window. A long initial request or a rewritten history can exceed
-that column even when native compaction is disabled.
+`rollout.prompt_length` sizes the traditional training prompt column; it is not
+the rollout context window. SWE loops preserve the complete rendered input,
+including long initial requests and histories rebuilt after compaction.
 
-The SWE agent loop preserves the complete rendered prompt. This requires
-`verl_preserve_chat_template_context.patch`, included at the end of the default
-installer patch chain. Existing installations must apply that patch to their
-VeRL checkout; explicit `VERL_PATCHES` overrides must include it too. Restart
-workers when adopting the correction so they import the updated dependency.
+## Shared sequence budget
 
-When packing a training segment, excess prompt tokens move into the response
-column with action mask and logprob set to zero. The concatenated sequence and
-all sampled action tokens remain intact. For example, a 55,000-token prompt and
-6,000-token continuation need 21,000 response positions when the prompt column
-is 40,000 tokens wide.
+Enable `VERL_AGENT_FULL_SEQUENCE_TRAINING=1` on every Ray worker to use the full
+sequence layout for text trajectories. The default installer includes both
+`verl_preserve_chat_template_context.patch` and `verl_full_sequence_training.patch`.
+Existing installations and explicit patch-list overrides must apply both, and
+workers must restart to import them. This mode currently rejects multimodal data.
 
-A segment that exceeds the response-column budget now raises `ValueError`,
-including its episode ID, segment index and required width. Previously the loop
-clipped response tokens, masks and logprobs, and could discard a segment whose
-conditioning history consumed the whole column. This validation happens before
-`longest` selection as well as for `all`: an oversized segment cannot silently
-change which sample is selected. Increase the training tensor budget or adjust
-segment boundaries before retrying. Model context-window and generation limits
-continue to apply independently.
+The total budget is `prompt_length + response_length`, capped by `max_model_len`
+when set. One existing prompt token is retained as a causal anchor; remaining
+prompt tokens move into the response column with zero action mask/logprob.
+Token order, action masks, sampled behavior logprobs and absolute routing positions
+are retained. The layout changes storage, not generation limits or sampled actions.
+
+For a 160,000-token budget the columns are 1 and 159,999 positions. A recorded
+8,114-token prompt plus 135,772 response positions fits: the complete sequence
+has 143,886 tokens. A fixed 40,000/120,000 split would incorrectly reject it.
+Response positions include tool results and other zero-loss conditioning tokens.
+
+If any segment exceeds the total budget, the whole episode becomes an audited
+zero-action-mask placeholder with reason `training_sequence_overflow`. It is
+neutralized before GRPO statistics; its original verifier reward remains in the
+trial audit record. Segments are never partially clipped to retain the episode
+reward. Token/mask/logprob/routing alignment errors remain explicit errors.
+
+Length metrics retain the original prompt/response boundaries. In this mode,
+`clip_ratio` measures total-budget saturation, not actual truncation; use
+`training_sequence_length/{mean,max,capacity_ratio,at_capacity_ratio}` to inspect
+budget usage.
+
+## Traditional columns
+
+When the full-sequence switch is off, original column widths remain in use.
+Prompt overflow relocates into the response column with zero action mask/logprob.
+Packing rejects a segment that cannot fit instead of truncating its tail, before
+both `longest` and `all` selection. Enable shared sequence training when a valid
+total length cannot fit those fixed columns. Other loops retain their existing
+render behavior unless they explicitly opt into context preservation.

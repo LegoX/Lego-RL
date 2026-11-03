@@ -102,6 +102,10 @@ _PROXY_METRIC_KEYS = (
 )
 
 from omegaconf import OmegaConf
+from verl.experimental.agent_loop.sequence_layout import (
+    full_sequence_training_enabled,
+    training_sequence_length,
+)
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.utils.profiler import simple_timer
 
@@ -448,6 +452,30 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         segments = session_meta.get("trajectory_segments", [])
         if session_meta.get("disable_proxy_trajectory"):
             segments = []
+        full_sequence = full_sequence_training_enabled()
+        if full_sequence:
+            budget = training_sequence_length(self.rollout_config)
+            for segment in segments:
+                count = len(segment["response_ids"])
+                if any(len(segment[key]) != count for key in
+                       ("response_mask", "response_logprobs", "response_routing")):
+                    raise ValueError("Invalid segment token/mask/logprob/routing alignment")
+            lengths = [len(s["prompt_ids"]) + len(s["response_ids"]) for s in segments]
+            oversized = [n for n in lengths if n > budget]
+            if oversized:
+                overflow_metrics = dict(metrics)
+                overflow_metrics.update(
+                    training_sequence_overflow=1.0,
+                    training_overflow_segments=float(len(oversized)),
+                    training_overflow_max_tokens=float(max(oversized)),
+                )
+                out = self._make_empty_output(
+                    kwargs, metrics=overflow_metrics, session_meta=session_meta,
+                    reason=TerminationReason.TRAINING_SEQUENCE_OVERFLOW,
+                    harness_selection=harness_selection, reward=reward,
+                )
+                out.response_mask = [0] * len(out.response_ids)
+                return out
         selection = getattr(self, "trajectory_selection", "longest")
         # Validate complete segments before selection so an oversized rewritten
         # context cannot silently erase actions or change which segment wins.
@@ -493,7 +521,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             if lp is None or len(lp) != len(response):
                 raise ValueError("Training segments require aligned behavior logprobs from the engine")
             required = max(0, len(prompt) - self.prompt_length) + len(response)
-            if required > self.response_length:
+            if not full_sequence and required > self.response_length:
                 raise ValueError(
                     f"Episode {session_meta.get('episode_id')!r} segment {index} needs "
                     f"{required} response positions after context relocation, but "
@@ -503,8 +531,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 )
             segment_reason = reason
             # Relocate conditioning tokens without changing the sampled sequence.
-            context = prompt[self.prompt_length :]
-            prompt = prompt[: self.prompt_length]
+            context = [] if full_sequence else prompt[self.prompt_length :]
+            prompt = prompt if full_sequence else prompt[: self.prompt_length]
             response = context + response
             mask = [0] * len(context) + mask
             lp = [0.0] * len(context) + lp
@@ -1026,6 +1054,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             reason
             if reason in {
                 TerminationReason.OVERLONG,
+                TerminationReason.TRAINING_SEQUENCE_OVERFLOW,
                 TerminationReason.MAX_TURNS_REACHED,
                 TerminationReason.TIMEOUT,
             }
