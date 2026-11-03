@@ -1,0 +1,227 @@
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -45,6 +45,9 @@
+ from tensordict import TensorDict
+ from transformers import AutoProcessor, AutoTokenizer
+
++from verl.experimental.agent_loop.sequence_layout import (
++    full_sequence_training_enabled, normalize_training_output, training_tensor_widths,
++)
+ from verl.experimental.agent_loop.utils import resolve_config_path
+ from verl.protocol import DataProto
+ from verl.tools.tool_registry import load_all_tools
+@@ -694,6 +697,8 @@
+
+     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+         """Perform post-processing operations on the output of each individual agent loop."""
++        output = normalize_training_output(output, self.rollout_config)
++        prompt_width, response_width = training_tensor_widths(self.rollout_config)
+         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+
+         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
+@@ -719,28 +724,28 @@
+         # TODO(wuxibin): remove padding and use tensordict.
+         prompt_output = self._pad_token_ids(
+             output.prompt_ids,
+-            max_length=self.rollout_config.prompt_length,
++            max_length=prompt_width,
+             padding_side="left",
+             return_attention_mask=True,
+         )
+
+         response_output = self._pad_token_ids(
+             output.response_ids,
+-            max_length=self.rollout_config.response_length,
++            max_length=response_width,
+             padding_side="right",
+             return_attention_mask=True,
+         )
+
+         response_mask_output = self._pad_token_ids(
+             output.response_mask,
+-            max_length=self.rollout_config.response_length,
++            max_length=response_width,
+             padding_side="right",
+             return_attention_mask=False,
+         )
+
+         response_logprobs = None
+         if output.response_logprobs is not None:
+-            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
++            pad_size = response_width - len(output.response_logprobs)
+             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+
+         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
+@@ -1029,7 +1034,20 @@
+         optional_outputs = {}
+         if inputs[0].response_logprobs is not None:
+             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+-        if inputs[0].routed_experts is not None:
++        if full_sequence_training_enabled():
++            route_template = next((item.routed_experts for item in inputs
++                                   if item.routed_experts is not None), None)
++            if route_template is not None:
++                routes = []
++                for item in inputs:
++                    route = item.routed_experts
++                    if route is None:
++                        if item.response_mask.any():
++                            raise ValueError("Trainable full-sequence row is missing routing metadata")
++                        route = torch.zeros_like(route_template)
++                    routes.append(route)
++                optional_outputs["routed_experts"] = torch.cat(routes, dim=0)
++        elif inputs[0].routed_experts is not None:
+             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
+--- /dev/null
++++ b/verl/experimental/agent_loop/sequence_layout.py
+@@ -0,0 +1,73 @@
++"""Loss-preserving full-sequence layout for text agent training.
++
++The rollout limits remain unchanged. In full-sequence mode the trainer keeps
++one existing prefix token as the causal anchor and puts all remaining tokens
++in the response tensor. Copied context has loss_mask=0. Thus any nonempty-prefix
++sequence within the total budget fits, without moving sampled actions out of
++loss or adding tokens. All workers use the same widths, including empty rows.
++"""
++import os
++
++
++class TrainingSequenceOverflow(ValueError):
++    """A complete sequence exceeds the configured training context window."""
++
++
++def full_sequence_training_enabled():
++    return os.environ.get("VERL_AGENT_FULL_SEQUENCE_TRAINING", "0") == "1"
++
++
++def training_sequence_length(config):
++    columns = int(config.prompt_length) + int(config.response_length)
++    model_limit = getattr(config, "max_model_len", None)
++    budget = min(columns, int(model_limit)) if model_limit is not None else columns
++    if budget < 2:
++        raise ValueError("Full-sequence training requires at least two token positions")
++    return budget
++
++
++def training_tensor_widths(config):
++    if full_sequence_training_enabled():
++        return 1, training_sequence_length(config) - 1
++    return int(config.prompt_length), int(config.response_length)
++
++
++def normalize_training_output(output, config):
++    if not full_sequence_training_enabled():
++        return output
++    if output.multi_modal_data:
++        raise ValueError("Full-sequence agent layout currently supports text trajectories only")
++    prompt = list(output.prompt_ids)
++    response = list(output.response_ids)
++    if not prompt:
++        raise ValueError("Full-sequence training requires an existing causal prefix token")
++    if len(output.response_mask) != len(response):
++        raise ValueError("Training response token/mask lengths differ")
++    if output.response_logprobs is not None and len(output.response_logprobs) != len(response):
++        raise ValueError("Training response token/logprob lengths differ")
++    total = len(prompt) + len(response)
++    limit = training_sequence_length(config)
++    if total > limit:
++        raise TrainingSequenceOverflow(f"Complete training sequence has {total} tokens; limit={limit}")
++    if output.routed_experts is not None and output.routed_experts.shape[0] != total:
++        raise ValueError("Full-sequence routing must cover the original complete token sequence")
++    context = prompt[1:]
++    metrics = output.metrics.model_copy(deep=True)
++    metrics.training_original_prompt_tokens = float(len(prompt))
++    metrics.training_original_response_positions = float(len(response))
++    metrics.training_sequence_tokens = float(total)
++    metrics.training_context_positions = float(len(context))
++    extra = dict(output.extra_fields)
++    extra["training_sequence_layout"] = "full_sequence"
++    extra["training_original_prompt_tokens"] = len(prompt)
++    extra["training_original_response_positions"] = len(response)
++    # Full-sequence IDs and the absolute R3 predictor positions do not move.
++    return output.model_copy(update={
++        "prompt_ids": prompt[:1],
++        "response_ids": context + response,
++        "response_mask": [0] * len(context) + list(output.response_mask),
++        "response_logprobs": None if output.response_logprobs is None else
++            [0.0] * len(context) + list(output.response_logprobs),
++        "metrics": metrics,
++        "extra_fields": extra,
++    })
+--- a/verl/trainer/ppo/metric_utils.py
++++ b/verl/trainer/ppo/metric_utils.py
+@@ -66,6 +66,16 @@
+             - prompt_length: Tensor of prompt lengths for each item in the batch
+             - response_length: Tensor of response lengths for each item in the batch
+     """
++    if "training_original_prompt_tokens" in batch.non_tensor_batch:
++        device = batch.batch["attention_mask"].device
++        return dict(
++            prompt_length=torch.as_tensor(
++                batch.non_tensor_batch["training_original_prompt_tokens"].astype(np.int64),
++                device=device, dtype=torch.float32),
++            response_length=torch.as_tensor(
++                batch.non_tensor_batch["training_original_response_positions"].astype(np.int64),
++                device=device, dtype=torch.float32),
++        )
+     if "prompt_length" in batch.batch and "response_length" in batch.batch:
+         return dict(
+             prompt_length=batch.batch["prompt_length"],
+@@ -125,6 +135,12 @@
+     prompt_length = response_info["prompt_length"]
+     response_length = response_info["response_length"]
+
++    full_sequence_layout = "training_original_prompt_tokens" in batch.non_tensor_batch
++    if full_sequence_layout:
++        sequence_capacity = batch.batch["input_ids"].shape[-1]
++        max_prompt_length = sequence_capacity - response_length
++        max_response_length = sequence_capacity - prompt_length
++
+     aborted_mask = (response_length == 0).bool()
+     non_aborted_mask = ~aborted_mask
+
+@@ -176,7 +192,7 @@
+         non_aborted_response_length_max = torch.max(non_aborted_response_length).detach().item()
+         non_aborted_response_length_min = torch.min(non_aborted_response_length).detach().item()
+         non_aborted_response_length_clip_ratio = (
+-            torch.mean(torch.eq(non_aborted_response_length, max_response_length).float()).detach().item()
++            torch.mean(torch.eq(non_aborted_response_length, max_response_length[non_aborted_mask] if full_sequence_layout else max_response_length).float()).detach().item()
+         )
+     else:
+         logger.warning("All samples are aborted, returning default response length metrics")
+@@ -252,6 +268,15 @@
+         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+     }
+
++    if full_sequence_layout:
++        total_length = prompt_length + response_length
++        metrics.update({
++            "training_sequence_length/mean": total_length.mean().item(),
++            "training_sequence_length/max": total_length.max().item(),
++            "training_sequence_length/capacity_ratio": (total_length / sequence_capacity).mean().item(),
++            "training_sequence_length/at_capacity_ratio": (total_length == sequence_capacity).float().mean().item(),
++        })
++
+     # multi-turn conversation
+     if "__num_turns__" in batch.non_tensor_batch:
+         num_turns = batch.non_tensor_batch["__num_turns__"]
+--- a/verl/trainer/ppo/trajectory_filter.py
++++ b/verl/trainer/ppo/trajectory_filter.py
+@@ -57,6 +57,7 @@
+     AGENT_COMPLETED = "agent_completed"      # ran to a normal stop; verifier scored it
+     OVERLONG = "overlong"                    # hit a length budget (context window or response window); truncated
+     MAX_TURNS_REACHED = "max_turns_reached"  # hit the turn cap
++    TRAINING_SEQUENCE_OVERFLOW = "training_sequence_overflow"
+     TIMEOUT = "timeout"                      # agent / verifier wall-clock timeout
+     ENV_SETUP_FAILED = "env_setup_failed"    # sandbox/env never produced a usable trajectory (dummy 1-token row)
+
+@@ -67,6 +68,7 @@
+     TerminationReason.MAX_TURNS_REACHED,
+     TerminationReason.TIMEOUT,
+     TerminationReason.ENV_SETUP_FAILED,
++    TerminationReason.TRAINING_SEQUENCE_OVERFLOW,
+ )
+
+ # Categories whose reward reflects the environment, not the policy -> excluded from training

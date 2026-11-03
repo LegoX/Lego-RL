@@ -1,0 +1,42 @@
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -335,6 +335,13 @@
+         Returns:
+             list[int]: Prompt token ids.
+         """
++        # Stateful loops fit complete sequences into training tensors later.
++        # Their rollout context must not inherit the training prompt-column cap.
++        preserve_context = getattr(self, "preserve_chat_template_context", False)
++        template_kwargs = dict(self.apply_chat_template_kwargs)
++        if preserve_context:
++            template_kwargs["truncation"] = False
++
+         if self.processor is not None:
+             raw_prompt = await self.loop.run_in_executor(
+                 None,
+@@ -344,6 +351,6 @@
+                     tools=tools,
+                     add_generation_prompt=True,
+                     tokenize=False,
+-                    **self.apply_chat_template_kwargs,
++                    **template_kwargs,
+                 ),
+             )
+@@ -368,7 +375,7 @@
+                     tools=tools,
+                     add_generation_prompt=True,
+                     tokenize=True,
+-                    **self.apply_chat_template_kwargs,
++                    **template_kwargs,
+                 ),
+             )
+             prompt_ids = normalize_token_ids(tokenized_prompt)
+@@ -382,7 +389,7 @@
+         # Multimodal prompts cannot be sliced here because placeholder tokens must remain
+         # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
+         prompt_length = self.rollout_config.prompt_length
+-        if len(prompt_ids) > prompt_length:
++        if len(prompt_ids) > prompt_length and not preserve_context:
+             if images or videos or audios:
+                 raise ValueError(
+                     f"Multimodal prompt produced {len(prompt_ids)} tokens, exceeding "
