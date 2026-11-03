@@ -91,6 +91,9 @@ _PROXY_METRIC_KEYS = (
     "proxy_compaction_summary_missing",
     "proxy_num_summary_segments",
     "proxy_summary_tokens",
+    "proxy_num_subagent_segments",
+    "proxy_subagent_tokens",
+    "proxy_subagent_archive_incomplete",
     "proxy_num_calls",  # number of chat completion calls handled
     "proxy_num_aborts",  # number of calls whose underlying vLLM request was aborted
     "proxy_num_preempted",  # sum of per-call ``num_preempted`` reported by vLLM
@@ -293,6 +296,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         # Prompt/response length limits
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
+        if os.environ.get("HARBOR_TRAIN_SUBAGENTS", "0") == "1" and self.trajectory_selection != "all":
+            raise ValueError("HARBOR_TRAIN_SUBAGENTS=1 requires trajectory_selection=all")
 
         # Turn cap (HARBOR_AGENT_MAX_ITERATIONS) — used only to label a trajectory that
         # exhausted it as termination_reason="max_turns_reached". 0 => unknown/disabled.
@@ -584,6 +589,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                         "episode_reward": float(reward),
                         "segment_index": index,
                         "segment_kind": segment.get("kind", "exec"),
+                        "subagent_session_id": segment.get("subagent_session_id", ""),
+                        "subagent_segment_kind": segment.get("subagent_segment_kind", ""),
                         "segment_boundary": segment.get("boundary", "live"),
                         "segment_count": len(segments),
                         "trajectory_selection": selection,
@@ -673,6 +680,9 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         }.items():
             metrics[metric] = float(meta.get(field) or 0)
         segments = meta.get("trajectory_segments") or []
+        metrics["proxy_num_subagent_segments"] = float(sum(s.get("kind") == "subagent" for s in segments))
+        metrics["proxy_subagent_tokens"] = float(sum(sum(s["response_mask"]) for s in segments if s.get("kind") == "subagent"))
+        metrics["proxy_subagent_archive_incomplete"] = float(bool(meta.get("subagent_archive_incomplete")))
         metrics["proxy_num_summary_segments"] = float(sum(s.get("kind") == "summary" for s in segments))
         metrics["proxy_summary_tokens"] = float(sum(int(s.get("summary_tokens") or 0) for s in segments))
         metrics["proxy_num_calls"] = float(meta.get("num_calls") or 0)

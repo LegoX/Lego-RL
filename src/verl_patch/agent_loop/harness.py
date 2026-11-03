@@ -811,6 +811,8 @@ def inject_harness_endpoint(
     """
 
     agent_cfg = harbor_cfg.setdefault("agent", {})
+    if definition.name == "openhands_sdk" and os.environ.get("HARBOR_OPENHANDS_ENABLE_SUBAGENT", "0") == "1":
+        agent_cfg.setdefault("kwargs", {})["enable_subagent"] = True
     endpoint_base = (
         anthropic_base if definition.protocol == "anthropic" else openai_base
     )

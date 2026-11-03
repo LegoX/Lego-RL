@@ -6,6 +6,7 @@
         "scaling",
         "codex",
         "compaction",
+        "subagents",
         "sao",
         "---Operations---",
         "preflight",

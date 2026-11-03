@@ -1,0 +1,72 @@
+---
+title: Training subagent actions
+description: Capture native child conversations under the parent task's reward.
+---
+
+By default, child conversations are isolated from the main conversation and are
+not trained. Set `HARBOR_TRAIN_SUBAGENTS=1` to archive their actual sampled actions
+as additional segments of the parent's episode. Each child keeps its own token
+prefix, behavior logprobs, action masks and routing; child actions are never
+reconstructed from text copied into the parent's tool results.
+
+The mode requires `HARBOR_TRAJECTORY_SELECTION=all`. Parent execution, summaries
+and child segments share one episode ID and verifier outcome, so the existing
+GRPO grouping, loss normalization and episode optimizer scheduling still apply.
+This does not introduce a separate child reward or another trainer.
+
+## Configuration
+
+Add `harbor/subagents.env` first in an existing recipe's `TEMPLATE_MODULES`.
+It selects full-sequence layout, `all` selection and child recording. It can be
+combined with `harbor/compaction.env`.
+
+```bash
+export HARBOR_TRAIN_SUBAGENTS=1
+export HARBOR_TRAJECTORY_SELECTION=all
+export VERL_AGENT_FULL_SEQUENCE_TRAINING=1
+```
+
+Export the switches on every Ray node before starting workers. The proxy captures
+native child calls sent through the parent's endpoint. Existing request identity
+heuristics distinguish conversations by system/opening messages; two logically
+different children with identical opening messages cannot be distinguished by
+this protocol. Summaries and hidden title/helper calls retain their existing
+separate routing, and hidden helper calls are not trained.
+
+Child generated tokens, including separately archived child summaries, count
+toward the parent's request-boundary generation budget. Superseded retry output
+also consumed generation budget, even though only the retained actions train.
+If a completed child's archive is incomplete or unsupported, the entire parent
+episode is excluded from training; a successful parent reward cannot silently
+train an incomplete collection of actions. The existing shared-sequence overflow
+policy applies to every retained segment.
+
+## OpenHands SDK task tools
+
+Spawning children and training them are separate switches. To expose the SDK's
+`TaskToolSet` and register its `general-purpose` child factory, also set
+`HARBOR_OPENHANDS_ENABLE_SUBAGENT=1` (enabled by the template). The factory uses
+fresh condenser state and the parent's compaction policy. Its child tools do not
+include the task tool, so the supplied factory does not recursively spawn agents.
+
+This requires the updated `patches/harbor.patch` on the pinned Harbor checkout.
+The default installer applies it. Existing environments must update that source
+and restart workers. When enabled, the adapter uploads the patched runtime runner
+to the task sandbox and executes it with the mounted SDK 1.33.0 interpreter; the
+mounted image itself does not need rebuilding. Other CLI harnesses use their
+own native child-spawning mechanisms; the training switch does not enable those
+mechanisms for them.
+
+## Observability and validation
+
+Archives identify child segments with `kind=subagent`, `subagent_session_id` and
+`subagent_segment_kind` (execution or summary). Worker output retains child session
+IDs, and rollout metrics include `proxy_num_subagent_segments`,
+`proxy_subagent_tokens` and `proxy_subagent_archive_incomplete`. Parent cleanup
+closes child and summary states, including requests completing after export.
+
+CPU tests cover opt-in/default behavior, exact contexts, retries/rewrites,
+parent-budget accounting, incomplete-child filtering, shared parent episode IDs,
+late completions and the SDK runtime upload path. These are main-episode contract
+tests; the existing production trial recipe is separate runtime evidence, not a
+distributed GPU acceptance run of this port.
