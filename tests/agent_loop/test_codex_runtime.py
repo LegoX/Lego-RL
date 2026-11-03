@@ -62,3 +62,18 @@ def test_mcp_registration_preserves_the_provider(monkeypatch):
     monkeypatch.setattr(_BaseCodex, '_build_register_mcp_servers_command',
                         lambda self: 'echo "[mcp_servers.test]" > "$CODEX_HOME/config.toml"')
     assert obj._build_register_mcp_servers_command().endswith(' >> "$CODEX_HOME/config.toml"')
+
+
+@pytest.mark.asyncio
+async def test_compaction_limits_reach_native_codex_config():
+    obj = agent()
+    values = {'OPENAI_BASE_URL': 'http://proxy/sess/trial/v1',
+              'CODEX_MODEL_CONTEXT_WINDOW': '96000', 'CODEX_AUTO_COMPACT_TOKEN_LIMIT': '86400'}
+    obj._get_env = values.get
+    env = SimpleNamespace(exec=AsyncMock())
+    await obj._write_provider_config(env)
+    command = env.exec.await_args.kwargs['command']
+    tokens = shlex.split(command)
+    config = tomllib.loads(tokens[tokens.index('echo') + 1])
+    assert config['model_context_window'] == 96000
+    assert config['model_auto_compact_token_limit'] == 86400

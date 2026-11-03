@@ -17,7 +17,9 @@ def _proxy_for_routing():
     proxy._session_state_locks = {}
     proxy._session_generation_locks = {}
     proxy._session_attempts = {}
-    proxy._main_initial_messages = {}
+    proxy._main_identity = {}
+    proxy._summ_seq = {}
+    proxy._gen_seq = 0
     proxy._sub_session_keys = {}
     proxy._session_scheduler = SimpleNamespace(
         finish_session=lambda *args, **kwargs: _done(),
@@ -96,10 +98,10 @@ async def test_hidden_opencode_prompt_isolated_and_pop_cleans_routing_state():
         {"role": "user", "content": "task"},
     ]
     await proxy._route_subagent_session(sid, main)
-    assert sid in proxy._main_initial_messages
+    assert sid in proxy._main_identity
 
     await proxy.pop_session(sid)
-    assert sid not in proxy._main_initial_messages
+    assert sid not in proxy._main_identity
     assert hidden_key not in proxy._sessions
 
 

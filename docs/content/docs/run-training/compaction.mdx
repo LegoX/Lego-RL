@@ -1,0 +1,78 @@
+---
+title: Native context compaction
+description: Train execution and summary actions across native harness compactions.
+---
+
+Claude Code, Codex, OpenCode and OpenHands SDK can summarize their history and
+continue working. Lego-RL keeps the actions sampled before that rewrite under
+their original contexts and records newly sampled summary tokens under the task
+reward. Existing assistant messages copied into the new history are conditioning,
+not newly sampled actions. Training uses the existing episode recorder and
+`trajectory_selection=all` interface.
+
+| Harness | Native behavior | How summary sampling is recorded | Budget setting |
+| --- | --- | --- | --- |
+| Claude Code 2.1.118 | Replaces history | On the main thread | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=C` |
+| Codex 0.153.4 | Replaces history | Native checkpoint requests are isolated and archived as summary segments | `model_context_window=C`, `model_auto_compact_token_limit=0.9*C` |
+| OpenCode 1.14.22 | Replaces history | Separate compaction provider on the session's `/summ/v1` endpoint | Provider `limit.context=C` |
+| OpenHands SDK 1.33.0 | Condenses history in place | Separate condenser LLM on `/summ/v1` | `condenser_max_tokens=C` |
+
+The OHSDK profile uses a large event-count limit so the token threshold controls
+the trigger, matching the current token-budget recipe. Profiles can be overridden
+with a `compaction` object in a harness definition or render contract. Native knob
+names and continuation formats depend on the versions above; revalidate them
+when upgrading runtimes.
+
+## Configuration
+
+Add `harbor/compaction.env` first in an existing recipe's `TEMPLATE_MODULES`, before
+scaffold and VeRL modules. Defaults are 96k context budget, three compactions,
+128k generated-token budget, summary training enabled, and full-sequence layout.
+This opts into the main episode path; it does not install a trial trainer or
+change the policy loss.
+
+```bash
+HARBOR_CONTEXT_BUDGET_TOKENS=96000
+HARBOR_COMPACTION_MAX=3
+HARBOR_TRIAL_GEN_TOKEN_BUDGET=128000
+HARBOR_COMPACTION_TRAIN_SUMMARY=1
+HARBOR_TRAJECTORY_SELECTION=all
+VERL_AGENT_FULL_SEQUENCE_TRAINING=1
+```
+
+Export the values on every Ray node, or use the template. The context budget
+configures the harness's native trigger, not a fixed compressed-history length.
+The generation budget counts model output, including separately generated
+summaries; tool results still occupy sequence positions but are not model output.
+Checks occur at request boundaries: once the generation budget is consumed, the
+next request is refused. A single generation can cross that budget. A refused
+request leaves the previous archive intact, signals context overflow and allows
+the existing verifier/termination handling to retain the real task reward.
+A value of zero disables each cross-compaction budget.
+
+`HARBOR_COMPACTION_TRAIN_SUMMARY=0` retains summaries for conditioning/audit while
+masking their policy loss. No new summary action is inferred from text copied
+into the post-compaction history. Summary segments and execution segments share
+one episode ID and the existing episode-level normalization. GSPO still computes
+ratios/clipping per segment. The existing `all` restrictions (GRPO and supported
+engines) remain in effect; SAO/GAE and subagent training are separate features.
+
+## Observability and validation
+
+Episode archives include segment kind (`exec` or `summary`), compaction boundary,
+original token IDs, action masks, behavior logprobs and routing. Rollout metrics
+include `proxy_num_compactions`, `proxy_num_summary_segments`,
+`proxy_summary_tokens`, `proxy_budget_refusals`, `proxy_compaction_shape_mismatch`
+and `proxy_compaction_summary_missing`. The last two expose mismatches between a
+runtime's observed behavior and its configured profile.
+
+Validation covers all four configuration profiles and two successive compaction
+shapes through the actual proxy router/recorder, with summary training on/off,
+plus existing HTTP protocol and episode-training regressions. This is CPU
+contract coverage, not a completed four-harness GPU acceptance run. The running
+OHSDK trial recipe supplies operational evidence for that recipe, separately
+from the main episode implementation in this change.
+
+Trainer validation uses the same native profiles and per-session summary routing.
+For standalone evaluation against a plain inference server, configure the native
+harness knobs explicitly and use that server for the condenser/summary provider.

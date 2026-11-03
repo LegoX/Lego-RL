@@ -101,7 +101,9 @@ def proxy():
     p._session_state_locks = {}
     p._session_generation_locks = {}
     p._session_attempts = {}
-    p._main_initial_messages = {}
+    p._main_identity = {}
+    p._summ_seq = {}
+    p._gen_seq = 0
     p._sub_session_keys = {}
     p._processor = None
     p._assistant_eos_token_id = 99

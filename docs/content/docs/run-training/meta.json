@@ -5,6 +5,7 @@
         "infer",
         "scaling",
         "codex",
+        "compaction",
         "sao",
         "---Operations---",
         "preflight",

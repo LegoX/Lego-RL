@@ -34,6 +34,9 @@ class FakeProxy:
     def session_url(self, session_id):
         return f"http://proxy/sess/{session_id}/v1"
 
+    def session_summ_url(self, session_id):
+        return f"http://proxy/sess/{session_id}/summ/v1"
+
     def session_anthropic_base(self, session_id):
         return f"http://proxy/sess/{session_id}"
 
