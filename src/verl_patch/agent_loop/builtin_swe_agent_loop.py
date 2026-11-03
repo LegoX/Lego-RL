@@ -85,6 +85,12 @@ _HARBOR_TIMING_KEYS = (
 # in extra_fields. Pre-populated alongside ``_HARBOR_TIMING_KEYS`` so empty
 # trials still aggregate cleanly.
 _PROXY_METRIC_KEYS = (
+    "proxy_num_compactions",
+    "proxy_budget_refusals",
+    "proxy_compaction_shape_mismatch",
+    "proxy_compaction_summary_missing",
+    "proxy_num_summary_segments",
+    "proxy_summary_tokens",
     "proxy_num_calls",  # number of chat completion calls handled
     "proxy_num_aborts",  # number of calls whose underlying vLLM request was aborted
     "proxy_num_preempted",  # sum of per-call ``num_preempted`` reported by vLLM
@@ -577,6 +583,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                         "episode_id": session_meta["episode_id"],
                         "episode_reward": float(reward),
                         "segment_index": index,
+                        "segment_kind": segment.get("kind", "exec"),
+                        "segment_boundary": segment.get("boundary", "live"),
                         "segment_count": len(segments),
                         "trajectory_selection": selection,
                     },
@@ -657,6 +665,16 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         metrics: dict[str, float], meta: dict
     ) -> None:
         """Overwrite proxy counters from a single completed proxy session (one Harbor attempt)."""
+        for metric, field in {
+            "proxy_num_compactions": "compaction_count",
+            "proxy_budget_refusals": "budget_refusals",
+            "proxy_compaction_shape_mismatch": "compaction_shape_mismatch",
+            "proxy_compaction_summary_missing": "compaction_summary_missing",
+        }.items():
+            metrics[metric] = float(meta.get(field) or 0)
+        segments = meta.get("trajectory_segments") or []
+        metrics["proxy_num_summary_segments"] = float(sum(s.get("kind") == "summary" for s in segments))
+        metrics["proxy_summary_tokens"] = float(sum(int(s.get("summary_tokens") or 0) for s in segments))
         metrics["proxy_num_calls"] = float(meta.get("num_calls") or 0)
         metrics["proxy_num_aborts"] = float(meta.get("num_aborts") or 0)
         metrics["proxy_num_preempted"] = float(meta.get("num_preempted") or 0)
@@ -763,6 +781,7 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 session_id, trajectory_dir=trajectory_dir,
                 sampling_params=sampling_params if definition.name == "codex" else None,
                 harness_name=definition.name,
+                compaction=getattr(definition, "compaction", None),
                 max_turns=(cfg.get("agent", {}).get("kwargs", {}).get("max_turns")
                            if definition.name == "codex" else None),
             )
@@ -771,6 +790,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 cfg,
                 definition,
                 openai_base=api_base,
+                summarizer_base=proxy.session_summ_url(session_id),
+                temperature=sampling_params.get("temperature"),
                 anthropic_base=anthropic_base,
                 openai_api_key=os.environ.get(
                     "LLM_API_KEY", "dummy-key-for-local-vllm"

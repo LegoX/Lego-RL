@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -49,10 +50,238 @@ _R3_PROXY_DIAG = 0
 # splits "vLLM read returns zeros for gen tokens" from "we lose it in archiving".
 _R3_TURN_PROBE = 0
 
+
+
+_MAIN_AGENT_PREFIX_MATCH = int(
+    os.environ.get("HARBOR_MAIN_AGENT_PREFIX_MATCH", "256")
+)
+# Gate 3, compaction continuation: a request that reproduces at least this many
+# characters of the reply this session generated last is the same conversation
+# resuming from its own summary (CC / Codex quote it in a user turn, OpenCode
+# opens the new history with the summary as an assistant turn) -- never a
+# sub-agent. 0 disables the quote check.
+_COMPACTION_QUOTE_MIN_CHARS = int(
+    os.environ.get("HARBOR_COMPACTION_QUOTE_MIN_CHARS", "256")
+)
+
+
+def _load_compaction_markers() -> tuple[str, ...]:
+    """Continuation markers harnesses put in front of a compacted history.
+
+    Fallback for the quote check when the summary is shorter than the threshold.
+    Extra markers: JSON list in ``HARBOR_COMPACTION_MARKERS``.
+    """
+    builtin = (
+        # Claude Code, /compact and autocompact continuation prompt.
+        "This session is being continued from a previous conversation that ran out of context",
+    )
+    raw = os.environ.get("HARBOR_COMPACTION_MARKERS", "").strip()
+    if not raw:
+        return builtin
+    try:
+        extra = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("[Proxy] HARBOR_COMPACTION_MARKERS is not a JSON list; ignored")
+        return builtin
+    return builtin + tuple(str(x) for x in extra if str(x))
+
+
+_COMPACTION_CONTINUATION_MARKERS = _load_compaction_markers()
+
+
+def _env_int(name: str, default: str) -> int:
+    try:
+        return int(os.environ.get(name, default) or default)
+    except ValueError:
+        logger.warning("[Proxy] %s is not an int; using %s", name, default)
+        return int(default)
+
+
+# Cross-compaction budgets. Compaction removes the context window as a natural
+# brake (a compacted trial otherwise runs to the harness turn cap or the wall
+# clock), so the proxy enforces a trial-level budget instead: the request that
+# would start the (N+1)-th compaction, or any request once the trial generated
+# this many tokens, is refused with the context-overflow error the harnesses
+# already handle (Claude Code fails fast on the 400) and the agent loop
+# classifies the trajectory as ``overlong`` through the ``context_overflow``
+# signal, keeping its real verifier reward. 0 = unlimited.
+_COMPACTION_MAX = _env_int("HARBOR_COMPACTION_MAX", "0")
+_GEN_TOKEN_BUDGET = _env_int("HARBOR_TRIAL_GEN_TOKEN_BUDGET", "0")
+# CompactionRL trains the summary tokens under the task reward (their ablation
+# "w/o summary training" is the main thing this switch reproduces): 0 archives
+# every summary with response_mask=0 so it stays context, not action.
+_TRAIN_SUMMARY = os.environ.get("HARBOR_COMPACTION_TRAIN_SUMMARY", "1").strip().lower() not in (
+    "0", "false", "no", "off", ""
+)
+
 _OPENCODE_HIDDEN_SYSTEM_PROMPT_PREFIXES = (
     "You are a title generator. You output ONLY a thread title.",
 )
 
+
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _message_text(message: dict) -> str:
+    """Plain text of a message's content (a string, or OpenAI text parts)."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return "" if content is None else str(content)
+
+
+def _normalize_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+_SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+def _first_user_identity(messages: list[dict]) -> str:
+    """The opening user turn with harness-injected ``<system-reminder>`` blocks
+    removed and whitespace collapsed.
+
+    Claude Code edits those blocks in place between turns (context-window notes,
+    todo state, ...); the task text underneath is what identifies the
+    conversation, and OpenCode Task sub-agents differ from the main thread
+    exactly there while sharing its system prompt.
+    """
+    for m in messages:
+        if m.get("role") == "user":
+            return _normalize_ws(_SYSTEM_REMINDER_RE.sub("", _message_text(m)))
+    return ""
+
+
+def _messages_quote_text(messages: list[dict], needle: str, min_chars: int) -> bool:
+    """True when ``messages`` reproduce a sizeable chunk of ``needle`` verbatim.
+
+    Recognises a compacted history: every harness re-injects the summary it
+    just generated (CC / Codex inside a user turn, OpenCode as the assistant
+    turn that opens the new history). Three probe windows (head / middle / tail
+    of the needle) tolerate a harness trimming or prefixing the quoted text.
+    """
+    needle = _normalize_ws(needle or "")
+    if min_chars <= 0 or len(needle) < min_chars:
+        return False
+    haystack = _normalize_ws(" ".join(_message_text(m) for m in messages))
+    mid = len(needle) // 2
+    probes = (
+        needle[:min_chars],
+        needle[max(0, mid - min_chars // 2) : mid + (min_chars - min_chars // 2)],
+        needle[-min_chars:],
+    )
+    return any(p and p in haystack for p in probes)
+
+
+def _messages_have_continuation_marker(messages: list[dict], markers=None) -> bool:
+    markers = tuple(markers) if markers is not None else _COMPACTION_CONTINUATION_MARKERS
+    if not markers:
+        return False
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        text = _message_text(m)
+        if any(marker in text for marker in markers):
+            return True
+    return False
+
+
+def _assistant_turn_key(message: dict) -> tuple:
+    """Identity of an assistant turn for subsequence matching: tool_call ids when
+    present (id-anchored like ``_tool_calls_equiv``), else the exact text."""
+    tcs = message.get("tool_calls") or []
+    ids = tuple(str((tc or {}).get("id") or "") for tc in tcs)
+    if any(ids):
+        return ("ids", ids)
+    return ("text", _message_text(message))
+
+
+def _is_subsequence(short: list, long: list) -> bool:
+    it = iter(long)
+    return all(any(x == y for y in it) for x in short)
+
+
+def _classify_rebuild(
+    snap: list[dict], messages: list[dict], *, pending_summary_texts: tuple[str, ...] = (), initial_prefix: list[dict] | None = None
+) -> str:
+    """Why an incoming history is not a prefix extension of the archived snapshot.
+
+    * ``retry``: the incoming history is a message-prefix of the snapshot -- the
+      harness dropped trailing phantom turns after an abort / retry. The token
+      prefix salvage in ``_compute_prompt_ids`` recovers the logprobs.
+    * ``compaction_inplace``: the opening prefix survived, but assistant turns
+      were removed from the middle while the most recent one is still there
+      (OpenHands SDK condenser: keep ``keep_first`` events, summarise the middle,
+      keep the recent tail). Token-based condensation can drop that tail too;
+      in that case require an exact newly inserted summary from this session
+      and preserve its opening prefix and any surviving assistant identities.
+      The archive is frozen as a segment and a new one
+      starts from the condensed history.
+    * ``history_edit``: anything else (a dynamic reminder edit, re-serialised
+      content the id-anchoring cannot absorb, ...): the lossy rebuild + salvage.
+
+    ``compaction_replace`` (the whole history replaced by ``[system, summary,
+    ...]``) is recognised earlier, by ``_route_subagent_session``, because the
+    opening prefix itself changes there.
+    """
+    if _messages_is_prefix(messages, snap):
+        return "retry"
+    snap_keys = [_assistant_turn_key(m) for m in snap if m.get("role") == "assistant"]
+    inc_keys = [_assistant_turn_key(m) for m in messages if m.get("role") == "assistant"]
+    if (
+        snap_keys
+        and inc_keys
+        and len(inc_keys) < len(snap_keys)
+        and inc_keys[-1] == snap_keys[-1]
+        and _is_subsequence(inc_keys, snap_keys)
+    ):
+        return "compaction_inplace"
+    if (
+        pending_summary_texts
+        and snap_keys
+        and len(inc_keys) < len(snap_keys)
+        and _is_subsequence(inc_keys, snap_keys)
+        and _messages_is_prefix(initial_prefix if initial_prefix is not None else _messages_before_first_assistant(snap), messages)
+        and any(
+            m.get("role") == "user"
+            and m not in snap
+            and _message_text(m) in pending_summary_texts
+            for m in messages
+        )
+    ):
+        return "compaction_inplace"
+    return "history_edit"
+
+
+class _CompactionBudgetExceeded(Exception):
+    """A trial exhausted its cross-compaction budget (see ``_COMPACTION_MAX`` /
+    ``_GEN_TOKEN_BUDGET``). Worded as a context-window overflow on purpose:
+    ``_is_context_overflow_exc`` / ``_proxy_error_from_exception`` turn it into
+    the permanent 400 the harnesses already give up on, and the agent loop maps
+    the session's ``context_overflow`` flag to termination_reason=overlong."""
+
+    def __init__(self, session_id: str, what: str) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"Prompt exceeds the model's maximum context length: {what} "
+            f"(session {session_id})"
+        )
+
+
+_COMPACTION_REBUILD_CAUSES = ("compaction_inplace", "compaction_replace")
 
 def _system_text(messages: list[dict]) -> str:
     """Leading system-message content (OpenAI-format), or '' if none."""
@@ -87,8 +316,8 @@ _VLLM_TOOL_PARSER_CLASSES: dict[str, type | None] = {
 
 import re as _re
 
-_HERMES_TOOL_CALL_RE = _re.compile(
-    r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", _re.DOTALL
+_HERMES_TOOL_CALL_RE = re.compile(
+    r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL
 )
 
 
@@ -1111,7 +1340,9 @@ class _VLLMChatCompletionsProxy:
         # the main conversation's complete prefix before its first assistant
         # turn. OpenCode task sub-agents reuse the main system prompt, so the
         # system prompt alone is not a conversation identity.
-        self._main_initial_messages: dict[str, list[dict]] = {}
+        self._main_identity: dict[str, dict[str, Any]] = {}
+        self._summ_seq: dict[str, int] = {}
+        self._gen_seq = 0
         # base session_id -> derived sub-agent state keys, for cleanup on pop.
         self._sub_session_keys: dict[str, set] = {}
 
@@ -1124,6 +1355,8 @@ class _VLLMChatCompletionsProxy:
         self._app = aiohttp.web.Application()
         self._app.router.add_post("/sess/{session_id}/v1/chat/completions", self._handle_chat)
         self._app.router.add_get("/sess/{session_id}/v1/models", self._handle_models)
+        self._app.router.add_post("/sess/{session_id}/summ/v1/chat/completions", self._handle_chat_summ)
+        self._app.router.add_get("/sess/{session_id}/summ/v1/models", self._handle_models)
         self._app.router.add_post("/v1/chat/completions", self._handle_chat_anon)
         self._app.router.add_get("/v1/models", self._handle_models)
         # Anthropic Messages API endpoints (Design A: Claude Code connects here
@@ -1199,15 +1432,20 @@ class _VLLMChatCompletionsProxy:
         self,
         session_id: str,
         trajectory_dir: str | Path | None = None,
+        compaction: dict | None = None,
         sampling_params: dict | None = None,
         harness_name: str | None = None,
         max_turns: int | None = None,
     ) -> None:
-        """Open a trial; sampling defaults and turn caps apply only to Codex."""
+        """Register a trial's main session. ``compaction`` is the harness's
+        compaction card (see harness.COMPACTION_PROFILES): its continuation
+        markers feed the routing, its ``mode`` / ``summary`` let the rebuild
+        validate the compaction shape and the summary source it sees."""
         async with self._sessions_lock:
             self._session_state_locks.setdefault(session_id, asyncio.Lock())
             st = self._fresh_session_state()
             st["session_id"] = session_id
+            st["compaction_profile"] = dict(compaction) if compaction else None
             # Codex omits sampling fields on the wire. Keep the caller's
             # train/validation settings scoped to this trial.
             st["harness_name"] = harness_name
@@ -1224,19 +1462,24 @@ class _VLLMChatCompletionsProxy:
                 st["trajectory_dir"] = str(Path(trajectory_dir).expanduser().resolve())
             self._sessions[session_id] = st
 
+
     async def pop_session(self, session_id: str) -> dict:
         async with self._sessions_lock:
             meta = self._sessions.pop(session_id, None) or self._fresh_session_state()
+            meta["recorder_closed"] = True
+            self._summ_seq.pop(session_id, None)
             # Drop the main-conversation identity and any isolated sub-agent
             # threads that shared this session; they are never trained, so just
             # discard their state to avoid leaking across trials.
-            self._main_initial_messages.pop(session_id, None)
+            self._main_identity.pop(session_id, None)
             self._session_generation_locks.pop(session_id, None)
             self._session_state_locks.pop(session_id, None)
             self._session_attempts.pop(session_id, None)
             sub_keys = tuple(self._sub_session_keys.pop(session_id, ()))
             for sub_key in sub_keys:
-                self._sessions.pop(sub_key, None)
+                child = self._sessions.pop(sub_key, None)
+                if child is not None:
+                    child["recorder_closed"] = True
                 self._session_generation_locks.pop(sub_key, None)
                 self._session_state_locks.pop(sub_key, None)
                 self._session_attempts.pop(sub_key, None)
@@ -1245,7 +1488,10 @@ class _VLLMChatCompletionsProxy:
             await self._session_scheduler.finish_session(sub_key, reason="pop_session")
         recorder = meta.pop("trajectory_recorder")
         meta["episode_id"] = session_id
-        meta["trajectory_segments"] = recorder.export()
+        meta["trajectory_segments"] = sorted(
+            recorder.export() + list(meta.get("segments") or []),
+            key=lambda segment: int(segment.get("seq_end") or 0),
+        )
         meta["discarded_generations"] = recorder.discarded_generations
         traj_dir = meta.get("trajectory_dir")
         # One-shot assemble: final snapshot already holds full chat prefix (no per-step duplication).
@@ -1272,6 +1518,24 @@ class _VLLMChatCompletionsProxy:
     @staticmethod
     def _fresh_session_state() -> dict:
         return {
+            'record_pending': None,
+            'session_id': None,
+            'last_assistant_text': "",
+            'last_assistant_tokens': 0,
+            'pending_rebuild_cause': None,
+            'rebuild_counts': {},
+            'compaction_count': 0,
+            'segments': [],
+            'carried_over_keys': [],
+            'summarizer_of': None,
+            'last_gen_seq': 0,
+            'gen_tokens_total': 0,
+            'budget_refusals': 0,
+            'compaction_profile': None,
+            'summaries_since_compaction': 0,
+            'compaction_shape_mismatch': 0,
+            'compaction_summary_missing': 0,
+
             "turn_limit_reached": False,
             "completed_assistant_turns": 0,
             "max_turns": None,
@@ -1319,19 +1583,31 @@ class _VLLMChatCompletionsProxy:
             "trajectory_dir": None,
         }
 
+
     async def _route_subagent_session(
         self, session_id: str, messages: list[dict]
     ) -> tuple[str, bool]:
         """Map a request to its conversation thread's state key.
 
-        The main agent and Task sub-agents share one proxy ``session_id``. In
-        particular, OpenCode task sub-agents also reuse the main agent's system
-        prompt, so system-prompt equality or similarity cannot distinguish the
-        conversations. The first non-hidden request establishes the main
-        conversation's complete message prefix before its first assistant turn.
-        Only requests with exactly that same initial prefix stay on the bare
-        ``session_id``; every other conversation gets an isolated, non-archived
-        ``{session_id}::sub::{fp}`` state.
+        The main agent and Task sub-agents share one proxy ``session_id``
+        (inherited base URL) yet are distinct conversations. The first non-hidden
+        request establishes the main thread's identity; a later request stays on
+        the bare, trainable ``session_id`` only if it passes three gates, and is
+        otherwise a sub-agent served from an isolated, non-archived
+        ``{session_id}::sub::{fp}`` state:
+
+        1. **System prompt** (``_MAIN_AGENT_PREFIX_MATCH``): CC sub-agents
+           (Explore, general-purpose, web-search, ...) run under their own system
+           prompt and diverge within the first sentence; a dynamic
+           ``<system-reminder>`` / ``<env>`` edit keeps a long common prefix.
+        2. **Opening user turn**, reminder blocks stripped: OpenCode Task
+           sub-agents reuse the main system prompt but open with their own task.
+        3. **Compaction continuation**: the opening turn changed under the same
+           system prompt *and* the request quotes the reply this session wrote
+           last (or carries a harness continuation marker) -- the main thread
+           resuming from its own summary. The identity is re-anchored to the new
+           opening prefix and the next ``_compute_prompt_ids`` rebuild is told to
+           freeze the pre-compaction archive as a segment.
 
         Returns ``(effective_session_key, is_subagent)``.
         """
@@ -1358,14 +1634,110 @@ class _VLLMChatCompletionsProxy:
                 self._sub_session_keys.setdefault(session_id, set()).add(eff)
                 return eff, True
 
-            main_initial = self._main_initial_messages.get(session_id)
-            if main_initial is None:
+            main = self._main_identity.get(session_id)
+            if main is None:
                 # First request on this session establishes the main thread.
-                self._main_initial_messages[session_id] = deepcopy(incoming_initial)
+                self._main_identity[session_id] = {
+                    "system": sys_text,
+                    "first_user": _first_user_identity(messages),
+                    "initial": deepcopy(incoming_initial),
+                }
                 return session_id, False
-            if incoming_initial == main_initial:
-                return session_id, False
-            # Sub-agent: isolate on a derived key, never archive.
+            same_system = sys_text == main["system"] or (
+                _common_prefix_len(sys_text, main["system"]) >= _MAIN_AGENT_PREFIX_MATCH
+            )
+            if same_system:
+                first_user = _first_user_identity(messages)
+                if incoming_initial == main["initial"] or first_user == main["first_user"]:
+                    # Codex keeps the original task while replacing the rest of
+                    # the conversation with a summary. Identity alone therefore
+                    # cannot tell whether the live token archive is continuous.
+                    st = self._sessions.get(session_id) or {}
+                    snap = st.get("messages_snapshot") or []
+                    profile = st.get("compaction_profile") or {}
+                    new_opening = [
+                        m for m in incoming_initial
+                        if m.get("role") == "user" and m not in main["initial"]
+                    ]
+                    incoming_turns = {
+                        _assistant_turn_key(m) for m in messages
+                        if m.get("role") == "assistant"
+                    }
+                    removed_turns = any(
+                        _assistant_turn_key(m) not in incoming_turns
+                        for m in snap if m.get("role") == "assistant"
+                    )
+                    # OpenCode can retain assistant/tool turns before its new
+                    # summary, leaving a system-only opening after every later
+                    # compaction. Require a freshly archived same-session
+                    # summary, newly inserted into the incoming history.
+                    pending_summaries = int(st.get("summaries_since_compaction") or 0)
+                    fresh_summary_inserted = False
+                    if (
+                        profile.get("mode") == "replace"
+                        and profile.get("summary") == "summ_route"
+                        and pending_summaries > 0
+                    ):
+                        summaries = [
+                            s for s in st.get("segments", []) if s.get("kind") == "summary"
+                        ]
+                        texts = {
+                            str(s["summary_text"]) for s in summaries[-pending_summaries:]
+                            if s.get("summary_text")
+                        }
+                        old_texts = {_message_text(m) for m in snap if m.get("role") == "assistant"}
+                        fresh_summary_inserted = any(
+                            m.get("role") == "assistant"
+                            and _message_text(m) in texts - old_texts
+                            for m in messages
+                        )
+                    if (
+                        profile.get("mode") == "replace"
+                        and (
+                            fresh_summary_inserted
+                            or (new_opening and self._is_compaction_continuation(session_id, new_opening))
+                        )
+                        and removed_turns
+                        # A normal extension or exact-prefix retry is not a
+                        # compaction, even if its context contains a summary.
+                        and not _messages_is_prefix(snap, messages)
+                        and not _messages_is_prefix(messages, snap)
+                    ):
+                        st["pending_rebuild_cause"] = "compaction_replace"
+                        main.update(
+                            system=sys_text,
+                            first_user=first_user,
+                            initial=deepcopy(incoming_initial),
+                        )
+                        logger.info(
+                            "[Proxy] compaction retained opening identity on main session "
+                            "(session=%s, messages=%d)", session_id, len(messages),
+                        )
+                    return session_id, False
+                sub_key = f"{session_id}::sub::{_messages_fingerprint(incoming_initial)}"
+                if (sub_key in self._sub_session_keys.get(session_id, ())
+                        and sub_key in self._sessions):
+                    return sub_key, True
+                # Same system prompt, different opening turn: an OpenCode Task
+                # sub-agent, or the main thread resuming from a compacted
+                # history. Only the latter quotes a reply this session wrote.
+                if self._is_compaction_continuation(session_id, messages):
+                    main.update(
+                        system=sys_text,
+                        first_user=first_user,
+                        initial=deepcopy(incoming_initial),
+                    )
+                    st = self._sessions.get(session_id)
+                    if st is not None:
+                        st["pending_rebuild_cause"] = "compaction_replace"
+                    logger.info(
+                        "[Proxy] compaction continuation kept on main session "
+                        "(session=%s, messages=%d, initial_messages=%d)",
+                        session_id, len(messages), len(incoming_initial),
+                    )
+                    return session_id, False
+            # Sub-agent: isolate its conversation and optionally train its sampled
+            # tokens as a separate segment under the parent trial's reward.
             fp = _messages_fingerprint(incoming_initial)
             eff = f"{session_id}::sub::{fp}"
             st = self._sessions.get(eff)
@@ -1376,12 +1748,14 @@ class _VLLMChatCompletionsProxy:
                 self._session_state_locks.setdefault(eff, asyncio.Lock())
                 logger.info(
                     "[Proxy] routed sub-agent conversation off main session "
-                    "(session=%s -> %s, sub_initial_messages=%d, "
+                    "(session=%s -> %s, same_system=%s, sub_initial_messages=%d, "
                     "main_initial_messages=%d)",
-                    session_id, eff, len(incoming_initial), len(main_initial),
+                    session_id, eff, same_system, len(incoming_initial),
+                    len(main["initial"]),
                 )
             self._sub_session_keys.setdefault(session_id, set()).add(eff)
             return eff, True
+
 
     async def _register_session_attempt(self, session_id: str) -> _SessionAttempt:
         async with self._sessions_lock:
@@ -1508,6 +1882,7 @@ class _VLLMChatCompletionsProxy:
         messages: list[dict],
         tools: list[dict] | None,
         body: dict,
+        summarizer: bool = False,
     ) -> tuple[dict, str, int, int]:
         """Token-fidelity generation core shared by the OpenAI and Anthropic
         endpoints.
@@ -1526,15 +1901,21 @@ class _VLLMChatCompletionsProxy:
         # accumulates cleanly (no rebuild thrash). For the main agent this is a
         # no-op returning the bare session_id; sub-agents get an isolated,
         # non-archived state key. All session-state and the vLLM request_id below
-        # use the routed key.
+        # use the routed key. Summarizer requests (``/summ/`` route) get their own
+        # archived key instead and are filed as summary segments afterwards.
+        # Capture main-trial defaults before routing: sub-agents, hidden
+        # conversations and summarizers inherit this sampling policy.
         async with self._sessions_lock:
             main_session = self._sessions.get(session_id, {})
             is_codex = main_session.get("harness_name") == "codex"
             sampling_defaults = dict(main_session.get("sampling_defaults") or {})
         trial_session_id = session_id
         turn_budget = main_session if is_codex and main_session.get("max_turns") else None
-        session_id, _is_subagent = await self._route_subagent_session(session_id, messages)
-        # Share the Codex limit across main and routed subagent calls.
+        session_id, _is_subagent = await self._route_generation_session(
+            session_id, messages, tools, summarizer=summarizer
+        )
+        # A Codex trial shares one cap across compaction, summaries and routed
+        # calls. Use the trial lock so concurrent requests cannot overshoot it.
         session_lock = await self._get_session_generation_lock(
             trial_session_id if turn_budget is not None else session_id
         )
@@ -1560,6 +1941,7 @@ class _VLLMChatCompletionsProxy:
                         "content": f"[Lego-RL] Maximum agent turns reached ({turn_budget['max_turns']}).",
                     }, "stop", 0, 0
                 async with state_lock:
+                    self._check_recorder_session_open(main_session)
                     sess = self._sessions.setdefault(session_id, self._fresh_session_state())
                     t_enter = time.perf_counter()
                     last_cmp = sess.get("last_completion_perf")
@@ -1572,9 +1954,10 @@ class _VLLMChatCompletionsProxy:
                 sampling_params = self._translate_sampling_params(
                     body, defaults=sampling_defaults if is_codex else None
                 )
-                if is_codex:
-                    async with state_lock:
-                        sess["last_sampling_params"] = dict(sampling_params)
+                async with state_lock:
+                    sess["last_sampling_params"] = dict(sampling_params)
+                    if not sess.get("num_calls"):
+                        logger.info("[Proxy] effective sampling (session=%s): %s", session_id, sampling_params)
 
                 attempt.phase = "admission_wait"
                 try:
@@ -1637,6 +2020,7 @@ class _VLLMChatCompletionsProxy:
                         len(prompt_ids),
                     )
                     async with state_lock:
+                        self._check_recorder_session_open(sess)
                         fin = self._sessions.setdefault(session_id, self._fresh_session_state())
                         fin["last_completion_perf"] = time.perf_counter()
                         # Record context-window overflow as an explicit session signal so the agent
@@ -1650,6 +2034,7 @@ class _VLLMChatCompletionsProxy:
                 await self._finalize_generation(session_id, sess, output, len(prompt_ids))
 
                 async with state_lock:
+                    self._check_recorder_session_open(sess)
                     s = self._sessions.setdefault(session_id, self._fresh_session_state())
                     s["proxy_model_inference_sec"] = float(s.get("proxy_model_inference_sec") or 0.0) + inference_sec
 
@@ -1671,14 +2056,16 @@ class _VLLMChatCompletionsProxy:
                             ChatCompletionRequest,
                         )
 
-                        _dummy_req = ChatCompletionRequest.model_validate(
+                        _parser_req = ChatCompletionRequest.model_validate(
                             {
                                 "messages": [{"role": "user", "content": "-"}],
                                 "model": body.get("model") or "vllm-rollout",
+                                # Scope typed XML recovery to Codex; preserve
+                                # other harnesses until separately validated.
                                 "tools": tools if is_codex else None,
                             }
                         )
-                        extracted = self._vllm_tool_parser.extract_tool_calls(decoded_out, _dummy_req)
+                        extracted = self._vllm_tool_parser.extract_tool_calls(decoded_out, _parser_req)
                     except Exception as exc:
                         logger.exception(
                             "[Proxy] vLLM tool parser failed (session=%s): %s",
@@ -1722,14 +2109,13 @@ class _VLLMChatCompletionsProxy:
                 # response; if the trial ends here, no further request arrives to extend history.
                 # Append this turn so ``pop_session`` / ``proxy_trajectory.json`` include the last reply.
                 async with state_lock:
+                    self._check_recorder_session_open(sess)
                     sess = self._sessions.setdefault(session_id, self._fresh_session_state())
                     prev_snap = sess.get("messages_snapshot") or []
                     normalized_assistant = _normalize_openai_messages_for_template([message])[0]
                     sess["messages_snapshot"] = list(prev_snap) + [normalized_assistant]
-                    if output.token_ids:
-                        sess["last_generation_snapshot"] = _copy_messages_for_snapshot(
-                            sess["messages_snapshot"]
-                        )
+                    if sess.get("trajectory_recorder") is not None:
+                        sess["last_generation_snapshot"] = _copy_messages_for_snapshot(sess["messages_snapshot"])
                     prev_debug = list(sess.get("message_snap_debug") or [])
                     if len(prev_debug) != len(prev_snap):
                         logger.warning(
@@ -1743,7 +2129,12 @@ class _VLLMChatCompletionsProxy:
                     sess["message_snap_debug"] = prev_debug + [
                         _message_snap_debug_entry(len(prev_snap), normalized_assistant, "assistant_append")
                     ]
-
+                    # Compaction bookkeeping: remember this reply so a follow-up
+                    # request that quotes it (a compacted history) is recognised
+                    # as the same conversation, not a sub-agent.
+                    sess["last_assistant_text"] = str(message.get("content") or "")
+                    sess["last_assistant_tokens"] = len(output.token_ids)
+                    is_summarizer = bool(sess.get("summarizer_of"))
                     if turn_budget is not None:
                         turn_budget["completed_assistant_turns"] += 1
 
@@ -1773,6 +2164,9 @@ class _VLLMChatCompletionsProxy:
 
                     sess["last_completion_perf"] = time.perf_counter()
 
+                if is_summarizer:
+                    await self._archive_summary_segment(sess)
+
                 if _message_calls_finish_tool(message):
                     await self._session_scheduler.finish_session(session_id, reason="finish_tool")
 
@@ -1781,14 +2175,16 @@ class _VLLMChatCompletionsProxy:
             attempt.phase = "done"
             await self._clear_session_attempt(session_id, attempt)
 
-    async def _handle_chat(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+
+    async def _handle_chat(
+        self, request: aiohttp.web.Request, summarizer: bool = False
+    ) -> aiohttp.web.Response:
         try:
             body = await request.json()
         except Exception as exc:
             return _proxy_error(400, f"Invalid JSON body: {exc}")
 
-        if body.get("stream"):
-            return _proxy_error(400, "stream=True is not supported by the verl proxy")
+        stream = bool(body.get("stream"))
 
         n_choices = int(body.get("n") or 1)
         if n_choices != 1:
@@ -1800,7 +2196,7 @@ class _VLLMChatCompletionsProxy:
 
         try:
             message, finish_reason, p_tok, c_tok = await self._generate_assistant_message(
-                session_id, messages, tools, body
+                session_id, messages, tools, body, summarizer=summarizer
             )
         except _AdmissionPreempted as exc:
             logger.info("[Proxy] chat request preempted (session=%s)", session_id)
@@ -1821,9 +2217,46 @@ class _VLLMChatCompletionsProxy:
                 "total_tokens": p_tok + c_tok,
             },
         }
+        if stream:
+            return await self._chat_sse_response(request, resp)
         return await self._logged_json_response(
             request, resp, session_id=session_id, api="chat"
         )
+
+
+    async def _chat_sse_response(self, request, completion):
+        """Replay an archived completion as OpenAI SSE, preserving sampling tokens.
+
+        Like the Anthropic/Responses surfaces, generation and trajectory capture
+        finish before HTTP replay. Tool argument strings and reasoning content
+        travel unchanged; no second generation or tokenization is performed.
+        """
+        response = aiohttp.web.StreamResponse(headers={
+            "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+        })
+        choice = completion["choices"][0]
+        delta = deepcopy(choice["message"])
+        if delta.get("tool_calls"):
+            delta["tool_calls"] = [
+                {**call, "index": i} for i, call in enumerate(delta["tool_calls"])
+            ]
+        base = {k: completion[k] for k in ("id", "created", "model")}
+        base["object"] = "chat.completion.chunk"
+        chunks = [
+            {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+            {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}]},
+            {**base, "choices": [], "usage": completion["usage"]},
+        ]
+        try:
+            await response.prepare(request)
+            for chunk in chunks:
+                await response.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode())
+            await response.write(b"data: [DONE]\n\n")
+            await response.write_eof()
+        except (ConnectionError, RuntimeError) as exc:
+            logger.warning("[Proxy] chat SSE client disconnected after generation: %s", exc)
+        return response
+
 
     async def _handle_messages_anon(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
         request.match_info["session_id"] = "anon-" + uuid4().hex
@@ -2072,161 +2505,299 @@ class _VLLMChatCompletionsProxy:
         return resp
 
 
-    async def _compute_prompt_ids(self, sess: dict, messages: list[dict], tools: list[dict] | None, session_id: str) -> list[int]:
-        sess["pending_retry"] = False
-        # Only disable token-level trajectory archiving for *genuinely* multimodal
-        # requests. A processor object being loaded (Qwen3.5 base ships
-        # processor_config.json) does NOT imply multimodal: text-only requests
-        # tokenize identically via the tokenizer path, so keep proxy-token fidelity.
+    def _is_compaction_continuation(self, session_id: str, messages: list[dict]) -> bool:
+        """Does this request resume the main thread from a summary this session wrote?
+
+        Checks the last reply of the main thread (Claude Code / Codex compact on
+        the main thread) and of every isolated sub-thread of the session
+        (OpenCode's compaction agent runs under its own system prompt). Falls back
+        to the harness continuation markers when the summary is shorter than the
+        quote threshold. Caller holds ``_sessions_lock``.
+        """
+        for key in (session_id, *self._sub_session_keys.get(session_id, ())):
+            st = self._sessions.get(key)
+            if st is None:
+                continue
+            # A trainable sub-agent may compact its own history. Its summary
+            # must not turn that continuation into the parent conversation.
+            if st.get("trainable_subagent"):
+                continue
+            if _messages_quote_text(
+                messages, st.get("last_assistant_text") or "", _COMPACTION_QUOTE_MIN_CHARS
+            ):
+                return True
+        # Markers: the global list plus the harness card's own continuation text.
+        profile = (self._sessions.get(session_id) or {}).get("compaction_profile") or {}
+        markers = list(_COMPACTION_CONTINUATION_MARKERS) + [
+            str(m) for m in (profile.get("markers") or []) if m
+        ]
+        return _messages_have_continuation_marker(messages, markers)
+
+
+    def session_summ_url(self, session_id: str) -> str:
+        """OpenAI-style base URL of a session's summarizer route: the harness's
+        compaction/condenser LLM client points here so its summaries are archived
+        as ``kind="summary"`` segments of the trial (see _open_summarizer_session)."""
+        return f"{self.base_url}/sess/{quote(session_id, safe='')}/summ/v1"
+
+
+    def _is_native_summary_request(self, session_id: str, messages: list[dict], tools) -> bool:
+        """Recognize a harness-declared summary request without rewriting main history.
+
+        Codex drops tool definitions when asking for its checkpoint summary. It
+        therefore needs a separate prompt even though the messages are a prefix
+        extension. Other edits, retries and sub-agent histories keep their routes.
+        """
+        main = self._sessions.get(session_id) or {}
+        prefix = (main.get("compaction_profile") or {}).get("summary_request_prefix")
+        snapshot = main.get("messages_snapshot")
+        if not prefix or tools or not snapshot or main.get("disable_proxy_trajectory"):
+            return False
+        if len(messages) <= len(snapshot) or not _messages_is_prefix(snapshot, messages):
+            return False
+        last = messages[-1]
+        return (
+            last.get("role") == "user"
+            and isinstance(last.get("content"), str)
+            and last["content"].startswith(prefix)
+        )
+
+
+    async def _route_generation_session(self, session_id, messages, tools, summarizer=False):
+        native_summary = not summarizer and self._is_native_summary_request(session_id, messages, tools)
+        if (summarizer or native_summary) and session_id in self._sessions:
+            # Check the parent budget before allocating a new state. A summary
+            # request must not bypass the trial's compaction or generation limit.
+            self._check_compaction_budget(self._sessions[session_id], session_id, about_to_compact=True)
+        if summarizer or native_summary:
+            effective, is_subagent = await self._open_summarizer_session(session_id)
+            self._sessions[effective]["native_summary"] = native_summary
+            return effective, is_subagent
+        return await self._route_subagent_session(session_id, messages)
+
+
+    async def _open_summarizer_session(self, session_id: str) -> tuple[str, bool]:
+        """State key for one request on the ``/summ/`` route of ``session_id``.
+
+        Every summarizer request gets a fresh, archived state key so its prompt
+        (the history to summarize) and the sampled summary form one complete
+        segment; ``_archive_summary_segment`` files it under the main session
+        once generated. The key is registered like a sub-thread so the routing's
+        compaction check sees the summary and ``pop_session`` cleans it up.
+        """
+        async with self._sessions_lock:
+            n = int(self._summ_seq.get(session_id) or 0) + 1
+            self._summ_seq[session_id] = n
+            eff = f"{session_id}::summ::{n}"
+            main = self._sessions.get(session_id)
+            st = self._fresh_session_state()
+            st["session_id"] = eff
+            st["summarizer_of"] = session_id
+            # Archive only when the main thread is archived (and exists): an
+            # anonymous / multimodal session has no trainable trajectory to join.
+            st["disable_proxy_trajectory"] = (
+                main is None or bool(main.get("disable_proxy_trajectory"))
+            )
+            self._sessions[eff] = st
+            self._session_state_locks.setdefault(eff, asyncio.Lock())
+            self._sub_session_keys.setdefault(session_id, set()).add(eff)
+            return eff, True
+
+
+    async def _archive_summary_segment(self, sess: dict) -> None:
+        """File a finished summarizer request as a ``kind="summary"`` segment of
+        the main session it belongs to (CompactionRL: summary tokens are policy
+        actions optimized under the task reward; ``HARBOR_COMPACTION_TRAIN_SUMMARY=0``
+        keeps them as context instead)."""
+        base = sess.get("summarizer_of")
+        if sess.get("trajectory_recorder") is not None:
+            if not base or sess.get("recorder_closed") or sess.get("disable_proxy_trajectory") or sess.get("summary_archived"):
+                return
+            segments = sess["trajectory_recorder"].export()
+            if not segments:
+                return
+            for seg in segments:
+                seg.update(kind="summary", boundary="summarizer",
+                    summary_text=sess.get("last_assistant_text") or "",
+                    summary_tokens=sum(seg["response_mask"]))
+                if not _TRAIN_SUMMARY:
+                    seg["response_mask"] = [0] * len(seg["response_mask"])
+            async with self._sessions_lock:
+                main = self._sessions.get(base)
+                if main is None or main.get("disable_proxy_trajectory") or sess.get("summary_archived"):
+                    return
+                main.setdefault("segments", []).extend(segments)
+                sess["summary_archived"] = True
+                if sess.get("native_summary"):
+                    main["native_summary_pending"] = True
+                main["gen_tokens_total"] += int(sess.get("gen_tokens_total") or 0)
+                main["summaries_since_compaction"] += 1
+            return
+
+    def _check_compaction_budget(self, sess: dict, session_id: str, about_to_compact: bool) -> None:
+        """Refuse the request when the trial's cross-compaction budget is spent.
+
+        Raises ``_CompactionBudgetExceeded`` (a context-overflow-shaped error) and
+        flags ``context_overflow`` on the session so the agent loop classifies the
+        trajectory as overlong. Called before any state is modified, so the live
+        archive is left exactly as it was.
+        """
+        if sess.get("summarizer_of") or sess.get("disable_proxy_trajectory"):
+            return
+        n_comp = int(sess.get("compaction_count") or 0)
+        if about_to_compact and _COMPACTION_MAX > 0 and n_comp >= _COMPACTION_MAX:
+            what = f"compaction budget exhausted (compactions={n_comp}, max={_COMPACTION_MAX})"
+        elif _GEN_TOKEN_BUDGET > 0 and int(sess.get("gen_tokens_total") or 0) >= _GEN_TOKEN_BUDGET:
+            what = (
+                f"generation budget exhausted (generated={int(sess.get('gen_tokens_total') or 0)}, "
+                f"budget={_GEN_TOKEN_BUDGET})"
+            )
+        else:
+            return
+        sess["context_overflow"] = True
+        sess["budget_refusals"] = int(sess.get("budget_refusals") or 0) + 1
+        logger.warning("[Proxy] refusing request: %s (session=%s)", what, session_id)
+        raise _CompactionBudgetExceeded(session_id, what)
+
+
+    def _record_successful_generation(self, sess, output, routes, mn, mx):
+        recorder = sess["trajectory_recorder"]
+        output_ids = list(output.token_ids)
+        prompt_ids = list(sess.get("rolling_acc_ids") or [])
+        tail = list(self._assistant_eos_tail) if (output_ids and
+            self._assistant_eos_token_id is not None and output_ids[-1] == self._assistant_eos_token_id) else []
+        pending = sess.get("record_pending") or {}
+        cause = pending.get("cause")
+        compaction = cause in _COMPACTION_REBUILD_CAUSES
+        if output_ids and not sess.get("disable_proxy_trajectory"):
+            # The caller has checked lengths before mutating budget or archive.
+            if pending.get("retry"):
+                recorder.rollback_last_generation()
+            if cause:
+                counts = sess.setdefault("rebuild_counts", {})
+                counts[cause] = int(counts.get(cause) or 0) + 1
+            if recorder.current is not None and cause:
+                recorder.current.metadata.update(boundary=cause, messages_snapshot=pending["snapshot"])
+            if compaction:
+                profile = sess.get("compaction_profile") or {}
+                expected = profile.get("mode")
+                if expected and cause != "compaction_" + expected:
+                    sess["compaction_shape_mismatch"] += 1
+                if profile.get("summary") == "summ_route" and not sess.get("summaries_since_compaction"):
+                    sess["compaction_summary_missing"] += 1
+                on_thread = (cause == "compaction_replace" and
+                    profile.get("summary", "on_thread") == "on_thread" and
+                    not pending.get("native_summary_pending"))
+                current = recorder.current
+                if current is not None:
+                    n_summary = pending["summary_tokens"] if on_thread else 0
+                    current.metadata.update(summary_tokens=n_summary,
+                        summary_text=pending.get("summary_text") if on_thread else None)
+                    if on_thread and not _TRAIN_SUMMARY and current.generations:
+                        start, end, _, _ = current.generations[-1]
+                        current.response_mask[start:end] = [0] * (end-start)
+                sess["compaction_count"] += 1
+                sess["summaries_since_compaction"] = 0
+                sess["native_summary_pending"] = False
+            recorder.record(prompt_ids, output_ids, None if output.log_probs is None else list(output.log_probs), routes,
+                context_tail=tail, min_global_steps=mn, max_global_steps=mx,
+                force_boundary=compaction,
+                metadata={"kind": "exec", "boundary": "live", "seq_end": sess["last_gen_seq"]})
+            sess["last_generation_messages"] = _copy_messages_for_snapshot(sess.get("messages_snapshot") or [])
+            sess["last_generation_tools"] = deepcopy(sess.get("last_tools"))
+            sess["last_generation_snapshot"] = None
+            sess["record_pending"] = None
+        sess["rolling_acc_ids"] = prompt_ids + output_ids + tail
+
+
+    async def _handle_chat_summ(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        """``/sess/{id}/summ/v1/chat/completions``: the harness's summarizer client."""
+        return await self._handle_chat(request, summarizer=True)
+
+
+    @staticmethod
+    def _check_recorder_session_open(sess: dict) -> None:
+        # A timeout may export/pop this same state while inference is in flight.
+        # Late completions must neither mutate the exported batch nor recreate
+        # a session that the harness has already closed.
+        if sess.get("recorder_closed"):
+            raise asyncio.CancelledError("Recorder session closed during generation")
+
+
+    async def _compute_prompt_ids(self, sess, messages, tools, session_id):
+        """Prepare engine input without overwriting previously sampled actions."""
+        pending_cause = sess.pop("pending_rebuild_cause", None)
+        self._check_compaction_budget(sess, session_id, about_to_compact=False)
         if self._processor is not None and _messages_have_multimodal(messages):
             sess["disable_proxy_trajectory"] = True
-            ids = await self._agent_loop.apply_chat_template(messages, tools=tools)
-            sess["rolling_acc_ids"] = list(ids)
-            sess["messages_snapshot"] = _copy_messages_for_snapshot(messages)
-            sess["message_snap_debug"] = _message_snap_debug_for(messages, "incoming_multimodal")
-            sess["last_tools"] = tools
-            sess["incremental_tokenize_ok"] = False
-            return list(ids)
-
-        if sess.get("messages_snapshot") is None:
-            ids = await self._agent_loop.apply_chat_template(messages, tools=tools)
-            ids_list = list(ids)
-            sess["rolling_acc_ids"] = ids_list
-            sess["messages_snapshot"] = _copy_messages_for_snapshot(messages)
-            sess["message_snap_debug"] = _message_snap_debug_for(messages, "incoming_initial")
-            sess["last_tools"] = tools
-            sess["incremental_tokenize_ok"] = True
-            return ids_list
-
-        snap = sess["messages_snapshot"]
-        # Prompt preparation mutates snap even if generation subsequently
-        # fails. Retry detection must compare with the last successful reply.
-        successful_snap = sess.get("last_generation_snapshot")
+        snap = sess.get("messages_snapshot")
         previous_request = sess.get("last_generation_messages")
-        retry = (
-            previous_request is not None
-            and _tools_equal(sess.get("last_generation_tools"), tools)
-            and _messages_is_prefix(previous_request, messages)
-        )
-        suffix = messages[len(previous_request) :] if retry else []
-        retry = retry and (
-            not suffix
-            or (
-                len(suffix) == 1
-                and suffix[0].get("role") == "assistant"
-                and (successful_snap is None or not _messages_is_prefix(successful_snap, messages))
-            )
-        )
-        if (
-            retry
-            or not _messages_is_prefix(snap, messages)
-            or not _tools_equal(sess.get("last_tools"), tools)
-        ):
-            trajectory_dir = sess.get("trajectory_dir")
-            logger.info(
-                "messages are not a prefix extension of the snapshot or tools are not the same as tools "
-                "in the snapshot, starting a new context segment "
-                "(session_id=%s, trajectory_dir=%s)",
-                session_id,
-                trajectory_dir,
-            )
-            if trajectory_dir:
-                snap_for_dump = deepcopy(snap)
-                snap_debug_for_dump = deepcopy(sess.get("message_snap_debug") or [])
-                messages_for_dump = deepcopy(messages)
-
-                def _dump_prefix_mismatch_files() -> None:
-                    base = Path(trajectory_dir)
-                    base.mkdir(parents=True, exist_ok=True)
-                    ts = _utc_debug_timestamp()
-                    (base / f"prefix_mismatch_snap_{ts}.json").write_text(
-                        json.dumps(snap_for_dump, ensure_ascii=False, indent=2, default=str),
-                        encoding="utf-8",
-                    )
-                    (base / f"prefix_mismatch_snap_debug_{ts}.json").write_text(
-                        json.dumps(snap_debug_for_dump, ensure_ascii=False, indent=2, default=str),
-                        encoding="utf-8",
-                    )
-                    (base / f"prefix_mismatch_message_{ts}.json").write_text(
-                        json.dumps(messages_for_dump, ensure_ascii=False, indent=2, default=str),
-                        encoding="utf-8",
-                    )
-
-                try:
-                    await asyncio.to_thread(_dump_prefix_mismatch_files)
-                except Exception as dump_exc:
-                    logger.warning(
-                        "[Proxy] failed to persist prefix-mismatch debug files "
-                        "(session_id=%s, dir=%s): %s",
-                        session_id,
-                        trajectory_dir,
-                        dump_exc,
-                    )
-
-            # A retry of the *latest* request may replace its unconsumed
-            # assistant reply. Only this exact case is rolled back; arbitrary
-            # history edits retain the previously sampled actions in a segment.
+        successful_snap = sess.get("last_generation_snapshot")
+        retry = (previous_request is not None
+                 and _tools_equal(sess.get("last_generation_tools"), tools)
+                 and _messages_is_prefix(previous_request, messages))
+        suffix = messages[len(previous_request):] if retry else []
+        retry = retry and (not suffix or (len(suffix) == 1
+                 and suffix[0].get("role") == "assistant"
+                 and (successful_snap is None or not _messages_is_prefix(successful_snap, messages))))
+        sess["pending_retry"] = bool(retry and not pending_cause)
+        changed = snap is not None and (retry or pending_cause or
+                  not _messages_is_prefix(snap, messages) or not _tools_equal(sess.get("last_tools"), tools))
+        if changed:
+            profile = sess.get("compaction_profile") or {}
+            n_summary = int(sess.get("summaries_since_compaction") or 0)
+            summary_texts = ()
+            if profile.get("mode") == "inplace" and profile.get("summary") == "summ_route" and n_summary:
+                summary_texts = tuple(s["summary_text"] for s in
+                    [s for s in sess.get("segments", []) if s.get("kind") == "summary"][-n_summary:]
+                    if s.get("summary_text"))
+            cause = pending_cause or ("retry" if retry else _classify_rebuild(
+                snap, messages, pending_summary_texts=summary_texts,
+                initial_prefix=(self._main_identity.get(session_id) or {}).get("initial")))
+            is_compaction = cause in _COMPACTION_REBUILD_CAUSES
+            if is_compaction:
+                self._check_compaction_budget(sess, session_id, about_to_compact=True)
+            # Commit boundary/counts only after a nonempty generation succeeds.
+            # A failed request, including a failed retry, preserves the archive.
+            sess["record_pending"] = {
+                "cause": cause, "retry": bool(retry and not is_compaction),
+                "snapshot": _copy_messages_for_snapshot(snap),
+                "summary_text": sess.get("last_assistant_text"),
+                "summary_tokens": int(sess.get("last_assistant_tokens") or 0),
+                "native_summary_pending": bool(sess.get("native_summary_pending")),
+            }
+        if snap is None or changed or sess.get("disable_proxy_trajectory"):
             recorder = sess["trajectory_recorder"]
-            current = recorder.current
-            if retry and current is not None and current.generations:
-                start = current.generations[-1][0]
-                ids = current.prompt_ids + current.response_ids[:start]
-                if suffix:
-                    # A replaced assistant is context, not a sampled action.
-                    # Full rendering starts a new segment if the token prefix
-                    # cannot be kept exactly.
-                    ids = list(await self._agent_loop.apply_chat_template(messages, tools=tools))
-                sess["pending_retry"] = True
+            if retry and not suffix and recorder.current is not None and recorder.current.generations:
+                start = recorder.current.generations[-1][0]
+                ids = recorder.current.prompt_ids + recorder.current.response_ids[:start]
             else:
                 ids = list(await self._agent_loop.apply_chat_template(messages, tools=tools))
-            sess["rolling_acc_ids"] = list(ids)
-            sess["messages_snapshot"] = _copy_messages_for_snapshot(messages)
-            sess["message_snap_debug"] = _message_snap_debug_for(messages, "incoming_rebuild")
-            sess["last_tools"] = deepcopy(tools)
-            # Do not alter the archive while preparing a request. It is sealed
-            # only after generation succeeds, using the exact engine input ids.
-            return list(ids)
-
-        # ``snap`` must end with the prior turn's assistant message (appended in
-        # ``_handle_chat`` after each successful generation) so ``delta`` is only
-        # new user/tool content—never a duplicate assistant span already emitted as completion ids.
-        delta = messages[len(snap) :]
-        if not delta:
-            return list(sess["rolling_acc_ids"])
-
-        delta_ids = await self._agent_loop.apply_chat_template(
-            delta, tools=None, remove_system_prompt=True
-        )
-        delta_ids = list(delta_ids)
-        new_prompt = list(sess["rolling_acc_ids"]) + delta_ids
-
-        sess["rolling_acc_ids"] = new_prompt
+        else:
+            delta = messages[len(snap):]
+            delta_ids = list(await self._agent_loop.apply_chat_template(
+                delta, tools=None, remove_system_prompt=True)) if delta else []
+            ids = list(sess.get("rolling_acc_ids") or []) + delta_ids
+        sess["rolling_acc_ids"] = list(ids)
         sess["messages_snapshot"] = _copy_messages_for_snapshot(messages)
-        prev_debug = list(sess.get("message_snap_debug") or [])
-        if len(prev_debug) != len(snap):
-            logger.warning(
-                "[Proxy] message_snap_debug length mismatch before delta append "
-                "(session=%s, debug_len=%d, snapshot_len=%d); rebuilding debug metadata",
-                session_id,
-                len(prev_debug),
-                len(snap),
-            )
-            prev_debug = _message_snap_debug_for(snap, "existing_snapshot")
-        sess["message_snap_debug"] = prev_debug + _message_snap_debug_for(
-            delta, "incoming_delta", start_index=len(snap)
-        )
-        sess["last_tools"] = tools
+        sess["message_snap_debug"] = _message_snap_debug_for(messages, "incoming_recorder")
+        sess["last_tools"] = deepcopy(tools)
+        return ids
 
-        return new_prompt
 
     async def _finalize_generation(self, session_id: str, sess: dict, output: TokenOutput, prompt_len: int) -> None:
+        self._check_recorder_session_open(sess)
         state_lock = await self._get_session_state_lock(session_id)
         async with state_lock:
+            self._check_recorder_session_open(sess)
             s = self._sessions.setdefault(session_id, self._fresh_session_state())
             s.update(sess)
             s["num_calls"] += 1
             s["total_prompt_tokens"] += prompt_len
             s["total_completion_tokens"] += len(output.token_ids)
+            self._gen_seq += 1
+            s["last_gen_seq"] = self._gen_seq
+            s["gen_tokens_total"] += len(output.token_ids)
             if output.num_preempted is not None and output.num_preempted > 0:
                 s["num_preempted"] += int(output.num_preempted)
             if output.stop_reason in ("aborted", "abort"):
@@ -2251,22 +2822,10 @@ class _VLLMChatCompletionsProxy:
                 else []
             )
             if not s.get("disable_proxy_trajectory"):
-                recorder = s["trajectory_recorder"]
                 if output.log_probs is not None and len(output.log_probs) != len(output_ids):
                     raise ValueError("Generated token ids and logprobs must have identical lengths")
-                if s.get("pending_retry") and output_ids:
-                    recorder.rollback_last_generation()
-                recorder.record(
-                    prompt_ids,
-                    output_ids,
-                    None if output.log_probs is None else list(output.log_probs),
-                    _turn_routing_per_token(
-                        getattr(output, "routed_experts", None), len(output_ids)
-                    ),
-                    context_tail=tail,
-                    min_global_steps=mn,
-                    max_global_steps=mx,
-                )
+                routes = _turn_routing_per_token(getattr(output, "routed_experts", None), len(output_ids))
+                self._record_successful_generation(s, output, routes, mn, mx)
             s["rolling_acc_ids"] = prompt_ids + output_ids + tail
             if output_ids:
                 s["last_generation_messages"] = _copy_messages_for_snapshot(
@@ -2275,6 +2834,7 @@ class _VLLMChatCompletionsProxy:
                 s["last_generation_tools"] = deepcopy(s.get("last_tools"))
                 s["last_generation_snapshot"] = None
             s["pending_retry"] = False
+
 
     @staticmethod
     def _translate_sampling_params(body: dict, defaults: dict | None = None) -> dict:

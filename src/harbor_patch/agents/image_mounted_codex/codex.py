@@ -119,6 +119,25 @@ class Codex(_BaseCodex):
                 "",
             ]
         )
+        # Context compaction (CompactionRL): codex only auto-compacts a model it
+        # knows the context window of, and vllm_model is not one of them. Both
+        # keys come from harbor/compaction.env; unset leaves codex's own defaults.
+        # Key names are the codex-cli config schema's (verify against the pinned
+        # runtime with `codex --help` / config docs if the version moves).
+        context_window = self._get_env("CODEX_MODEL_CONTEXT_WINDOW") or os.environ.get(
+            "CODEX_MODEL_CONTEXT_WINDOW"
+        )
+        compact_limit = self._get_env("CODEX_AUTO_COMPACT_TOKEN_LIMIT") or os.environ.get(
+            "CODEX_AUTO_COMPACT_TOKEN_LIMIT"
+        )
+        compaction_lines = []
+        if context_window and str(context_window).strip().isdigit():
+            compaction_lines.append(f"model_context_window = {int(context_window)}")
+        if compact_limit and str(compact_limit).strip().isdigit():
+            compaction_lines.append(f"model_auto_compact_token_limit = {int(compact_limit)}")
+        if compaction_lines:
+            # Top-level keys must precede the [model_providers.*] table in TOML.
+            toml = "\n".join(compaction_lines) + "\n" + toml
         await environment.exec(
             command=f"mkdir -p {codex_home} && echo {shlex.quote(toml)} > {codex_home}/config.toml"
         )

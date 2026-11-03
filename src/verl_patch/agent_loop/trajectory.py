@@ -15,6 +15,7 @@ from typing import Any
 @dataclass
 class TrajectorySegment:
     prompt_ids: list[int]
+    metadata: dict[str, Any] = field(default_factory=dict)
     response_ids: list[int] = field(default_factory=list)
     response_mask: list[int] = field(default_factory=list)
     response_logprobs: list[float] | None = field(default_factory=list)
@@ -47,6 +48,7 @@ class TrajectorySegment:
             if lo is not None and hi is not None
         ]
         return {
+            **deepcopy(self.metadata),
             "prompt_ids": list(self.prompt_ids),
             "response_ids": list(self.response_ids),
             "response_mask": list(self.response_mask),
@@ -81,6 +83,8 @@ class TrajectoryRecorder:
         routing: list[Any],
         *,
         context_tail: list[int] | tuple[int, ...] = (),
+        force_boundary: bool = False,
+        metadata: dict[str, Any] | None = None,
         min_global_steps: int | None = None,
         max_global_steps: int | None = None,
     ) -> None:
@@ -95,14 +99,15 @@ class TrajectoryRecorder:
         if not output_ids:
             return
         previous = self.current.token_ids if self.current is not None else []
-        if self.current is None or prompt_ids[: len(previous)] != previous:
-            if self.current is not None and self.current.num_model_tokens:
+        if force_boundary or self.current is None or prompt_ids[: len(previous)] != previous:
+            if self.current is not None and self.current.generations:
                 self.segments.append(self.current)
             self.current = TrajectorySegment(prompt_ids=list(prompt_ids))
         else:
             self.current.append_context(prompt_ids[len(previous) :])
 
         segment = self.current
+        segment.metadata.update(metadata or {})
         start = len(segment.response_ids)
         segment.response_ids.extend(output_ids)
         segment.response_mask.extend([1] * len(output_ids))
@@ -144,7 +149,7 @@ class TrajectoryRecorder:
 
     def export(self) -> list[dict[str, Any]]:
         segments = self.segments + ([self.current] if self.current is not None else [])
-        return [segment.as_dict() for segment in segments if segment.num_model_tokens]
+        return [segment.as_dict() for segment in segments if segment.generations]
 
 
 def select_trajectories(
