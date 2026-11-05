@@ -1059,3 +1059,100 @@ index 0000000..be73128
 +        attempt["fake_env"].stop.assert_awaited_once_with(delete=True)
 +    assert patch.read_text() == "original committed submission"
 +    assert "InvalidRewardError" in RetryConfig().exclude_exceptions
+
+--- a/src/harbor/agents/custom/openhands_sdk.py
++++ b/src/harbor/agents/custom/openhands_sdk.py
+@@ -92,6 +92,7 @@
+         load_skills: bool = True,
+         skill_paths: list[str] | None = None,
+         collect_token_ids: bool = False,
++        enable_subagent: bool = False,
+         max_iterations: int | None = None,
+         temperature: float | None = None,
+         send_reasoning_content_models: str | list[str] | None = None,
+@@ -150,6 +151,7 @@
+         self._load_skills = load_skills
+         self._skill_paths = skill_paths or self.DEFAULT_SKILL_PATHS
+         self._collect_token_ids = collect_token_ids
++        self._enable_subagent = enable_subagent
+         self._max_iterations = max_iterations
+         self._temperature = temperature
+         self._send_reasoning_content_models = _normalize_send_reasoning_content_models(
+@@ -394,7 +396,7 @@
+             user="root",
+         )
+
+-        if mounted_runtime_python is None:
++        if mounted_runtime_python is None or self._enable_subagent:
+             runtime_entrypoint_path = self._repo_runtime_entrypoint_path()
+             runtime_copy = self.logs_dir / "run_openhands_harbor.py"
+             runtime_copy.write_text(runtime_entrypoint_path.read_text())
+@@ -469,6 +471,7 @@
+         env["AGENT_LOGS_DIR"] = "/logs/agent"
+         env["TRAJECTORY_PATH"] = f"/logs/agent/{self._TRAJECTORY_FILENAME}"
+         env["LOAD_SKILLS"] = "1" if self._load_skills else "0"
++        env["HARBOR_OPENHANDS_ENABLE_SUBAGENT"] = "1" if self._enable_subagent else "0"
+         env["SKILL_PATHS"] = ":".join(self._skill_paths)
+
+         # Pass MCP server config so run_agent.py can register them with the SDK
+@@ -543,7 +546,7 @@
+
+         env[self._CUSTOM_RUNTIME_ENTRYPOINT_ENV] = (
+             self._mounted_runtime_entrypoint()
+-            if self._resolved_python_path != self._legacy_venv_python()
++            if not self._enable_subagent and self._resolved_python_path != self._legacy_venv_python()
+             else str(self._LEGACY_RUNTIME_ENTRYPOINT)
+         )
+         env[self._CUSTOM_RUNTIME_PYTHON_ENV] = self._current_python_path()
+--- a/scripts/agent_runtimes/openhands-sdk/1.33.0/runtime/run_openhands_harbor.py
++++ b/scripts/agent_runtimes/openhands-sdk/1.33.0/runtime/run_openhands_harbor.py
+@@ -302,6 +302,7 @@
+         Conversation,
+         Tool,
+         get_logger,
++        register_agent,
+     )
+     from openhands.sdk.context import Skill
+     from openhands.sdk.event import (
+@@ -350,6 +351,10 @@
+         Tool(name=FileEditorTool.name),
+         Tool(name=TaskTrackerTool.name),
+     ]
++    if os.environ.get("HARBOR_OPENHANDS_ENABLE_SUBAGENT", "0") == "1":
++        from openhands.tools.task import TaskToolSet
++
++        tools.append(Tool(name=TaskToolSet.name))
+
+     skills: list[Skill] = []
+     if os.environ.get("LOAD_SKILLS", "1") == "1":
+@@ -449,5 +454,30 @@
+                 "no condenser will be attached.",
+                 condenser_type,
+             )
++
++    if os.environ.get("HARBOR_OPENHANDS_ENABLE_SUBAGENT", "0") == "1":
++        # TaskToolSet exposes the task action, while the SDK requires a separate
++        # agent factory for each subagent_type. Use a fresh condenser for every
++        # child so compaction and usage accounting match the parent policy.
++        child_tools = tools[:3]
++        parent_condenser = agent_kwargs.get("condenser")
++
++        def make_general_purpose_agent(child_llm: LLM) -> Agent:
++            child_kwargs: dict[str, Any] = {"llm": child_llm, "tools": child_tools}
++            if parent_condenser is not None:
++                child_cond_llm = parent_condenser.llm.model_copy(
++                    update={"usage_id": "condenser"}
++                )
++                child_cond_llm.reset_metrics()
++                child_kwargs["condenser"] = parent_condenser.model_copy(
++                    update={"llm": child_cond_llm}
++                )
++            return Agent(**child_kwargs)
++
++        register_agent(
++            name="general-purpose",
++            factory_func=make_general_purpose_agent,
++            description="General-purpose coding agent for repository tasks.",
++        )
+
+     agent = Agent(**agent_kwargs)

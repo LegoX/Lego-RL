@@ -1468,16 +1468,42 @@ class _VLLMChatCompletionsProxy:
             meta = self._sessions.pop(session_id, None) or self._fresh_session_state()
             meta["recorder_closed"] = True
             self._summ_seq.pop(session_id, None)
-            # Drop the main-conversation identity and any isolated sub-agent
-            # threads that shared this session; they are never trained, so just
-            # discard their state to avoid leaking across trials.
+            # Export enabled child archives before closing all trial states.
             self._main_identity.pop(session_id, None)
             self._session_generation_locks.pop(session_id, None)
             self._session_state_locks.pop(session_id, None)
             self._session_attempts.pop(session_id, None)
-            sub_keys = tuple(self._sub_session_keys.pop(session_id, ()))
+            sub_keys = list(self._sub_session_keys.pop(session_id, ()))
+            seen = set(sub_keys)
+            for key in sub_keys:
+                for descendant in self._sub_session_keys.pop(key, ()):
+                    if descendant not in seen:
+                        seen.add(descendant)
+                        sub_keys.append(descendant)
+            child_segments = []
+            train_children = os.environ.get("HARBOR_TRAIN_SUBAGENTS", "0") == "1"
+            incomplete = False
             for sub_key in sub_keys:
                 child = self._sessions.pop(sub_key, None)
+                self._main_identity.pop(sub_key, None)
+                self._summ_seq.pop(sub_key, None)
+                if train_children and child is not None and child.get("trainable_subagent"):
+                    segments = child["trajectory_recorder"].export() + list(child.get("segments") or [])
+                    if child.get("num_calls") and child.get("disable_proxy_trajectory"):
+                        incomplete = True
+                    for segment in segments:
+                        count = len(segment["response_ids"])
+                        if segment.get("response_logprobs") is None or any(
+                            len(segment[key]) != count for key in
+                            ("response_mask", "response_logprobs", "response_routing")
+                        ):
+                            incomplete = True
+                        child_segments.append({**segment, "kind": "subagent", "subagent_session_id": sub_key,
+                                               "subagent_segment_kind": segment.get("kind", "exec")})
+                    meta.setdefault("subagent_discarded_generations", []).extend(
+                        child["trajectory_recorder"].discarded_generations)
+                    meta["subagent_num_calls"] = int(meta.get("subagent_num_calls") or 0) + int(child.get("num_calls") or 0)
+
                 if child is not None:
                     child["recorder_closed"] = True
                 self._session_generation_locks.pop(sub_key, None)
@@ -1486,10 +1512,13 @@ class _VLLMChatCompletionsProxy:
         await self._session_scheduler.finish_session(session_id, reason="pop_session")
         for sub_key in sub_keys:
             await self._session_scheduler.finish_session(sub_key, reason="pop_session")
+        meta["subagent_archive_incomplete"] = incomplete
+        if incomplete:
+            meta["disable_proxy_trajectory"] = True
         recorder = meta.pop("trajectory_recorder")
         meta["episode_id"] = session_id
         meta["trajectory_segments"] = sorted(
-            recorder.export() + list(meta.get("segments") or []),
+            recorder.export() + list(meta.get("segments") or []) + child_segments,
             key=lambda segment: int(segment.get("seq_end") or 0),
         )
         meta["discarded_generations"] = recorder.discarded_generations
@@ -1504,6 +1533,9 @@ class _VLLMChatCompletionsProxy:
                 "last_sampling_params": deepcopy(meta.get("last_sampling_params") or {}),
                 "trajectory_segments": meta["trajectory_segments"],
                 "discarded_generations": meta["discarded_generations"],
+                "subagent_discarded_generations": meta.get("subagent_discarded_generations", []),
+                "subagent_archive_incomplete": meta["subagent_archive_incomplete"],
+                "subagent_num_calls": int(meta.get("subagent_num_calls") or 0),
                 "messages_snapshot": _copy_messages_for_snapshot(
                     meta.get("messages_snapshot") or []
                 ),
@@ -1743,7 +1775,12 @@ class _VLLMChatCompletionsProxy:
             st = self._sessions.get(eff)
             if st is None:
                 st = self._fresh_session_state()
-                st["disable_proxy_trajectory"] = True
+                st["trainable_subagent"] = os.environ.get("HARBOR_TRAIN_SUBAGENTS", "0") == "1"
+                st["disable_proxy_trajectory"] = not st["trainable_subagent"]
+                if st["trainable_subagent"]:
+                    st["session_id"] = eff
+                    st["budget_parent"] = session_id
+                    st["compaction_profile"] = deepcopy((self._sessions.get(session_id) or {}).get("compaction_profile"))
                 self._sessions[eff] = st
                 self._session_state_locks.setdefault(eff, asyncio.Lock())
                 logger.info(
@@ -2593,6 +2630,7 @@ class _VLLMChatCompletionsProxy:
             st = self._fresh_session_state()
             st["session_id"] = eff
             st["summarizer_of"] = session_id
+            st["budget_parent"] = main.get("budget_parent") if main else None
             # Archive only when the main thread is archived (and exists): an
             # anonymous / multimodal session has no trainable trajectory to join.
             st["disable_proxy_trajectory"] = (
@@ -2727,6 +2765,12 @@ class _VLLMChatCompletionsProxy:
     async def _compute_prompt_ids(self, sess, messages, tools, session_id):
         """Prepare engine input without overwriting previously sampled actions."""
         pending_cause = sess.pop("pending_rebuild_cause", None)
+        parent_id = sess.get("budget_parent")
+        if parent_id:
+            parent = self._sessions.get(parent_id)
+            if parent is None or parent.get("recorder_closed"):
+                raise asyncio.CancelledError("Parent recorder session closed")
+            self._check_compaction_budget(parent, parent_id, about_to_compact=False)
         self._check_compaction_budget(sess, session_id, about_to_compact=False)
         if self._processor is not None and _messages_have_multimodal(messages):
             sess["disable_proxy_trajectory"] = True
@@ -2798,6 +2842,14 @@ class _VLLMChatCompletionsProxy:
             self._gen_seq += 1
             s["last_gen_seq"] = self._gen_seq
             s["gen_tokens_total"] += len(output.token_ids)
+            parent_id = s.get("budget_parent")
+            if parent_id:
+                parent_lock = await self._get_session_state_lock(parent_id)
+                async with parent_lock:
+                    parent = self._sessions.get(parent_id)
+                    if parent is None or parent.get("recorder_closed"):
+                        raise asyncio.CancelledError("Parent recorder session closed")
+                    parent["gen_tokens_total"] += len(output.token_ids)
             if output.num_preempted is not None and output.num_preempted > 0:
                 s["num_preempted"] += int(output.num_preempted)
             if output.stop_reason in ("aborted", "abort"):
