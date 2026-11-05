@@ -236,10 +236,22 @@ fi
 # --- 8. lr_scheduler / val timeout / rollout_is ── other silent pitfalls ───────────────────
 # Training-only: eval/infer have no optimizer, no val loop and no IS correction.
 if [ "${PF_KIND:-train}" = train ]; then
+    if [ "$(_lc "${HARBOR_MULTITURN_ENABLED:-false}")" = true ]; then
+        [ "${SCAFFOLD:-}" = cc ] || _pf_fatal "Multi-turn currently requires SCAFFOLD=cc"
+        [ "${HARBOR_TRAJECTORY_SELECTION:-longest}" = all ] || _pf_fatal "Multi-turn requires HARBOR_TRAJECTORY_SELECTION=all"
+        if [ "${HARBOR_MULTITURN_REWARD_MODE:-terminal}" = per_round ]; then
+            [ "${ADV_ESTIMATOR:-}" = grpo ] || _pf_fatal "Per-round rewards require ADV_ESTIMATOR=grpo"
+            [ "${N_RESP:-1}" -ge 2 ] || _pf_fatal "Per-round GRPO requires N_RESP>=2"
+        fi
+    fi
     case "${HARBOR_TRAJECTORY_SELECTION:-longest}" in
         longest) ;;
         all)
-            [ "$(_lc "${ADV_ESTIMATOR:-}")" = grpo ] || _pf_fatal "HARBOR_TRAJECTORY_SELECTION=all requires ADV_ESTIMATOR=grpo"
+            case "$(_lc "${ADV_ESTIMATOR:-}")" in
+                grpo) ;;
+                gae) [ "$(_lc "${CRITIC_ENABLE:-false}")" = true ] || _pf_fatal "Episode GAE requires CRITIC_ENABLE=True" ;;
+                *) _pf_fatal "HARBOR_TRAJECTORY_SELECTION=all requires ADV_ESTIMATOR=grpo or gae" ;;
+            esac
             case "$(_lc "${USE_KL_IN_REWARD:-False}")" in
                 false|0) ;; *) _pf_fatal "HARBOR_TRAJECTORY_SELECTION=all requires USE_KL_IN_REWARD=False" ;;
             esac

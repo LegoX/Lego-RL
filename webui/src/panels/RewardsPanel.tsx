@@ -1,3 +1,4 @@
+import MultiTurnPanel from "./MultiTurnPanel";
 import { useMemo } from "react";
 import ChartPanel, { MinMaxChart } from "../components/Chart";
 import type { MetricPoint } from "../types";
@@ -33,6 +34,7 @@ export default function RewardsPanel({ data }: Props) {
           </span>
         )}
       </p>
+      <MultiTurnPanel data={data} />
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {data.some(p => Number.isFinite(p["dashboard/reward/trial_mean"])) && (
           <ChartPanel title="Trial Reward (each attempt once, padding excluded)"

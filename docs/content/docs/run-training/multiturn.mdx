@@ -1,0 +1,126 @@
+---
+title: Multi-turn user feedback
+description: Keep one coding session across external user rounds and train its recorded segments.
+---
+
+Multi-turn mode lets a coding agent continue the same task after feedback from a
+fixed external user model. The policy sandbox, Claude Code session and proxy
+episode remain alive between user rounds. The user model and optional judge are
+external services; their generated tokens never become policy actions.
+
+This implementation supports the image-mounted Claude Code harness. It is opt-in:
+single-turn runs keep the existing agent loop and reward behavior.
+
+## Configure an experiment
+
+Start with `scripts/train/examples/multiturn_sao.env`. Replace all model, data,
+environment and sandbox paths. Set the simulator credential through the named
+environment variable on every rollout node; do not put credentials in a config
+file or repository. List `harbor/multiturn.env` before the ordinary Harbor module,
+and `verl/sao.env` before `verl/common.env` when using SAO.
+
+```bash
+bash scripts/train/train.sh --preflight-only scripts/train/configs/my_multiturn.env
+bash scripts/train/train.sh scripts/train/configs/my_multiturn.env
+```
+
+`HARBOR_MULTITURN_MAX_ROUNDS` includes the original task. A value of five allows
+four follow-up user messages. The outer settings map to `++multiturn.*` Hydra
+fields, independently of Harbor's `TrialConfig`. Invalid fields fail validation.
+
+For frozen two-step SWE-Interact datasets, set `HARBOR_MULTITURN_TASK_PROFILE=swe_interact`,
+`HARBOR_SWE_INTERACTION_MODE=conversation`, the manifest, native benchmark source,
+and pinned runtime image. Run `python utils/preflight_native_swe.py` with the
+experiment environment to check the task split, immutable images and sandbox
+cluster. `native_review` is a separate protocol and must be selected explicitly
+when that is the benchmark being evaluated.
+
+Generic `/app` tasks use `task_profile=ccbench`; OpenSWE tasks use `openswe` and
+default to `/testbed`. Their hidden verifier runs in a disposable environment
+restored from a byte-preserving workspace snapshot. Tests are not copied into the
+live policy workspace. Files outside the task workspace and external process or
+database state are not part of that snapshot.
+
+## Episode and training boundaries
+
+Each rollout or validation result represents one episode, even if it contains
+multiple user rounds or context segments. The trainer expands segments only
+after queue accounting, and selects optimizer minibatches by episode rather
+than by segment. Validation retains one final score per episode.
+
+Every user-round or tool-handoff boundary preserves the exact sampled tokens,
+behavior log-probabilities, loss masks and MoE routing. Reserialized history is
+conditioning for the next segment, never a second copy of earlier actions. User
+rounds do not reset the episode token budget or compaction budget. The mainline
+full-sequence training layout remains enabled; true overflow produces a zero-loss
+episode rather than silently slicing sampled tokens.
+
+`patches/verl_multiturn_episode.patch` applies after the existing base, SAO,
+episode-segment, context-preservation and full-sequence patches. It adds episode
+GAE and critic minibatches, optional per-round GRPO, metrics and ragged position
+ID handling. Do not apply the historical `verl_compaction` / flattened-row patch
+chain on top of this implementation. Install from a clean pinned dependency tree
+or use a new `THIRD_PARTY_DIR` and environment.
+
+## Terminal reward and SAO
+
+The default is `reward_mode=terminal`, `judge_enabled=false`, test weight one
+and judge weight zero. This matches the reward choice of the existing multi-turn
+SAO experiment. A valid verifier failure remains reward zero; it is not retried
+until it succeeds. Transient infrastructure failures retry with a new sandbox
+and session, and an exhausted invalid attempt has no trainable actions.
+
+SAO uses `adv_estimator=gae`, an enabled FSDP/FSDP2 or VeOmni critic, and critic
+`loss_agg_mode=token-mean`. Actor and critic minibatches keep each episode's
+segments together, including critic warmup and multiple critic epochs. Padding
+has zero action mask and no reward or optimizer contribution. Episode selection
+does not silently change the configured token-mean policy or value loss.
+
+For historical cross-segment SAO behavior, `CROSS_SEGMENT_GAE=True` discounts each
+segment's policy advantages by `(gamma * lambda) ** tokens_after`. With
+`CROSS_SEGMENT_LAM_MODE=trial`, adaptive policy lambda uses the whole episode's
+generated-token count. Critic returns use their independent lambda and are never
+scaled by this policy correction. This preserves the historical algorithm; it
+does not claim that nonzero value estimates reproduce a single concatenated GAE
+recursion across rewritten contexts.
+
+## Optional per-round rewards
+
+`ccbench` and `openswe` can opt into `reward_mode=per_round` with a configured
+judge and GRPO/GSPO. This is a separate training objective from terminal SAO.
+Set `N_RESP` to at least two and configure test/judge weights summing to one.
+SWE-Interact keeps terminal verifier rewards and rejects per-round mode.
+
+The baseline compares distinct episodes for the same task and user-round number.
+An episode compacted into multiple segments enters those group statistics once.
+Padding and filtered rows do not enter the baseline. A late-round group with only
+one surviving episode gets zero relative advantage. Scores are assigned to the
+segments of their own user round; future-round evidence never enters an earlier
+round's judge context.
+
+## Metrics and saved artifacts
+
+`multiturn/*` describes the training batch; `val-multiturn/*` describes trainer
+validation. Both deduplicate episode fragments. Invalid attempts, termination
+reasons, feedback counts and trainable episodes are reported separately.
+
+The dashboard reads `multiturn.json` and bounded conversation/round artifacts. Its
+saved-artifact snapshot is labeled separately from optimizer-step curves. It
+keeps terminal test success distinct from blended training reward, and never
+infers zero gradient from a final test success/failure histogram.
+
+## Validation scope
+
+The integration is developed against LegoX/Lego-RL `9fa43b3` and the source of the
+existing multi-turn experiment. CPU tests cover the real episode envelope,
+advantage functions, actor/critic dispatch, user-round boundaries, retry and
+verifier behavior. Hardware and live sandbox acceptance must be run separately
+before replacing a production training source directory.
+
+Validation results and source provenance are recorded in
+`docs/development/multiturn-validation.json` and `multiturn-source.json`. The
+upstream regression suite passed 254 tests (three opt-in fixture/configuration
+skips); multi-turn and SAO regression checks passed 234 tests. Eight synthetic
+comparisons against the installed legacy experiment produced identical GAE
+advantages, critic returns, token-mean surrogate losses and gradients. These are
+numerical and CPU checks, not a live rollout or GPU optimizer acceptance run.

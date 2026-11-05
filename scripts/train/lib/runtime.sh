@@ -223,6 +223,9 @@ run_preflight() {
     MODEL_PATH="${MODEL_PATH:-}" TRAIN_INDEX="${TRAIN_FILES:-}" VAL_INDEX="${VAL_FILES:-}" \
         source "$REPO_ROOT/scripts/lib/preflight.sh" \
         || { echo "[FATAL] preflight failed — refusing to launch." >&2; exit 1; }
+    if [[ "${HARBOR_MULTITURN_ENABLED:-false}" == true && "${HARBOR_MULTITURN_TASK_PROFILE:-}" == swe_interact && "${PF_STRUCTURE_ONLY:-0}" != 1 ]]; then
+        "$PYTHON_BIN" "$REPO_ROOT/utils/preflight_native_swe.py"
+    fi
 }
 
 print_launch_summary() {

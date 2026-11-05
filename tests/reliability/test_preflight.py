@@ -26,7 +26,7 @@ def test_supported_episode_configs(engine):
 
 
 @pytest.mark.parametrize("updates,diagnostic", [
-    ({"ADV_ESTIMATOR": "gae", "CRITIC_ENABLE": "True"}, "requires ADV_ESTIMATOR=grpo"),
+    ({"ADV_ESTIMATOR": "gae", "CRITIC_ENABLE": "False"}, "requires CRITIC_ENABLE=True"),
     ({"USE_KL_IN_REWARD": "True"}, "requires USE_KL_IN_REWARD=False"),
     ({"MODEL_ENGINE": "megatron"}, "requires FSDP/FSDP2 or VeOmni"),
     ({"HARBOR_TRAJECTORY_SELECTION": "frist"}, "must be longest or all"),
@@ -92,3 +92,8 @@ def test_empty_or_unreadable_index_is_not_reported_as_valid(tmp_path):
     assert result.returncode == 0
     assert "unreadable" in result.stdout
     assert "task paths resolve" not in result.stdout
+
+
+def test_episode_gae_with_enabled_critic_passes_preflight():
+    result = check(HARBOR_TRAJECTORY_SELECTION="all", ADV_ESTIMATOR="gae", CRITIC_ENABLE="True")
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -1,0 +1,340 @@
+diff --git a/verl/experimental/fully_async_policy/detach_utils.py b/verl/experimental/fully_async_policy/detach_utils.py
+index e5186eb6..fe05bbc6 100644
+--- a/verl/experimental/fully_async_policy/detach_utils.py
++++ b/verl/experimental/fully_async_policy/detach_utils.py
+@@ -173,6 +173,13 @@ def addition_process(output: DataProto):
+     return output
+
+
++def _align_optional_agent_loop_timings(batches):
++    keys = {key for batch in batches for key in batch.non_tensor_batch if key.startswith("_al_timing_")}
++    for batch in batches:
++        for key in keys.difference(batch.non_tensor_batch):
++            batch.non_tensor_batch[key] = np.zeros(len(batch), dtype=np.float64)
++
++
+ def assemble_batch_from_rollout_samples(
+     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
+ ) -> DataProto:
+@@ -207,6 +214,7 @@ def assemble_batch_from_rollout_samples(
+     for rs in rollout_samples:
+         batch = addition_process(rs.full_batch)
+         rollout_samples_batch.append(batch)
++    _align_optional_agent_loop_timings(rollout_samples_batch)
+     final_batch = DataProto.concat(rollout_samples_batch)
+
+     # Calculate response_mask (if not present)
+diff --git a/verl/trainer/config/algorithm.py b/verl/trainer/config/algorithm.py
+index 78c2f0a2..7b7945f2 100644
+--- a/verl/trainer/config/algorithm.py
++++ b/verl/trainer/config/algorithm.py
+@@ -764,6 +764,10 @@ class AlgoConfig(BaseConfig):
+     gamma: float = 1.0
+     lam: float = 1.0
+     lam_critic: Optional[float] = None
++    # Episode segments share one terminal reward; discount only policy advantages across boundaries.
++    cross_segment_gae: bool = False
++    cross_segment_lam_mode: str = "trial"
++
+     length_adaptive_lam_alpha: Optional[float] = None
+     gae_whiten_advantages: bool = True
+     adv_estimator: str = "gae"
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index e641f4c6..004eed32 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -78,6 +78,12 @@ algorithm:
+   # computed per sequence and overriding lam. SAO uses 1.5; null disables. GAE only.
+   length_adaptive_lam_alpha: null
+
++  # Discount earlier episode segments by subsequent generated-token distance.
++  cross_segment_gae: false
++
++  # Use the whole trial length for adaptive policy lambda (or segment for legacy behavior).
++  cross_segment_lam_mode: trial
++
+   # Whether to batch-whiten GAE advantages. Set false for single-rollout/value-based
+   # runs, where whitening turns the value baseline back into a batch-relative one.
+   gae_whiten_advantages: True
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index c883fb1b..ada5003e 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -243,6 +243,58 @@ def compute_length_adaptive_lam(response_mask: torch.Tensor, alpha: float) -> to
+     return 1.0 - 1.0 / (alpha * lengths)
+
+
++def compute_trial_length_adaptive_lam(trial_gen_tokens: torch.Tensor, alpha: float) -> torch.Tensor:
++    """Length-adaptive lambda over a WHOLE compacted trial: ``1 - 1/(alpha * L_trial)``.
++
++    CompactionRL (https://arxiv.org/abs/2607.05378) splits a trial into token segments
++    that are trained as separate rows. With ``L_trial`` counting the policy tokens of
++    every segment of the trial, the cross-segment discount of an earlier segment
++    becomes ``lam ** N_{>s} = exp(-N_{>s} / (alpha * L_trial))``, which lies in
++    ``[exp(-1/alpha), 1]``: bounded, and tied to how much of the trial's work still
++    lies ahead. A per-segment lambda raised to tens of thousands of later tokens
++    would vanish instead.
++
++    Args:
++        trial_gen_tokens: `(torch.Tensor)` shape (bs,), policy tokens of the whole
++            trial each row belongs to.
++        alpha: length-scaling factor, as in :func:`compute_length_adaptive_lam`.
++
++    Returns:
++        `(torch.Tensor)` shape (bs,), a per-row lambda.
++    """
++    if alpha <= 0:
++        raise ValueError(f"length_adaptive_lam_alpha must be positive, got {alpha}.")
++    lengths = trial_gen_tokens.to(torch.float32).clamp(min=1.0)
++    return 1.0 - 1.0 / (alpha * lengths)
++
++def compute_cross_segment_scale(gamma, lam, tokens_after: torch.Tensor) -> torch.Tensor:
++    """CompactionRL's trajectory-position correction (eq. 14 of arXiv:2607.05378).
++
++    A trial compacted into several segments shares one terminal reward, but a naive
++    per-segment GAE puts that reward at the end of every segment, so early segments
++    see the outcome as closer than it is. Scaling a row's advantages by
++    ``(gamma * lam) ** N_{>s}``, with ``N_{>s}`` the policy tokens generated after
++    the row's segment in the same trial, restores the distance of the concatenated
++    rollout. ``N_{>s} = 0`` (the last segment, and every uncompacted trajectory)
++    gives scale 1, so the correction is a no-op without compaction.
++
++    Args:
++        gamma: `(float)` or 0-d tensor.
++        lam: `(float)` or `(torch.Tensor)` of shape (bs,) (per-row lambda).
++        tokens_after: `(torch.Tensor)` shape (bs,).
++
++    Returns:
++        `(torch.Tensor)` shape (bs,), float32.
++    """
++    exponent = tokens_after.to(torch.float64).clamp(min=0.0)
++    lam_t = torch.as_tensor(lam, dtype=torch.float64, device=exponent.device)
++    gamma_t = torch.as_tensor(gamma, dtype=torch.float64, device=exponent.device)
++    base = (gamma_t * lam_t).clamp(min=0.0)
++    if base.dim() == 0:
++        base = base.expand_as(exponent)
++    return torch.pow(base, exponent).to(torch.float32)
++
++
+ @register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
+ def compute_gae_advantage_return(
+     token_level_rewards: torch.Tensor,
+@@ -252,6 +304,7 @@ def compute_gae_advantage_return(
+     lam: torch.Tensor,
+     lam_critic: Optional[torch.Tensor] = None,
+     whiten_advantages: bool = True,
++    advantage_scale: Optional[torch.Tensor] = None,
+ ):
+     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
+
+@@ -317,6 +370,9 @@ def compute_gae_advantage_return(
+         advantages = _gae(lam)
+         # returns must be built from the RAW advantages, before any whitening
+         returns = (advantages if lam_critic is None else _gae(lam_critic)) + values
++        # Scale policy advantages only; keep critic targets independent of future segment distance.
++        if advantage_scale is not None:
++            advantages = advantages * advantage_scale.to(advantages.dtype).view(-1, 1)
+         if whiten_advantages:
+             advantages = verl_F.masked_whiten(advantages, response_mask)
+     return advantages, returns
+diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
+index bb4cbb25..0c32c906 100644
+--- a/verl/trainer/ppo/metric_utils.py
++++ b/verl/trainer/ppo/metric_utils.py
+@@ -290,6 +290,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+         metrics["tool_call_counts/max"] = tool_call_counts.max()
+         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
++    if "multiturn_summary" in batch.non_tensor_batch:
++        from verl_patch.multiturn.metrics import training_metrics
++
++        real = ~batch.batch.get("segment_padding", torch.zeros(len(batch), dtype=torch.bool)).cpu().numpy()
++        metrics.update(training_metrics(batch, real, sequence_score[torch.as_tensor(real, device=sequence_score.device)]))
+     return metrics
+
+
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index e0951674..f653d59d 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -221,6 +221,22 @@ def compute_advantage(
+         # Both default to off, in which case this is the classic single-lambda GAE.
+         alpha = config.get("length_adaptive_lam_alpha", None) if config is not None else None
+         lam_policy = core_algos.compute_length_adaptive_lam(response_mask, alpha) if alpha is not None else lam
++        advantage_scale = None
++        if config is not None and config.get("cross_segment_gae", False) and "tokens_after" in data.non_tensor_batch:
++            if config.get("cross_segment_lam_mode", "trial") not in {"trial", "segment"}:
++                raise ValueError("cross_segment_lam_mode must be trial or segment")
++            device = response_mask.device
++            tokens_after = torch.tensor(
++                [float(x or 0) for x in data.non_tensor_batch["tokens_after"]], device=device, dtype=torch.float64
++            )
++            if str(config.get("cross_segment_lam_mode", "trial")) == "trial" and alpha is not None:
++                if "trial_gen_tokens" not in data.non_tensor_batch:
++                    raise ValueError("Trial-length cross-segment GAE requires trial_gen_tokens")
++                trial_tokens = torch.tensor(
++                    [float(x or 0) for x in data.non_tensor_batch["trial_gen_tokens"]], device=device
++                )
++                lam_policy = core_algos.compute_trial_length_adaptive_lam(trial_tokens, alpha)
++            advantage_scale = core_algos.compute_cross_segment_scale(gamma, lam_policy, tokens_after)
+         advantages, returns = core_algos.compute_gae_advantage_return(
+             token_level_rewards=data.batch["token_level_rewards"],
+             values=data.batch["values"],
+@@ -229,6 +245,7 @@ def compute_advantage(
+             lam=lam_policy,
+             lam_critic=config.get("lam_critic", None) if config is not None else None,
+             whiten_advantages=config.get("gae_whiten_advantages", True) if config is not None else True,
++            advantage_scale=advantage_scale,
+         )
+         data.batch["advantages"] = advantages
+         data.batch["returns"] = returns
+@@ -242,7 +259,15 @@ def compute_advantage(
+         # Initialize the mask for GRPO calculation
+         grpo_calculation_mask = data.batch["response_mask"]
+
+-        if data.meta_info.get("episode_segments_expanded"):
++        if "multiturn_round_id" in data.non_tensor_batch:
++            from verl_patch.multiturn.advantages import compute_round_grpo_advantage
++
++            advantages, returns = compute_round_grpo_advantage(
++                data.batch["token_level_rewards"], grpo_calculation_mask,
++                data.non_tensor_batch["uid"], data.non_tensor_batch["episode_id"],
++                data.non_tensor_batch["multiturn_round_id"], norm_adv_by_std_in_grpo,
++            )
++        elif data.meta_info.get("episode_segments_expanded"):
+             advantages, returns = compute_episode_grpo(data, norm_adv_by_std_in_grpo)
+         else:
+             advantages, returns = core_algos.compute_grpo_outcome_advantage(
+@@ -694,6 +719,8 @@ class RayPPOTrainer:
+             scores = reward_tensor.sum(-1).cpu().tolist()
+             sample_scores.extend(scores)
+
++            if "multiturn_summary" in test_batch.non_tensor_batch:
++                reward_extra_infos_dict["_multiturn_summary"].extend(test_batch.non_tensor_batch["multiturn_summary"].tolist())
+             reward_extra_infos_dict["reward"].extend(scores)
+             for key, values in reward_extra_info.items():
+                 if key not in reward_extra_infos_dict:
+@@ -744,8 +771,14 @@ class RayPPOTrainer:
+         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
++        reward_extra_infos_dict = dict(reward_extra_infos_dict)
++        summaries = reward_extra_infos_dict.pop("_multiturn_summary", [])
+         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+         metric_dict = {}
++        if summaries:
++            from verl_patch.multiturn.metrics import aggregate_episodes
++
++            metric_dict.update(aggregate_episodes(summaries, prefix="val-multiturn"))
+         for data_source, var2metric2val in data_src2var2metric2val.items():
+             core_var = "acc" if "acc" in var2metric2val else "reward"
+             for var_name, metric2val in var2metric2val.items():
+@@ -1367,6 +1400,32 @@ class RayPPOTrainer:
+         return DataProto.from_single_dict(data={}, meta_info={"metrics": metrics})
+
+     def _update_critic(self, batch: DataProto) -> DataProto:
++        if batch.meta_info.get("episode_segments_expanded", False):
++            from verl.utils.episode_segments import iter_episode_minibatches
++
++            cfg = self.config.critic
++            metrics = {}
++            steps = 0
++            for update in iter_episode_minibatches(
++                batch, cfg, self.config.actor_rollout_ref.rollout.n,
++                self._get_dp_size(self.critic_wg, "train"),
++            ):
++                batch_td = left_right_2_no_padding(update.to_tensordict())
++                tu.assign_non_tensor(
++                    batch_td, global_batch_size=update.meta_info["num_update_episodes"],
++                    mini_batch_size=len(update), epochs=1, seed=cfg.data_loader_seed,
++                    dataloader_kwargs={"shuffle": False},
++                    update_lr_scheduler=update.meta_info["update_lr_scheduler"],
++                )
++                output = tu.get(self.critic_wg.train_mini_batch(batch_td).get(), "metrics")
++                for key, value in output.items():
++                    metrics.setdefault(key, []).extend(value if isinstance(value, list) else [value])
++                steps += 1
++            metrics = rename_dict(metrics, "critic/")
++            if "critic/mfu" in metrics:
++                metrics["perf/mfu/critic"] = metrics.pop("critic/mfu")
++            metrics["critic/episode_optimizer_steps"] = steps
++            return DataProto.from_single_dict(data={}, meta_info={"metrics": metrics})
+         batch_td = batch.to_tensordict()
+         # step 2: convert from padding to no-padding
+         batch_td = left_right_2_no_padding(batch_td)
+diff --git a/verl/utils/episode_segments.py b/verl/utils/episode_segments.py
+index 805e346b..4cd8409a 100644
+--- a/verl/utils/episode_segments.py
++++ b/verl/utils/episode_segments.py
+@@ -15,6 +15,8 @@ import torch
+ from verl import DataProto
+ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
+
++MULTITURN_EPISODE_SUPPORTED = True
++
+ SEGMENTS_KEY = "_episode_segments"
+ PADDING_KEY = "segment_padding"
+ EPISODE_INDEX = "episode_index"
+@@ -24,8 +26,17 @@ TOKEN_COUNT = "episode_token_count"
+ def validate_episode_training(config):
+     """Fail explicitly for training paths that do not honor episode boundaries."""
+     actor = config.actor_rollout_ref.actor
+-    if config.algorithm.adv_estimator != "grpo" or config.algorithm.get("use_kl_in_reward", False):
+-        raise ValueError("trajectory_selection=all requires GRPO and use_kl_in_reward=false")
++    estimator = config.algorithm.adv_estimator
++    if estimator not in {"grpo", "gae"} or config.algorithm.get("use_kl_in_reward", False):
++        raise ValueError("trajectory_selection=all requires GRPO or GAE and use_kl_in_reward=false")
++    if estimator == "gae":
++        critic = config.get("critic", {})
++        if not critic.get("enable", False):
++            raise ValueError("Episode GAE requires critic.enable=true")
++        if critic.get("strategy") not in {"fsdp", "fsdp2", "veomni"}:
++            raise ValueError("Episode GAE requires an FSDP or VeOmni critic")
++        if critic.get("loss_agg_mode", "token-mean") != "token-mean":
++            raise ValueError("Episode GAE currently requires critic.loss_agg_mode=token-mean")
+     if actor.strategy not in {"fsdp", "fsdp2", "veomni"}:
+         raise ValueError("trajectory_selection=all currently supports the FSDP and VeOmni engines")
+     if actor.get("use_prefix_grouper", False):
+@@ -72,6 +83,12 @@ def _forward_batch_divisor(config):
+             if size is None or size < 1:
+                 raise ValueError(f"{name}.log_prob_micro_batch_size_per_gpu must be positive for fixed batching")
+             micro_sizes.append(int(size))
++    critic = config.get("critic", {})
++    if config.algorithm.adv_estimator == "gae" and not critic.get("use_dynamic_bsz", True):
++        size = critic.get("ppo_infer_micro_batch_size_per_gpu")
++        if size is None or size < 1:
++            raise ValueError("critic.ppo_infer_micro_batch_size_per_gpu must be positive for fixed batching")
++        micro_sizes.append(int(size))
+     return divisor * lcm(*micro_sizes)
+
+
+diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
+index 6c3a33f7..669d2d1c 100644
+--- a/verl/utils/tensordict_utils.py
++++ b/verl/utils/tensordict_utils.py
+@@ -177,9 +177,7 @@ def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int
+     offsets = torch.zeros(len(tensors) + 1, dtype=torch.long, device=values.device)
+     torch.cumsum(lengths, dim=0, out=offsets[1:])
+
+-    nested_tensor = torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets)
+-    nested_tensor._ragged_idx = ragged_idx
+-    return nested_tensor
++    return torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets, jagged_dim=ragged_idx)
+
+
+ def concat_nested_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
+diff --git a/verl/workers/utils/padding.py b/verl/workers/utils/padding.py
+index ed8d1455..6af612ba 100644
+--- a/verl/workers/utils/padding.py
++++ b/verl/workers/utils/padding.py
+@@ -64,7 +64,9 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
+         else:  # (4, seq_len)
+             valid_ids = curr_pos_ids[:, curr_mask]
+         position_ids_list.append(valid_ids)
+-    position_ids_nested = torch.nested.as_nested_tensor(position_ids_list, layout=torch.jagged)
++    position_ids_nested = tu.nested_tensor_from_tensor_list(
++        position_ids_list, ragged_idx=position_ids.dim() - 1
++    )
+
+     data["input_ids"] = input_ids_nested
+     data["position_ids"] = position_ids_nested

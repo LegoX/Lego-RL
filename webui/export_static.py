@@ -36,6 +36,7 @@ import urllib.request
 # but we never exported degrades to an empty panel, not an error page.
 RUN_ENDPOINTS: list[str] = [
     "metrics",
+    "multiturn",
     "latest",
     "keys",
     "config",
@@ -187,6 +188,7 @@ def main() -> int:
         if sid is None:
             continue
         body = grab(f"/api/runs/{run}/step-tasks?step={urllib.parse.quote(str(sid), safe='')}")
+        grab(f"/api/runs/{run}/multiturn?step={urllib.parse.quote(str(sid), safe='')}")
         if body is None or budget <= 0:
             continue
         try:

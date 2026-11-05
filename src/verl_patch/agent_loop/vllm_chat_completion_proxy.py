@@ -1946,6 +1946,12 @@ class _VLLMChatCompletionsProxy:
             main_session = self._sessions.get(session_id, {})
             is_codex = main_session.get("harness_name") == "codex"
             sampling_defaults = dict(main_session.get("sampling_defaults") or {})
+            request_user_round = main_session.get("user_round_id")
+        controller = main_session.get("native_round_controller")
+        if controller is not None:
+            if summarizer:
+                raise ValueError("Native no-compaction session cannot summarize")
+            messages, tools, body = await controller.prepare(messages, tools, body)
         trial_session_id = session_id
         turn_budget = main_session if is_codex and main_session.get("max_turns") else None
         session_id, _is_subagent = await self._route_generation_session(
@@ -1980,6 +1986,10 @@ class _VLLMChatCompletionsProxy:
                 async with state_lock:
                     self._check_recorder_session_open(main_session)
                     sess = self._sessions.setdefault(session_id, self._fresh_session_state())
+                    if request_user_round and sess.get("user_round_id") != request_user_round:
+                        if sess.get("user_round_id"):
+                            self._mark_user_boundary(sess, "user_round")
+                        sess["user_round_id"] = request_user_round
                     t_enter = time.perf_counter()
                     last_cmp = sess.get("last_completion_perf")
                     if last_cmp is not None:
@@ -2739,14 +2749,50 @@ class _VLLMChatCompletionsProxy:
                 sess["native_summary_pending"] = False
             recorder.record(prompt_ids, output_ids, None if output.log_probs is None else list(output.log_probs), routes,
                 context_tail=tail, min_global_steps=mn, max_global_steps=mx,
-                force_boundary=compaction,
-                metadata={"kind": "exec", "boundary": "live", "seq_end": sess["last_gen_seq"]})
+                force_boundary=compaction or bool(sess.get("user_round_boundary_pending", False)),
+                metadata={"kind": "exec", "boundary": "live", "seq_end": sess["last_gen_seq"],
+                          **({"user_round_id": sess["user_round_id"]} if sess.get("user_round_id") else {})})
+            sess.pop("user_round_boundary_pending", None)
             sess["last_generation_messages"] = _copy_messages_for_snapshot(sess.get("messages_snapshot") or [])
             sess["last_generation_tools"] = deepcopy(sess.get("last_tools"))
             sess["last_generation_snapshot"] = None
             sess["record_pending"] = None
         sess["rolling_acc_ids"] = prompt_ids + output_ids + tail
 
+
+    async def begin_user_round(self, session_id: str, round_id: int) -> None:
+        """Mark a round boundary without resetting episode budgets or rebuilding actions."""
+        lock = await self._get_session_state_lock(session_id)
+        async with lock:
+            sess = self._sessions[session_id]
+            self._check_recorder_session_open(sess)
+            rounds = sess.setdefault("user_rounds", [])
+            if round_id != len(rounds) + 1:
+                raise ValueError("User rounds must start at 1 and advance consecutively")
+            if rounds:
+                self._mark_user_boundary(sess, "user_round")
+            sess["user_round_id"] = round_id
+            sess["consecutive_no_tool"] = 0
+            rounds.append({"round_id": round_id, "gen_tokens_before": int(sess.get("gen_tokens_total") or 0)})
+
+    @staticmethod
+    def _mark_user_boundary(sess, cause):
+        current = sess["trajectory_recorder"].current
+        if current is not None:
+            current.metadata["boundary"] = cause
+        sess["user_round_boundary_pending"] = True
+        sess["record_pending"] = None
+        sess["messages_snapshot"] = None
+        sess["carried_over_keys"] = []
+
+    async def begin_tool_handoff(self, session_id: str) -> None:
+        lock = await self._get_session_state_lock(session_id)
+        async with lock:
+            sess = self._sessions[session_id]
+            self._check_recorder_session_open(sess)
+            if not sess.get("user_round_id"):
+                raise ValueError("Tool handoff requires an active user round")
+            self._mark_user_boundary(sess, "tool_handoff")
 
     async def _handle_chat_summ(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
         """``/sess/{id}/summ/v1/chat/completions``: the harness's summarizer client."""

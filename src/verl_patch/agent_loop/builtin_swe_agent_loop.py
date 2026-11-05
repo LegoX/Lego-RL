@@ -260,7 +260,28 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         self._max_consecutive_no_tool = int(kwargs["max_consecutive_no_tool"])
         self.base_trials_dir = str(kwargs["trials_dir"])
         self.max_retries = int(kwargs["max_retries"])
-        self.trajectory_selection = str(kwargs.get("trajectory_selection", "longest"))
+        from harbor_patch.multiturn.config import MultiTurnConfig
+
+        self.multiturn = MultiTurnConfig.model_validate(
+            to_plain(getattr(self, "config", {}).get("multiturn")) or {}
+        )
+        if self.multiturn.enabled:
+            from verl.utils import episode_segments
+
+            if not getattr(episode_segments, "MULTITURN_EPISODE_SUPPORTED", False):
+                raise ValueError("Apply patches/verl_multiturn_episode.patch before multi-turn training")
+        if self.multiturn.enabled and set(definitions) != {"claude_code"}:
+            raise ValueError("multiturn.enabled currently requires a Claude Code-only harness config")
+        algorithm = getattr(self, "config", {}).get("algorithm", {})
+        if self.multiturn.enabled and self.multiturn.reward_mode == "per_round":
+            if algorithm.get("adv_estimator") != "grpo":
+                raise ValueError("per_round rewards currently require GRPO/GSPO")
+            if self.rollout_config.get("n", 1) < 2:
+                raise ValueError("per_round GRPO requires at least two episodes per task")
+        # Keep one episode in the queue; expand all user-round segments at training.
+        self.trajectory_selection = (
+            "all" if self.multiturn.enabled else str(kwargs.get("trajectory_selection", "longest"))
+        )
         select_trajectories([], self.trajectory_selection)  # validate before starting any trials
         if self.trajectory_selection == "all":
             from verl.utils.episode_segments import validate_episode_training
@@ -491,6 +512,17 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
         # Validate complete segments before selection so an oversized rewritten
         # context cannot silently erase actions or change which segment wins.
         selected = select_trajectories(segments, "all")
+        mt = getattr(self, "multiturn", None)
+        round_rewards = {}
+        if mt is not None and mt.enabled and mt.reward_mode == "per_round":
+            round_rewards = {
+                row["round_id"]: row for row in session_meta.get("multiturn", {}).get("round_rewards", [])
+            }
+            if any(segment.get("user_round_id") not in round_rewards for _, segment in selected):
+                return self._make_empty_output(
+                    kwargs, metrics=metrics, session_meta=session_meta,
+                    reason="invalid_trajectory", harness_selection=harness_selection,
+                )
         if not selected:
             return self._make_empty_output(
                 kwargs,
@@ -559,7 +591,8 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                     response_logprobs=lp,
                     routed_experts=self._build_routed_experts(prompt, routing),
                     multi_modal_data=None,
-                    reward_score=reward,
+                    reward_score=(round_rewards[segment["user_round_id"]]["training_reward"]
+                                  if round_rewards else reward),
                     num_turns=num_turns,
                     metrics=dict(metrics),
                     extra_fields={
@@ -594,6 +627,16 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                         "segment_boundary": segment.get("boundary", "live"),
                         "segment_count": len(segments),
                         "trajectory_selection": selection,
+                        "trial_id": session_meta.get("episode_id"),
+                        "segment_gen_tokens": int(sum(segment["response_mask"])),
+                        "tokens_after": int(sum(sum(s["response_mask"]) for s in segments[index + 1:])),
+                        "trial_gen_tokens": int(sum(sum(s["response_mask"]) for s in segments)),
+                        **({"multiturn_summary": json.dumps(session_meta.get("multiturn", {}))}
+                           if mt is not None and mt.enabled else {}),
+                        **({"multiturn_round_id": segment["user_round_id"],
+                            "multiturn_test_reward": round_rewards[segment["user_round_id"]]["functional_reward"],
+                            "multiturn_judge_reward": round_rewards[segment["user_round_id"]]["judge_score"]}
+                           if round_rewards else {}),
                     },
                 )
             )
@@ -736,6 +779,13 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             # fallback keeps direct helper callers backward compatible.
             harness_selection = self.harness_resolver.resolve({}, is_val=is_val)
         definition = harness_selection.definition
+        mt = getattr(self, "multiturn", None)
+        if mt is not None and mt.enabled and mt.task_profile == "swe_interact":
+            from harbor_patch.multiturn.native_swe import run_native_trial
+
+            return await run_native_trial(
+                self, proxy, task_path, global_steps, sampling_params, metrics, is_val
+            )
 
         cfg = deepcopy(definition.harbor_cfg)
         base_trials_dir = self.base_trials_dir
@@ -825,7 +875,12 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
             try:
                 # Validate and create trial
                 trial_config = TrialConfig.model_validate(cfg)
-                trial = await Trial.create(trial_config)
+                if mt is not None and mt.enabled:
+                    from harbor_patch.multiturn.trial import create_multiturn_trial
+
+                    trial = await create_multiturn_trial(trial_config, mt, proxy, session_id)
+                else:
+                    trial = await Trial.create(trial_config)
 
                 trial_dir = Path(cfg["trials_dir"]) / session_id
                 trial_dir.mkdir(parents=True, exist_ok=True)
@@ -881,6 +936,12 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                     else 0.0
                 )
 
+                multiturn_meta = getattr(getattr(results, "agent_result", None), "metadata", {}) or {}
+                multiturn_meta = multiturn_meta.get("multiturn", {})
+                if mt is not None and mt.enabled and not multiturn_meta.get("valid", False):
+                    # Infrastructure errors invalidate the entire attempt; never reuse an old round reward.
+                    continue
+
                 if is_timeout:
                     logger.warning("%s timeout (no retry). results=%s", prefix, results)
                     reward = verifier_reward
@@ -934,6 +995,13 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 continue
             finally:
                 attempt_meta = await proxy.pop_session(session_id)
+                if mt is not None and mt.enabled:
+                    agent_meta = getattr(getattr(results, "agent_result", None), "metadata", {}) or {}
+                    attempt_meta["multiturn"] = agent_meta.get("multiturn", {
+                        "enabled": True, "valid": False, "task_profile": mt.task_profile,
+                    })
+                    if not terminal_commit:
+                        attempt_meta["disable_proxy_trajectory"] = True
                 last_attempt_meta = attempt_meta
                 self._collect_harbor_timings(results, metrics)
                 if terminal_commit:
@@ -1117,6 +1185,10 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 "segment_index": 0,
                 "segment_count": 0,
                 "trajectory_selection": getattr(self, "trajectory_selection", "longest"),
+                **({"multiturn_summary": json.dumps({
+                    **session_meta.get("multiturn", {}), "enabled": True,
+                    "task_profile": self.multiturn.task_profile,
+                })} if getattr(getattr(self, "multiturn", None), "enabled", False) else {}),
                 "turn_scores": [],
                 "tool_rewards": [],
                 # This dummy keeps rollout accounting intact. Its zero mask

@@ -1,0 +1,68 @@
+{
+  "upstream_base": "9fa43b37d2997ac95cdc437e40d4857b948d31dc",
+  "upstream_regressions": {
+    "passed": 254,
+    "skipped": 3,
+    "paths": [
+      "tests/agent_loop",
+      "tests/harbor",
+      "tests/eval",
+      "tests/reliability"
+    ],
+    "skip_reasons": [
+      "Original failure replay needs FULLSEQ_FAILURE_PATH",
+      "Two Kubernetes scheduler integration simulations need HARBOR_TEST_KUBECONFIG"
+    ],
+    "tokenizer": "Real local Qwen3.5-35B-A3B tokenizer for full-sequence boundary tests"
+  },
+  "multiturn_sao_regressions": {
+    "passed": 234,
+    "paths": [
+      "tests/multiturn",
+      "tests/agent_loop/test_multiturn_episode_sao.py",
+      "third_party/verl/tests/trainer/ppo/test_sao_on_cpu.py"
+    ]
+  },
+  "test_count_note": "The two suites overlap on seven episode SAO tests; counts must not be added as unique cases.",
+  "numerical_parity": {
+    "passed": true,
+    "synthetic_cases": 8,
+    "tolerance": 1e-07,
+    "max_absolute_errors": {
+      "advantages": 0.0,
+      "returns": 0.0,
+      "loss": 0.0,
+      "gradient": 0.0,
+      "mask": 0.0
+    },
+    "scope": "Same fixed synthetic masks, nonzero critic values, terminal rewards and token-mean surrogate in legacy installed source versus integrated source; no policy rollout or optimizer update."
+  },
+  "dependency_patch_replay": {
+    "passed": true,
+    "base": "7aed6b23",
+    "patches": [
+      "verl_7aed6b23.patch",
+      "verl_sao_7aed6b23.patch",
+      "verl_segments_7aed6b23.patch",
+      "verl_preserve_chat_template_context.patch",
+      "verl_full_sequence_training.patch",
+      "verl_multiturn_episode.patch"
+    ],
+    "files_compared": 54,
+    "reverse_check": true
+  },
+  "hydra_full_async_config_composition": "passed for GAE, critic, cross-segment controls and multi-turn",
+  "webui_production_build": "passed (TypeScript and Vite)",
+  "static_checks": [
+    "Python compile",
+    "Bash syntax",
+    "Ruff F/E9 on imported multi-turn modules and new integration test",
+    "git diff --check"
+  ],
+  "runtime_acceptance": {
+    "live_model_rollout": false,
+    "gpu_optimizer_update": false,
+    "production_training_source_modified": false,
+    "notes": "Synthetic parity checks and CPU dispatcher tests do not replace live sandbox/accelerator acceptance."
+  }
+}

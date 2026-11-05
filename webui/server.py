@@ -32,6 +32,14 @@ import threading
 import uuid
 import shutil
 import zipfile
+# Load relative to this file so standalone use and importlib-based exporters agree.
+import importlib.util
+_multiturn_spec = importlib.util.spec_from_file_location("lego_dashboard_multiturn", Path(__file__).with_name("multiturn.py"))
+_multiturn = importlib.util.module_from_spec(_multiturn_spec)
+_multiturn_spec.loader.exec_module(_multiturn)
+read_multiturn = _multiturn.read_multiturn
+final_reward = _multiturn.final_reward
+artifact_metrics = _multiturn.artifact_metrics
 
 # ---------------------------------------------------------------------------
 # Log parser
@@ -524,6 +532,9 @@ def _fmt_rollout_dist(dist: dict | None, series: dict | None, batch_prompts: flo
             "(not computed — the Rollout Distribution panel populates this cache; "
             "open it once for this run to give the next report this evidence)"
         )
+    if dist.get("is_multiturn"):
+        return ("Multi-turn: final test success cannot establish zero GRPO advantage. "
+                "Use logged per-round advantage and singleton-group metrics instead.")
     n = dist.get("expected_n") or 8
     tot = dist.get("train_groups") or 0
     if not tot:
@@ -624,7 +635,7 @@ def _fmt_task_solve(ts: dict | None) -> str:
     return "\n".join(
         [
             f"tasks seen: {n}  (n={ts.get('expected_n')} rollouts per epoch)",
-            f"  never solved in any epoch : {p(ts.get('never_solved', 0))}  <- permanently zero signal",
+            f"  never solved in any epoch : {p(ts.get('never_solved', 0))}",
             f"  always solved             : {p(ts.get('always_solved', 0))}",
             f"  rolled out in >=2 epochs  : {p(ts.get('multi_epoch', 0))}",
             f"    of those, improved      : {ts.get('improved', 0)}",
@@ -783,6 +794,9 @@ def _list_steps(run_id: str) -> list[str]:
 
 
 def _read_reward(task_dir: str) -> float | None:
+    multi = read_multiturn(task_dir)
+    if multi is not None:
+        return final_reward(multi)
     result_file = os.path.join(task_dir, "result.json")
     if not os.path.isfile(result_file):
         return None
@@ -1327,6 +1341,9 @@ def _run_config(log_path: str) -> dict[str, Any]:
 
 
 def _read_reward(task_dir: str) -> float | None:
+    multi = read_multiturn(task_dir)
+    if multi is not None:
+        return final_reward(multi)
     # fast path: verifier/reward.txt is a bare number
     rt = os.path.join(task_dir, "verifier", "reward.txt")
     if os.path.isfile(rt):
@@ -1348,7 +1365,22 @@ def _read_reward(task_dir: str) -> float | None:
     return None
 
 
+def _read_success_reward(task_dir: str) -> float | None:
+    multi = read_multiturn(task_dir)
+    if multi is not None:
+        if multi.get("task_profile") == "swe_interact":
+            reward = multi.get("terminal_reward", multi.get("final_reward"))
+            return float(reward == 1) if multi.get("valid") and reward in (0, 1) else None
+        rounds = multi.get("round_rewards", [])
+        if not multi.get("valid") or not rounds:
+            return None
+        return float(rounds[-1].get("functional_reward") == 1)
+    return _read_reward(task_dir)
+
+
 def _has_trajectory(task_dir: str) -> bool:
+    if os.path.isfile(os.path.join(task_dir, "multiturn.json")):
+        return True
     return os.path.isfile(
         os.path.join(task_dir, "agent", "trajectory.json")
     ) or os.path.isfile(
@@ -1513,7 +1545,7 @@ def _collect_groups(
     rewards: dict[str, float | None] = {}
     if all_dirs:
         with ThreadPoolExecutor(max_workers=32) as ex:
-            for td, rv in zip(all_dirs, ex.map(_read_reward, all_dirs)):
+            for td, rv in zip(all_dirs, ex.map(_read_success_reward, all_dirs)):
                 rewards[td] = rv
 
     groups = {key: [rewards.get(td) for td in tds] for key, tds in pending.items()}
@@ -1523,6 +1555,7 @@ def _collect_groups(
         # more than the reward (trajectory length, turn count, …) would otherwise
         # have to re-walk the whole tree to find the dirs we just enumerated.
         "group_dirs": dict(pending),
+        "is_multiturn": any(os.path.isfile(os.path.join(td, "multiturn.json")) for td in all_dirs),
         "scanned_steps": all_steps,
         "val_like": val_like,
         "truncated": truncated,
@@ -1562,7 +1595,8 @@ def _rollout_distribution(
         "other_groups": other,
         "all_correct": hist[expected_n],
         "all_wrong": hist[0],
-        "no_signal": hist[0] + hist[expected_n],
+        "no_signal": None if col.get("is_multiturn") else hist[0] + hist[expected_n],
+        "is_multiturn": col.get("is_multiturn", False),
         "mean_solve_rate": (sum(solve_rates) / len(solve_rates))
         if solve_rates
         else None,
@@ -1625,7 +1659,7 @@ def _rollout_dist_series(
                 "step_end": chunk[-1][1],
                 "histogram": hist,
                 "frac": frac,
-                "no_signal_frac": (hist[0] + hist[expected_n]) / cnt,
+                "no_signal_frac": None if col.get("is_multiturn") else (hist[0] + hist[expected_n]) / cnt,
                 "mean_solve_rate": mean_sr,
             }
         )
@@ -1746,7 +1780,7 @@ def _val_analysis(
         {td for d in event_tasks.values() for tds in d.values() for td in tds}
     )
     with ThreadPoolExecutor(max_workers=32) as ex:
-        rew = dict(zip(all_dirs, ex.map(_read_reward, all_dirs)))
+        rew = dict(zip(all_dirs, ex.map(_read_success_reward, all_dirs)))
 
     def solved_of(tds):
         # pass@1: count ONE attempt per task (first copy), NOT best-of. Async val
@@ -2021,7 +2055,7 @@ def _gold_files_for_task(task_dir: str) -> list[str]:
 
 def _classify_val_trajectory(task_dir: str, gold_files: list[str]) -> str:
     """Deterministic failure-mode label for one task dir (no LLM)."""
-    reward = _read_reward(task_dir)
+    reward = _read_success_reward(task_dir)
     resolved = None
     patch_applied = None
     rp = os.path.join(task_dir, "verifier", "report.json")
@@ -2039,6 +2073,9 @@ def _classify_val_trajectory(task_dir: str, gold_files: list[str]) -> str:
     if (reward is not None and reward > 0) or resolved:
         return "success"
     if not has_report:
+        multi = read_multiturn(task_dir)
+        if multi is not None and multi.get("valid"):
+            return "other"
         return "infra"
     if patch_applied is False:
         return "infra"
@@ -2972,6 +3009,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if m:
             return self._handle_trials(m.group(1))
 
+        m = re.match(r"^/api/runs/([^/]+)/multiturn$", path)
+        if m:
+            return self._handle_multiturn(m.group(1), qs)
+
         m = re.match(r"^/api/runs/([^/]+)/trajectory$", path)
         if m:
             return self._handle_trajectory(m.group(1), qs)
@@ -3262,7 +3303,31 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "system_prompt": system_prompt,
             "problem_statement": problem_statement,
             "turns": turns,
+            "multiturn": read_multiturn(trial["task_dir"], details=True),
         })
+
+    def _handle_multiturn(self, run_id: str, qs: dict):
+        exp_dirs = self._exp_dirs_for(run_id)
+        steps = _list_steps_multi(exp_dirs)
+        step = qs.get("step", [None])[0]
+        if step not in steps:
+            return self._json({"steps": steps, "metrics": {}, "source": "artifacts"})
+        summaries = []
+        seen = set()
+        for exp_dir in exp_dirs:
+            directory = Path(exp_dir) / step
+            if not directory.is_dir():
+                continue
+            for task in directory.iterdir():
+                resolved = str(task.resolve())
+                if resolved in seen or not task.is_dir():
+                    continue
+                seen.add(resolved)
+                summary = read_multiturn(task)
+                if summary:
+                    summaries.append(summary)
+        return self._json({"steps": steps, "step": step,
+                           "metrics": artifact_metrics(summaries), "source": "artifacts"})
 
     def _handle_step_tasks(self, run_id: str, qs: dict):
         step = qs.get("step", [None])[0]
@@ -3293,6 +3358,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 "system_prompt": sys_p,
                 "problem_statement": prob,
                 "turns": turns,
+                "multiturn": read_multiturn(task_dir, details=True),
             })
         self._json({
             "run_id": run_id, "step": step,

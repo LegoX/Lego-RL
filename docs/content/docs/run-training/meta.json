@@ -8,6 +8,7 @@
         "compaction",
         "subagents",
         "sao",
+        "multiturn",
         "---Operations---",
         "preflight",
         "backends",

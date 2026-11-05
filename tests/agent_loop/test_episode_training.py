@@ -196,7 +196,7 @@ def test_unsupported_episode_reward_semantics_fail_before_updates(override):
     cfg = config()
     cfg.algorithm.update(override)
     data = envelope([[output("a", 1, 10)]], ["q"])
-    with pytest.raises(ValueError, match="GRPO"):
+    with pytest.raises(ValueError, match="GRPO|critic"):
         expand_episode_segments(data, cfg)
 
 

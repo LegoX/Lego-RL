@@ -1,0 +1,27 @@
+{
+  "upstream_base": "9fa43b37d2997ac95cdc437e40d4857b948d31dc",
+  "source_snapshot": "h20-ydu:/mnt/workspace/duyiming/code/swe-sao200k-b64-c32-s1-tp4-base-glm-cw5-10ep-20261102",
+  "development_lineage": "Lego-RL-multi-turn (683c610 plus later working-source changes)",
+  "source_sha256": {
+    "src/harbor_patch/multiturn/__init__.py": "6424757257df22dd9415bf03f9189d308f9d65e7800f3059b92f6ed2c0aaa861",
+    "src/harbor_patch/multiturn/benchmark.py": "1bad33b8f145442c878f9c0a95b52a505f0a893869195a438c413a513aa5e6ac",
+    "src/harbor_patch/multiturn/claude_code.py": "9ebe60ff2de6445abc37cf4c4909aed560d2acd0ca301662810aa4d305d2d560",
+    "src/harbor_patch/multiturn/config.py": "ff14b1b2e03b286d56898c0b03decca4fa9c36c4d520ed7f52f0d11d366301fe",
+    "src/harbor_patch/multiturn/conversation_verifier.py": "dde40194c30e5963116449a638c509af794fe2a2b5d8faaa64b1466d25da589f",
+    "src/harbor_patch/multiturn/kubernetes.py": "4d65371e4bd15f8784151c098e03f830bfdb4141f5124d64a8b832a1cb3307e1",
+    "src/harbor_patch/multiturn/native_budget.py": "e16401418d3f976ca8889492c924cbfe170a68999a739d47ba36da2163ed5bd0",
+    "src/harbor_patch/multiturn/native_cc_protocol.py": "c4ed7d9fd3799ecc73f9202e9de125fd3693e66a2f656992c5b1392032ec5ef1",
+    "src/harbor_patch/multiturn/native_swe.py": "e254a7f7f544d5cd96d1581b947f1346851a985ea4b918e87a87566478ff47a6",
+    "src/harbor_patch/multiturn/round_judge.py": "2ccfafbd8018adc908545c9c6fd547090d930dec421cd9a46a60bc90638181b8",
+    "src/harbor_patch/multiturn/swe_conversation.py": "6e8c1f33310560f5998d2dfe796ac445d47a03f2b4e5897f4f1291d2b318b752",
+    "src/harbor_patch/multiturn/swe_conversation_driver.py": "4f79c454ff4798b8fcb902da080b6b941e354366f1a8391a450d7187309efbfc",
+    "src/harbor_patch/multiturn/swe_process_judge.py": "7374d4ce187c9dcd5d09e5b2f8683613229fbf3ed9f360664d41d2736699c821",
+    "src/harbor_patch/multiturn/test_progress.py": "bd673caff90995c1d49b68f07e0a4afa881b8c55de06b3483bd9c4922fca06c0",
+    "src/harbor_patch/multiturn/trial.py": "25d82c9619301009e5055f80d1bd8770597ba66c0e2325251f7c8dc5a47e4b02",
+    "src/harbor_patch/multiturn/user_simulator.py": "ad889716bd7f17c4de7d6b4ebeb7e2aff89801043b9b520062cf7abfb5d66730",
+    "src/verl_patch/multiturn/__init__.py": "9d1741c62a363e064d75d6f846b355589bbcdac7cf8063121ac634d983cc6fd5",
+    "src/verl_patch/multiturn/advantages.py": "2f95c58501df876a5b11a1c40c1b427a6e3d82a9d31b8a73c76cb126b8bc3402",
+    "src/verl_patch/multiturn/metrics.py": "8495622b40a7063129813fd36176966bdadcdd8be015fbe2fcf33cc451b4eb6f"
+  },
+  "integration": "Ported to upstream trajectory recorder and episode envelopes; historical flattened-row dependency chain is excluded."
+}

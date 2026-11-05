@@ -1,3 +1,4 @@
+import MultiTurnTrajectory, { type MultiTurnData } from "./MultiTurnTrajectory";
 import { useState, useCallback, useEffect, useRef } from "react";
 import {
   Shuffle,
@@ -39,6 +40,7 @@ interface Turn {
 }
 
 interface TrajectoryData {
+  multiturn?: MultiTurnData | null;
   run_id: string;
   step: string;
   task: string;
@@ -630,6 +632,7 @@ export default function TrajectoryPanel({ runId, target }: Props) {
       {/* Trajectory display */}
       {data && !loading && (
         <div>
+          <MultiTurnTrajectory value={data.multiturn} />
           {/* Meta bar */}
           <div className="rounded-xl bg-slate-900/80 border border-slate-800/60 p-3 mb-4 flex items-center justify-between flex-wrap gap-2">
             <div className="flex items-center gap-4 text-xs flex-wrap">

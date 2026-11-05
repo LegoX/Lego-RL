@@ -314,12 +314,61 @@ append_mode_hydra_args() {
     esac
 }
 
+# Optional user-feedback loop controls.
+append_multiturn_hydra_args() {
+    local pair name key
+    for pair in \
+        HARBOR_MULTITURN_ENABLED:enabled \
+        HARBOR_MULTITURN_TASK_PROFILE:task_profile \
+        HARBOR_MULTITURN_WORKSPACE_DIR:workspace_dir \
+        HARBOR_MULTITURN_MAX_ROUNDS:max_rounds \
+        HARBOR_MULTITURN_STOP_ON_SUCCESS:stop_on_success \
+        HARBOR_MULTITURN_EPISODE_TIMEOUT_SEC:episode_timeout_sec \
+        HARBOR_MULTITURN_SIMULATOR_MODEL:simulator_model \
+        HARBOR_MULTITURN_SIMULATOR_MODE:simulator_mode \
+        HARBOR_MULTITURN_SIMULATOR_TEMPERATURE:simulator_temperature \
+        HARBOR_MULTITURN_SIMULATOR_API_BASE:simulator_api_base \
+        HARBOR_MULTITURN_SIMULATOR_API_KEY_ENV:simulator_api_key_env \
+        HARBOR_MULTITURN_SIMULATOR_TIMEOUT_SEC:simulator_timeout_sec \
+        HARBOR_MULTITURN_SIMULATOR_MAX_RETRIES:simulator_max_retries \
+        HARBOR_MULTITURN_SIMULATOR_MAX_TOKENS:simulator_max_tokens \
+        HARBOR_MULTITURN_REWARD_MODE:reward_mode \
+        HARBOR_MULTITURN_JUDGE_ENABLED:judge_enabled \
+        HARBOR_MULTITURN_JUDGE_MODEL:judge_model \
+        HARBOR_MULTITURN_JUDGE_API_BASE:judge_api_base \
+        HARBOR_MULTITURN_JUDGE_API_KEY_ENV:judge_api_key_env \
+        HARBOR_MULTITURN_JUDGE_TIMEOUT_SEC:judge_timeout_sec \
+        HARBOR_MULTITURN_JUDGE_MAX_RETRIES:judge_max_retries \
+        HARBOR_MULTITURN_JUDGE_MAX_CONTEXT_CHARS:judge_max_context_chars \
+        HARBOR_MULTITURN_TEST_WEIGHT:test_weight \
+        HARBOR_MULTITURN_JUDGE_WEIGHT:judge_weight \
+        HARBOR_MULTITURN_SEED:seed
+    do
+        name="${pair%%:*}"
+        key="${pair#*:}"
+        if [[ -n "${!name:-}" ]]; then
+            add_force "multiturn.$key" "${!name}"
+        fi
+    done
+    # Hydra interprets unquoted commas as a sweep; keep the URL list one string.
+    if [[ -n "${HARBOR_MULTITURN_SIMULATOR_API_BASES:-}" ]]; then
+        add_force multiturn.simulator_api_bases "\"${HARBOR_MULTITURN_SIMULATOR_API_BASES}\""
+    fi
+}
+
 build_hydra_args() {
     init_hydra_args
     append_common_hydra_args
     append_engine_hydra_args
     append_critic_hydra_args
     append_mode_hydra_args
+    append_multiturn_hydra_args
+    if [[ -n "${CROSS_SEGMENT_GAE:-}" ]]; then
+        add_force algorithm.cross_segment_gae "$CROSS_SEGMENT_GAE"
+    fi
+    if [[ -n "${CROSS_SEGMENT_LAM_MODE:-}" ]]; then
+        add_force algorithm.cross_segment_lam_mode "$CROSS_SEGMENT_LAM_MODE"
+    fi
 }
 
 build_verl_command() {

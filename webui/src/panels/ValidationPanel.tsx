@@ -1,3 +1,5 @@
+import MultiTurnPanel from "./MultiTurnPanel";
+import MultiTurnArtifacts from "./MultiTurnArtifacts";
 import ChartPanel from "../components/Chart";
 import MetricCard from "../components/MetricCard";
 import ValAnalysis from "./ValAnalysis";
@@ -86,6 +88,8 @@ export default function ValidationPanel({ data, runId, onOpenTrajectory }: Props
         />
       </div>
 
+      <MultiTurnPanel data={data} prefix="val-multiturn" />
+      <MultiTurnArtifacts runId={runId} />
       <ValCotTrend runId={runId ?? null} />
 
       <ValAnalysis runId={runId ?? null} onOpenTrajectory={onOpenTrajectory} />
