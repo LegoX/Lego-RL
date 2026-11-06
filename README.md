@@ -13,7 +13,7 @@
   &nbsp;·&nbsp;
   <a href="https://huggingface.co/collections/Lego-X/lego-rl"><img src="img/icon-huggingface.svg" height="15" alt=""> HuggingFace</a>
   &nbsp;·&nbsp;
-  <a href="https://legox.net/"><img src="img/icon-legox.svg" height="15" alt=""> LegoX</a>
+  <a href="https://intellegox.net/"><img src="img/icon-legox.svg" height="15" alt=""> LegoX</a>
   &nbsp;·&nbsp;
   <a href="LICENSE"><img src="img/icon-license.svg" height="15" alt=""> License</a>
 </p>
@@ -33,17 +33,17 @@ updates the policy from the captured trajectory.
 ## News
 
 - [2026/10/08] **Codex training dashboard.** The dedicated
-  [Codex dashboard](https://rl-dashboard-codex.legox.net/) shows the
+  [Codex dashboard](https://rl-dashboard-codex.intellegox.net/) shows the
   `cx-6n8g-dlcoenjt6d5urdcu` experiment, with training curves and per-trial analysis.
   Workspace sign-in is required.
 - [2026/09/17] **Public training dashboards.** We are opening the live dashboards of six real
   Lego-RL runs, all on Qwen3.5-35B-A3B: GSPO on OpenSWE with each harness natively —
-  [OpenHands SDK](https://rl-dashboard-openhands.legox.net),
-  [OpenCode](https://rl-dashboard-opencode.legox.net) and
-  [Claude Code](https://rl-dashboard-claudecode.legox.net); SAO (critic-based) on
-  [OpenSWE](https://rl-dashboard-sao.legox.net) and on a
-  [multilingual task set](https://rl-dashboard-multilingual.legox.net) validated on SWE-bench
-  Multilingual; and a [mixed-harness run](https://rl-dashboard-mixed.legox.net) that trains one
+  [OpenHands SDK](https://rl-dashboard-openhands.intellegox.net),
+  [OpenCode](https://rl-dashboard-opencode.intellegox.net) and
+  [Claude Code](https://rl-dashboard-claudecode.intellegox.net); SAO (critic-based) on
+  [OpenSWE](https://rl-dashboard-sao.intellegox.net) and on a
+  [multilingual task set](https://rl-dashboard-multilingual.intellegox.net) validated on SWE-bench
+  Multilingual; and a [mixed-harness run](https://rl-dashboard-mixed.intellegox.net) that trains one
   policy across all three harnesses at once. Every board shows the full reward and validation
   curves plus per-trial analysis — see [Live Training Dashboard](#live-training-dashboard).
 - [2026/09/11] **Mixed-harness training.** A single run can now interleave OpenHands SDK, OpenCode,
@@ -113,13 +113,13 @@ All seven dashboards are public. The Codex and Mixed harness dashboards open dir
 
 | Run              | Harness                                | Data (train / val)                                 | Algorithm                  | Steps | Val (start → best)     | Dashboard                                                     |
 |:-----------------|:---------------------------------------|:---------------------------------------------------|:---------------------------|------:|:-----------------------|:--------------------------------------------------------------|
-| OpenHands SDK    | OpenHands SDK                          | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   126 | 64.0 → 70.4            | [rl-dashboard-openhands ↗](https://rl-dashboard-openhands.legox.net)       |
-| OpenCode         | OpenCode                               | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   127 | 57.2 → 66.6            | [rl-dashboard-opencode ↗](https://rl-dashboard-opencode.legox.net)         |
-| Claude Code      | Claude Code                            | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   130 | 62.4 → 68.2            | [rl-dashboard-claudecode ↗](https://rl-dashboard-claudecode.legox.net)     |
-| Codex            | Codex                                  | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   125 | 60.0 → 67.6            | [rl-dashboard-codex ↗](https://rl-dashboard-codex.legox.net/)             |
-| Mixed harness    | OpenHands SDK + OpenCode + Claude Code | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO with R3 router replay |   126 | 62.2 → 68.2            | [rl-dashboard-mixed ↗](https://rl-dashboard-mixed.legox.net)               |
-| SAO on OpenSWE   | OpenHands SDK                          | OpenSWE 2,699 / SWE-bench Verified 500             | SAO                        |   239 | 64.0 → 68.6            | [rl-dashboard-sao ↗](https://rl-dashboard-sao.legox.net)                   |
-| SAO multilingual | OpenHands SDK                          | Self-made multilingual 1,729 / SWE-bench Multilingual 300 | SAO                 |   110 | 51.7 → 57.0            | [rl-dashboard-multilingual ↗](https://rl-dashboard-multilingual.legox.net) |
+| OpenHands SDK    | OpenHands SDK                          | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   126 | 64.0 → 70.4            | [rl-dashboard-openhands ↗](https://rl-dashboard-openhands.intellegox.net)       |
+| OpenCode         | OpenCode                               | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   127 | 57.2 → 66.6            | [rl-dashboard-opencode ↗](https://rl-dashboard-opencode.intellegox.net)         |
+| Claude Code      | Claude Code                            | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   130 | 62.4 → 68.2            | [rl-dashboard-claudecode ↗](https://rl-dashboard-claudecode.intellegox.net)     |
+| Codex            | Codex                                  | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO                       |   125 | 60.0 → 67.6            | [rl-dashboard-codex ↗](https://rl-dashboard-codex.intellegox.net/)             |
+| Mixed harness    | OpenHands SDK + OpenCode + Claude Code | OpenSWE 2,699 / SWE-bench Verified 500             | GSPO with R3 router replay |   126 | 62.2 → 68.2            | [rl-dashboard-mixed ↗](https://rl-dashboard-mixed.intellegox.net)               |
+| SAO on OpenSWE   | OpenHands SDK                          | OpenSWE 2,699 / SWE-bench Verified 500             | SAO                        |   239 | 64.0 → 68.6            | [rl-dashboard-sao ↗](https://rl-dashboard-sao.intellegox.net)                   |
+| SAO multilingual | OpenHands SDK                          | Self-made multilingual 1,729 / SWE-bench Multilingual 300 | SAO                 |   110 | 51.7 → 57.0            | [rl-dashboard-multilingual ↗](https://rl-dashboard-multilingual.intellegox.net) |
 
 <br>
 
