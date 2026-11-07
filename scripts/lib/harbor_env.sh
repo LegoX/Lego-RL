@@ -61,7 +61,7 @@ case "$SCAFFOLD" in
     # harbor.agents.installed.codex:Codex and install in-pod via nvm+npm instead.
     : "${HARBOR_AGENT_NAME:=null}"
     : "${HARBOR_AGENT_IMPORT_PATH:=harbor_patch.agents.image_mounted_codex:Codex}"
-    : "${HARBOR_AGENT_RUNTIME_IMAGE:=null}"
+    : "${HARBOR_AGENT_RUNTIME_IMAGE:=docker.io/jierun/c-codex-0.153.4:v0.1}"
     : "${HARBOR_AGENT_RUNTIME_MOUNT_PATH:=/opt/custom-agent-runtime/codex}"
     : "${HARBOR_AGENT_RUNTIME_IMAGE_SUBPATH:=opt/custom-agent-runtime/codex}"
     # Pinned: the installed path falls back to @latest, which moves under you.
