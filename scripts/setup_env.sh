@@ -61,8 +61,9 @@ HARBOR_PATCH="${HARBOR_PATCH:-$REPO_ROOT/patches/harbor.patch}"
 #                            DIS preset, reward placement, trajectory filter v6
 #   verl_segments_7aed6b23.patch  Context segments, episode GRPO, batching and loss normalization
 #   verl_optional_agent_loop_timings.patch  Align optional metrics before fully-async concat
+#   verl_optional_rollout_metrics.patch  Align optional metrics across worker shards
 # VERL_PATCH (singular) is kept as an alias for a single-patch override.
-VERL_PATCHES="${VERL_PATCHES:-${VERL_PATCH:-$REPO_ROOT/patches/verl_7aed6b23.patch $REPO_ROOT/patches/verl_sao_7aed6b23.patch $REPO_ROOT/patches/verl_segments_7aed6b23.patch $REPO_ROOT/patches/verl_preserve_chat_template_context.patch $REPO_ROOT/patches/verl_full_sequence_training.patch $REPO_ROOT/patches/verl_optional_agent_loop_timings.patch}}"
+VERL_PATCHES="${VERL_PATCHES:-${VERL_PATCH:-$REPO_ROOT/patches/verl_7aed6b23.patch $REPO_ROOT/patches/verl_sao_7aed6b23.patch $REPO_ROOT/patches/verl_segments_7aed6b23.patch $REPO_ROOT/patches/verl_preserve_chat_template_context.patch $REPO_ROOT/patches/verl_full_sequence_training.patch $REPO_ROOT/patches/verl_optional_agent_loop_timings.patch $REPO_ROOT/patches/verl_optional_rollout_metrics.patch}}"
 VLLM_PATCH="${VLLM_PATCH:-$REPO_ROOT/patches/vllm_2a69949b.patch}"
 
 # Python / venv / base dependency lock
@@ -372,6 +373,7 @@ fi
 
 ensure_repo "harbor" "$HARBOR_DIR" "$HARBOR_REPO_URL" "$HARBOR_REF"
 apply_repo_patch "harbor" "$HARBOR_DIR" "$HARBOR_PATCH" 0
+apply_repo_patch "harbor startup exception" "$HARBOR_DIR" "$REPO_ROOT/patches/harbor_preserve_startup_exception.patch" 0
 ensure_repo "verl"   "$VERL_DIR"   "$VERL_REPO_URL"   "$VERL_REF"
 apply_repo_patches "verl" "$VERL_DIR" "$VERL_PATCHES"
 ensure_repo "vllm"   "$VLLM_DIR"   "$VLLM_REPO_URL"   "$VLLM_REF"

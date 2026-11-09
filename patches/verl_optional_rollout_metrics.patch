@@ -1,0 +1,28 @@
+diff --git a/verl/experimental/fully_async_policy/fully_async_rollouter.py b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+--- a/verl/experimental/fully_async_policy/fully_async_rollouter.py
++++ b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+@@ -453,6 +453,24 @@
+         from a shard that has it (only the batch dim varies), so no per-model constants
+         (num_layers/topk) are needed and it works regardless of how trials map to workers.
+         """
++        # Optional scalar metrics differ between successful and empty trials.
++        # Validation concatenates here directly, bypassing detach_utils' timing
++        # alignment. Preserve every observed column and row, filling absence
++        # with zero as in the training timing contract.
++        metric_rows = []
++        for output in outputs:
++            if output is None:
++                continue
++            metrics = output.meta_info.get("metrics")
++            if isinstance(metrics, list):
++                metric_rows.extend(metrics)
++            elif isinstance(metrics, dict):
++                metric_rows.append(metrics)
++        metric_keys = {key for row in metric_rows for key in row}
++        for row in metric_rows:
++            for key in metric_keys:
++                row.setdefault(key, 0.0)
++
+         shards = [o for o in outputs if o is not None and getattr(o, "batch", None) is not None]
+         if len(shards) <= 1:
+             return outputs
