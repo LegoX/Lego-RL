@@ -1,0 +1,17 @@
+diff --git a/src/harbor/trial/trial.py b/src/harbor/trial/trial.py
+--- a/src/harbor/trial/trial.py
++++ b/src/harbor/trial/trial.py
+@@ -851,6 +851,13 @@
+
+         except Exception as e:
+             self._logger.debug(f"Trial {self.config.trial_name} failed: {e}")
++            # Record the primary failure before best-effort log collection.
++            # A never-created Pod returns 404 during download; that secondary
++            # error must not replace the environment startup timeout.
++            if self.result.exception_info is None:
++                self.result.exception_info = ExceptionInfo.from_exception(e)
++                self._ensure_trial_dir()
++                self._trial_paths.exception_message_path.write_text(traceback.format_exc())
+
+             await self._maybe_download_logs(
+                 source_dir=EnvironmentPaths.agent_dir.as_posix(),

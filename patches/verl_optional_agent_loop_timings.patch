@@ -1,0 +1,26 @@
+diff --git a/verl/experimental/fully_async_policy/detach_utils.py b/verl/experimental/fully_async_policy/detach_utils.py
+index e5186eb6..fe05bbc6 100644
+--- a/verl/experimental/fully_async_policy/detach_utils.py
++++ b/verl/experimental/fully_async_policy/detach_utils.py
+@@ -173,6 +173,13 @@ def addition_process(output: DataProto):
+     return output
+
+
++def _align_optional_agent_loop_timings(batches):
++    keys = {key for batch in batches for key in batch.non_tensor_batch if key.startswith("_al_timing_")}
++    for batch in batches:
++        for key in keys.difference(batch.non_tensor_batch):
++            batch.non_tensor_batch[key] = np.zeros(len(batch), dtype=np.float64)
++
++
+ def assemble_batch_from_rollout_samples(
+     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
+ ) -> DataProto:
+@@ -207,6 +214,7 @@ def assemble_batch_from_rollout_samples(
+     for rs in rollout_samples:
+         batch = addition_process(rs.full_batch)
+         rollout_samples_batch.append(batch)
++    _align_optional_agent_loop_timings(rollout_samples_batch)
+     final_batch = DataProto.concat(rollout_samples_batch)
+
+     # Calculate response_mask (if not present)
