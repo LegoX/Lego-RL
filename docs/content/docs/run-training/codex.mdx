@@ -32,24 +32,31 @@ existing sampling and turn-limit behavior.
 
 ## Mount a pinned runtime
 
-The supported runtime is Codex CLI `0.153.4` on Linux x86-64. Build and push it
-to a registry reachable by your sandbox nodes:
+The supported runtime is Codex CLI `0.153.4` on Linux x86-64. The default
+runtime image is `docker.io/jierun/c-codex-0.153.4:v0.1` (digest
+`sha256:05893e6ff77c5f270d8d7017cee28795c84d21b1f2052ff61190e21e20476bde`).
+The image is mounted into task containers, matching the Claude Code scaffold.
+
+If your sandbox nodes cannot reach Docker Hub, mirror this image to a registry
+they can reach, then set `HARBOR_AGENT_RUNTIME_IMAGE` to the mirror. You can
+also build the pinned runtime yourself:
 
 ```bash
 bash scripts/agent_runtimes/codex/0.153.4/build-runtime-image.sh \
   --image YOUR_REGISTRY/lego/c-codex-0.153.4:v0.1 --push
 ```
 
-Then set this in your experiment config:
+Set your own image address in the experiment config when using a mirror or a
+self-built image:
 
 ```bash
 HARBOR_AGENT_RUNTIME_IMAGE=YOUR_REGISTRY/lego/c-codex-0.153.4:v0.1
 ```
 
 The wrapper checks the mounted binary's version and writes a per-trial custom
-provider with `wire_api="responses"` and WebSockets disabled. No production
-registry or host path is built into the scaffold. With the image left as `null`,
-Harbor's installer is used and the sandbox needs network access for installation.
+provider with `wire_api="responses"` and WebSockets disabled. Set the image
+to `null` to use Harbor's installer instead; the sandbox then needs network
+access for installation.
 
 Preview the launch command before starting an experiment:
 
