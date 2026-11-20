@@ -1115,6 +1115,11 @@ class BuiltinSWEAgentLoop(AgentLoopBase):
                 "episode_id": session_meta.get("episode_id"),
                 "episode_reward": float(reward),
                 "segment_index": 0,
+                # Match successful worker shards; zero-mask rows have no segment.
+                "segment_kind": "",
+                "subagent_session_id": "",
+                "subagent_segment_kind": "",
+                "segment_boundary": "",
                 "segment_count": 0,
                 "trajectory_selection": getattr(self, "trajectory_selection", "longest"),
                 "turn_scores": [],

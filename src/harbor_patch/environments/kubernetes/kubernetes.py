@@ -343,8 +343,16 @@ class _GenericK8sClientManager:
         ray_scheduler = await self._get_ray_pod_scheduler()
         ray_token = None
         if ray_scheduler is not None:
+            acquire_ref = None
             try:
-                ray_token = await ray_scheduler.acquire.remote(pod_name)
+                acquire_ref = ray_scheduler.acquire.remote(pod_name)
+                ray_token = await acquire_ref
+            except asyncio.CancelledError:
+                # The startup deadline includes queueing. Cancel the remote
+                # waiter so an expired trial cannot consume a later slot.
+                if acquire_ref is not None:
+                    _ray.cancel(acquire_ref, force=False)
+                raise
             except Exception as exc:
                 self._logger.warning(
                     "Ray pod creation scheduler request failed; "
